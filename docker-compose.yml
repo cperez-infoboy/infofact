@@ -1,0 +1,70 @@
+# InfoFact WebUI — backend FastAPI que orquesta el agente.
+#
+# Un solo servicio por ahora. El frontend (SvelteKit SPA) se agrega en Iter 5
+# como build stage adicional del Dockerfile; compose no cambia.
+#
+#network_mode: host
+#  _TRADEOFF_: simplest way to let the WebUI reach the docker daemon
+#   (/var/run/docker.sock) and to let `curl http://127.0.0.1:8080/health` from
+#   the host just work, sin publicar puertos. La desventaja es que el WebUI
+#   comparte el netns del host (menos aislamiento). Cuando se añada TLS o se
+#   quiera limitar puertos, cambiar a `ports: ["8080:8080"]` + un socket
+#   proxy. El contenedor del AGENTE no necesita publicar puertos (habla por
+#   `docker exec`), así que host networking no filtra nada de él.
+#
+# TRAMPA DinD (Docker-in-Docker) bind-mount path:
+#   El CLI `docker` dentro del WebUI habla con el daemon del HOST vía el
+#   socket. Cuando el WebUI hace `docker run -v <src>:<dst>`, el daemon
+#   resuelve `<src>` en el filesystem del HOST, no en la vista del WebUI.
+#   Por eso montamos el workspace del host al MISMO path absoluto dentro del
+#   WebUI (`WORKSPACES_HOST_PATH` en ambos lados), y le decimos al WebUI
+#   que su `WORKSPACES_HOST_ROOT` es ese mismo path absoluto. Así
+#   `Path(settings.workspaces_host_root).resolve()` dentro del WebUI da el
+#   mismo string que ve el daemon del host → el bind-mount del agente cae en
+#   el inodo correcto. Si los paths difieren, el WebUI mkdir en SU vista pero
+#   el daemon no encuentra el dir en el host.
+#
+# Storage externo (HA / NFS / CephFS / EFS):
+#   Para apuntar el workspace a un montaje de alta disponibilidad, setear en
+#   `.env` la variable `WORKSPACES_HOST_PATH` con un path ABSOLUTO estable en
+#   el host (ej. `/srv/infofact/workspaces`), Y montar ese path del storage
+#   externo en el host docker daemon (fuera de compose — systemd/fstab/mount
+#   unit). Sin ese montaje en el host, `docker run -v` resuelve contra un
+#   path inexistente o equivocado en el FS del host.
+#   Default (sin setear la var): `${PWD}/data/workspaces` = comportamiento
+#   histórico, local al repo.
+#
+# Volúmenes (cada uno documentado en su línea):
+services:
+  infofact-webui:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: infofact-webui:dev
+    container_name: infofact-webui
+    network_mode: host
+    volumes:
+      # El WebUI necesita invocar `docker run`/`exec` para spawnear y hablar
+      # con los containers del agente. Sin este socket no puede hacer nada.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Persistencia de SQLite + registro de containers. Si se pierde, se
+      # pierden usuarios, proyectos, sesiones, checkpoints LangGraph.
+      # NUNCA apuntar a network FS: SQLite sobre NFS/CephFS corrompe datos.
+      - ./data:/app/data
+      # Raíz de workspaces por perfil. MISMO path absoluto dentro del WebUI y
+      # en el host, para que docker run -v (resuelto por el daemon del host)
+      # caiga en el inodo correcto. Override vía `.env`:
+      #   WORKSPACES_HOST_PATH=/srv/infofact/workspaces
+      # apunta todo a un montaje HA del host. Default: local al repo.
+      - ${WORKSPACES_HOST_PATH:-${PWD}/data/workspaces}:${WORKSPACES_HOST_PATH:-${PWD}/data/workspaces}
+    env_file: .env
+    environment:
+      # TIENE que ser el mismo path absoluto que el bind-mount de arriba
+      # usa como target dentro del WebUI container. Cualquier otro valor
+      # rompe el bind-mount del agente (ver nota DinD arriba).
+      WORKSPACES_HOST_ROOT: ${WORKSPACES_HOST_PATH:-${PWD}/data/workspaces}
+      # SQLite + checkpointer + registry siempre bajo /app/data (bind-mounted).
+      DATABASE_URL: sqlite+aiosqlite:////app/data/infofact.db
+      CHECKPOINTER_DB: /app/data/checkpoints.db
+      REGISTRY_FILE: /app/data/container_registry.json
+    restart: unless-stopped

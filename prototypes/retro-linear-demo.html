@@ -1,0 +1,616 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>InfoFact — Linear + Retro</title>
+
+<!-- Fonts: Inter (body), JetBrains Mono (code), Press Start 2P (pixel) -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Press+Start+2P&display=swap" rel="stylesheet">
+
+<!-- NES.css solo para iconos pixel sueltos -->
+<link href="https://unpkg.com/nes.css@2.3.0/css/nes.min.css" rel="stylesheet" />
+
+<style>
+  :root {
+    /* Linear dark base */
+    --bg:           #08090a;
+    --surface:      #0f1011;
+    --surface-2:    #15171a;
+    --surface-3:    #1c1e22;
+    --border:       #1f2023;
+    --border-strong:#2a2c30;
+    --text:         #f7f8f8;
+    --text-muted:   #b4bcd0;
+    --text-dim:     #8a8f98;
+    --text-faint:   #62666d;
+
+    /* Synthwave dusk accents (no verde / no ambar) */
+    --accent:       #ff2a6d;   /* magenta */
+    --accent-2:     #05d9e8;   /* cyan */
+    --accent-3:     #b16bff;   /* purpura puente */
+
+    --radius:       10px;
+    --radius-sm:    6px;
+    --shadow-1:     0 1px 2px rgba(0,0,0,0.4);
+    --shadow-2:     0 8px 30px rgba(0,0,0,0.5);
+  }
+
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Inter', system-ui, sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+    position: relative;
+  }
+
+  /* Aurora glow Linear-style */
+  body::before {
+    content: "";
+    position: fixed; inset: 0;
+    background:
+      radial-gradient(60rem 40rem at 12% 10%, rgba(255,42,109,0.10), transparent 60%),
+      radial-gradient(50rem 40rem at 90% 90%, rgba(5,217,232,0.08), transparent 60%),
+      radial-gradient(70rem 50rem at 50% 50%, rgba(177,107,255,0.05), transparent 60%);
+    pointer-events: none;
+    z-index: 0;
+    animation: drift 22s ease-in-out infinite alternate;
+  }
+
+  /* Grain / noise sutil */
+  body::after {
+    content: "";
+    position: fixed; inset: 0;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0.5 0'/></filter><rect width='100%25' height='100%25' filter='url(%23n)' opacity='0.6'/></svg>");
+    opacity: 0.035;
+    mix-blend-mode: overlay;
+    pointer-events: none;
+    z-index: 1;
+  }
+
+  @keyframes drift {
+    0%   { transform: translate3d(-2%, -1%, 0) scale(1.05); }
+    100% { transform: translate3d(2%,  1%, 0) scale(1.1); }
+  }
+
+  .app {
+    position: relative;
+    z-index: 2;
+    display: grid;
+    grid-template-rows: 48px 1fr;
+    height: 100vh;
+  }
+
+  /* ───────── Topbar ───────── */
+  .topbar {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 0 16px;
+    border-bottom: 1px solid var(--border);
+    background: rgba(8,9,10,0.7);
+    backdrop-filter: blur(12px);
+  }
+  .brand {
+    display: flex; align-items: center; gap: 10px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+  }
+  .brand .logo {
+    width: 22px; height: 22px;
+    display: grid; place-items: center;
+    background: linear-gradient(135deg, var(--accent), var(--accent-3));
+    border-radius: 5px;
+    box-shadow: 0 0 18px rgba(255,42,109,0.5);
+  }
+  .brand .logo::after {
+    content: "";
+    width: 10px; height: 10px;
+    background: var(--bg);
+    clip-path: polygon(50% 0,100% 50%,50% 100%,0 50%);
+  }
+  .crumb {
+    color: var(--text-dim);
+    font-size: 13px;
+  }
+  .crumb b { color: var(--text-muted); font-weight: 500; }
+  .topbar .spacer { flex: 1; }
+  .pill {
+    font-family: 'Press Start 2P', monospace;
+    font-size: 8px;
+    letter-spacing: 0.5px;
+    padding: 6px 9px;
+    color: var(--accent-2);
+    background: rgba(5,217,232,0.08);
+    border: 1px solid rgba(5,217,232,0.3);
+    border-radius: 4px;
+    text-shadow: 0 0 8px rgba(5,217,232,0.7);
+  }
+  .avatar {
+    width: 26px; height: 26px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, var(--accent-3), var(--accent-2));
+    border: 1px solid var(--border-strong);
+  }
+
+  /* ───────── Main grid ───────── */
+  .main {
+    display: grid;
+    grid-template-columns: 232px 1fr 380px;
+    min-height: 0;
+  }
+
+  /* Sidebar */
+  .sidebar {
+    border-right: 1px solid var(--border);
+    background: rgba(12,12,14,0.5);
+    backdrop-filter: blur(8px);
+    padding: 14px 10px;
+    overflow-y: auto;
+  }
+  .side-title {
+    font-family: 'Press Start 2P', monospace;
+    font-size: 8px;
+    color: var(--text-faint);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    padding: 6px 8px 10px;
+  }
+  .nav-item {
+    display: flex; align-items: center; gap: 9px;
+    padding: 7px 8px;
+    border-radius: var(--radius-sm);
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 13px;
+  }
+  .nav-item:hover { background: var(--surface-2); color: var(--text); }
+  .nav-item.active {
+    background: var(--surface-3);
+    color: var(--text);
+    box-shadow: inset 2px 0 0 var(--accent);
+  }
+  .nav-item .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text-faint); }
+  .nav-item .dot.on { background: var(--accent-2); box-shadow: 0 0 8px var(--accent-2); }
+
+  .project-card {
+    margin-top: 6px;
+    padding: 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--surface);
+  }
+  .project-card .name { font-weight: 600; font-size: 13px; }
+  .project-card .meta {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--text-faint);
+    margin-top: 4px;
+  }
+
+  /* Chat */
+  .chat {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+  .chat-head {
+    padding: 14px 22px 10px;
+    border-bottom: 1px solid var(--border);
+  }
+  .chat-head h1 {
+    margin: 0;
+    font-size: 18px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    text-shadow: 0 0 24px rgba(255,42,109,0.25);
+  }
+  .chat-head .sub {
+    color: var(--text-dim);
+    font-size: 12px;
+    margin-top: 2px;
+  }
+
+  /* Agent output panel — AQUI van scanlines CRT */
+  .stream {
+    flex: 1;
+    overflow-y: auto;
+    padding: 18px 22px 8px;
+  }
+  .crt {
+    position: relative;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius);
+    background:
+      linear-gradient(180deg, rgba(20,8,28,0.6), rgba(8,9,10,0.6));
+    padding: 16px 18px;
+    box-shadow:
+      var(--shadow-2),
+      inset 0 0 40px rgba(255,42,109,0.06);
+    overflow: hidden;
+  }
+  /* scanlines */
+  .crt::after {
+    content: "";
+    position: absolute; inset: 0;
+    background: repeating-linear-gradient(
+      0deg,
+      rgba(0,0,0,0.25) 0 1px,
+      transparent 1px 3px
+    );
+    pointer-events: none;
+    mix-blend-mode: multiply;
+    border-radius: inherit;
+  }
+  /* vignette CRT */
+  .crt::before {
+    content: "";
+    position: absolute; inset: 0;
+    background: radial-gradient(ellipse at center, transparent 55%, rgba(0,0,0,0.55) 100%);
+    pointer-events: none;
+    border-radius: inherit;
+  }
+  .crt > * { position: relative; z-index: 1; }
+
+  .msg { margin-bottom: 14px; }
+  .msg .who {
+    font-family: 'Press Start 2P', monospace;
+    font-size: 8px;
+    letter-spacing: 0.5px;
+    margin-bottom: 6px;
+    text-transform: uppercase;
+  }
+  .msg.user .who { color: var(--text-dim); }
+  .msg.agent .who {
+    color: var(--accent);
+    text-shadow: 0 0 8px rgba(255,42,109,0.6);
+  }
+  .msg .body {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    color: var(--text);
+    line-height: 1.65;
+  }
+  .msg.agent .body { color: #f4e9f2; }
+  .msg .body code {
+    color: var(--accent-2);
+    background: rgba(5,217,232,0.07);
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+  .cursor {
+    display: inline-block;
+    width: 8px; height: 14px;
+    background: var(--accent-2);
+    vertical-align: -2px;
+    margin-left: 2px;
+    box-shadow: 0 0 8px var(--accent-2);
+    animation: blink 1s steps(1) infinite;
+  }
+  @keyframes blink {
+    0%, 50%      { opacity: 1; }
+    50.01%, 100% { opacity: 0; }
+  }
+
+  .tool-event {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--text-dim);
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    padding: 3px 8px;
+    border-radius: 4px;
+    margin: 4px 0;
+  }
+  .tool-event .tag { color: var(--accent-3); }
+
+  /* Composer */
+  .composer {
+    border-top: 1px solid var(--border);
+    padding: 12px 22px 16px;
+    background: rgba(8,9,10,0.6);
+    backdrop-filter: blur(8px);
+  }
+  .composer .box {
+    display: flex; align-items: center; gap: 10px;
+    background: var(--surface-2);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius);
+    padding: 10px 12px;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  }
+  .composer .box:focus-within {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(255,42,109,0.15);
+  }
+  .composer input {
+    flex: 1;
+    background: transparent;
+    border: 0;
+    outline: 0;
+    color: var(--text);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+  }
+  .composer input::placeholder { color: var(--text-faint); }
+  .btn {
+    font-family: 'Inter', sans-serif;
+    font-weight: 600;
+    font-size: 12px;
+    padding: 7px 14px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--accent);
+    background: linear-gradient(180deg, rgba(255,42,109,0.18), rgba(255,42,109,0.08));
+    color: var(--text);
+    cursor: pointer;
+    transition: transform 0.08s ease, box-shadow 0.15s ease;
+  }
+  .btn:hover {
+    box-shadow: 0 0 20px rgba(255,42,109,0.4);
+  }
+  .btn:active { transform: translateY(1px); }
+
+  /* Doc panel */
+  .doc {
+    border-left: 1px solid var(--border);
+    background: rgba(12,12,14,0.5);
+    backdrop-filter: blur(8px);
+    display: flex; flex-direction: column;
+    min-height: 0;
+  }
+  .doc-head {
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .doc-head .title { font-weight: 600; font-size: 14px; }
+  .doc-head .badge {
+    font-family: 'Press Start 2P', monospace;
+    font-size: 7px;
+    color: var(--accent-3);
+    border: 1px solid rgba(177,107,255,0.4);
+    background: rgba(177,107,255,0.08);
+    padding: 4px 6px;
+    border-radius: 3px;
+  }
+  .doc-body {
+    overflow-y: auto;
+    padding: 16px 18px;
+    color: var(--text-muted);
+    font-size: 13px;
+    line-height: 1.65;
+  }
+  .doc-body h2 {
+    font-size: 14px;
+    color: var(--text);
+    margin: 18px 0 6px;
+    letter-spacing: -0.01em;
+  }
+  .doc-body h2:first-child { margin-top: 0; }
+  .doc-body ul { padding-left: 18px; }
+  .doc-body li { margin: 3px 0; }
+  .doc-body code {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    color: var(--accent-2);
+  }
+  .doc-body .row {
+    display: flex; align-items: center; gap: 8px;
+    margin: 6px 0;
+    color: var(--text-dim);
+  }
+
+  /* Phase rail */
+  .phase-rail {
+    display: flex; gap: 6px;
+    padding: 10px 22px;
+    border-top: 1px solid var(--border);
+    background: rgba(8,9,10,0.4);
+  }
+  .phase {
+    display: flex; align-items: center; gap: 6px;
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    color: var(--text-faint);
+    border: 1px solid transparent;
+  }
+  .phase.done { color: var(--text-dim); }
+  .phase.active {
+    color: var(--accent-2);
+    background: rgba(5,217,232,0.06);
+    border-color: rgba(5,217,232,0.25);
+    text-shadow: 0 0 8px rgba(5,217,232,0.5);
+  }
+  .phase i { transform: scale(0.7); transform-origin: center; }
+
+  /* Scrollbars */
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-thumb {
+    background: var(--surface-3);
+    border-radius: 10px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
+  }
+  ::-webkit-scrollbar-thumb:hover { background: var(--border-strong); background-clip: padding-box; }
+  ::-webkit-scrollbar-track { background: transparent; }
+
+  @media (max-width: 1100px) {
+    .main { grid-template-columns: 200px 1fr; }
+    .doc { display: none; }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <!-- Topbar -->
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo"></div>
+      <span>InfoFact</span>
+    </div>
+    <div class="crumb">/ <b>TiendaNorte</b> / Requerimientos</div>
+    <div class="spacer"></div>
+    <span class="pill">● ONLINE</span>
+    <div class="avatar" title="claudio"></div>
+  </header>
+
+  <!-- Main -->
+  <div class="main">
+
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <div class="side-title">// PROYECTOS</div>
+      <div class="nav-item active">
+        <span class="dot on"></span>
+        TiendaNorte
+      </div>
+      <div class="nav-item">
+        <span class="dot"></span>
+        PagosAPI
+      </div>
+      <div class="nav-item">
+        <span class="dot"></span>
+        BlogCMS
+      </div>
+      <div class="nav-item">
+        <span class="dot"></span>
+        TrackFleet
+      </div>
+
+      <div class="side-title" style="margin-top:18px;">// FASE</div>
+      <div class="project-card">
+        <div class="name">TiendaNorte</div>
+        <div class="meta">fase_01 · requirements</div>
+        <div class="meta" style="margin-top:6px;">
+          sesiones: <span style="color:var(--accent-2)">3</span> ·
+          docs: <span style="color:var(--accent)">1</span>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Chat -->
+    <main class="chat">
+      <div class="chat-head">
+        <h1>Asistente de Requerimientos</h1>
+        <div class="sub">Fase 1 · Sesión #3 · TiendaNorte</div>
+      </div>
+
+      <div class="stream">
+        <!-- CRT output panel -->
+        <div class="crt">
+          <div class="msg user">
+            <div class="who">&gt; usuario</div>
+            <div class="body">
+              Necesito un sistema de carrito de compras para una tienda de productos regionales del norte argentino. Pagos con MercadoPago y transferencia.
+            </div>
+          </div>
+
+          <div class="msg agent">
+            <div class="who">&gt; agente · req-v1</div>
+            <div class="body">
+              Recibido. Voy a descomponer el dominio en <code>actores</code>, <code>funciones</code> y <code>restricciones</code>. Antes de generar el SRS necesito confirmar tres puntos:<br>
+              1. ¿El catálogo tiene variantes por producto (talle, color)?<br>
+              2. ¿Stock multi-depósito o único?<br>
+              3. ¿Necesitás facturación electrónica (AFIP)?
+            </div>
+          </div>
+
+          <div class="tool-event">
+            <span class="tag">[tool]</span> write_doc(srs_draft.md)
+          </div>
+          <div class="tool-event">
+            <span class="tag">[tool]</span> extract_actors()
+          </div>
+
+          <div class="msg agent">
+            <div class="who">&gt; agente · req-v1</div>
+            <div class="body">
+              Mientras tanto dejé el borrador del SRS en el panel derecho<span class="cursor"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Phase rail -->
+      <div class="phase-rail">
+        <div class="phase active">
+          <i class="nes-icon sword"></i>
+          01 · Requerimientos
+        </div>
+        <div class="phase">
+          <i class="nes-icon hammer"></i>
+          02 · Análisis
+        </div>
+        <div class="phase">
+          <i class="nes-icon star"></i>
+          03 · Implementación
+        </div>
+        <div class="phase">
+          <i class="nes-icon heart"></i>
+          04 · Testing
+        </div>
+        <div class="phase">
+          <i class="nes-icon rocket"></i>
+          05 · Deploy
+        </div>
+      </div>
+
+      <!-- Composer -->
+      <div class="composer">
+        <div class="box">
+          <input placeholder="Escribí tu respuesta o usá / para comandos…" />
+          <button class="btn">Enviar ▸</button>
+        </div>
+      </div>
+    </main>
+
+    <!-- Doc viewer -->
+    <aside class="doc">
+      <div class="doc-head">
+        <div class="title">SRS · TiendaNorte</div>
+        <span class="badge">DRAFT</span>
+      </div>
+      <div class="doc-body">
+        <h2>1. Actores</h2>
+        <div class="row"><i class="nes-icon user is-small"></i> Cliente final</div>
+        <div class="row"><i class="nes-icon user is-small"></i> Administrador de tienda</div>
+        <div class="row"><i class="nes-icon user is-small"></i> Pasarela de pago (MercadoPago)</div>
+
+        <h2>2. Funciones clave</h2>
+        <ul>
+          <li>Catálogo con variantes (<code>POST /products</code>)</li>
+          <li>Carrito persistente por sesión</li>
+          <li>Checkout multi-método (MP / transferencia)</li>
+          <li>Panel de administración de stock</li>
+        </ul>
+
+        <h2>3. Restricciones</h2>
+        <ul>
+          <li>Geografía: Argentina</li>
+          <li>Moneda: ARS</li>
+          <li>Idioma: es-AR</li>
+        </ul>
+
+        <h2>4. Criterios de aceptación</h2>
+        <ul>
+          <li>Checkout en menos de 3 pasos</li>
+          <li>Tiempo de carga inicial menor a 1.5s</li>
+        </ul>
+      </div>
+    </aside>
+
+  </div>
+</div>
+</body>
+</html>

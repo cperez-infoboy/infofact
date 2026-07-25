@@ -1,0 +1,507 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>InfoFact — Comparador icono de tool</title>
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+
+<!-- Iconify: para las variantes "genericas" (spinners + game-icons). CDN confiable. -->
+<script src="https://code.iconify.design/iconify-icon/2.3.0/iconify-icon.min.js"></script>
+
+<style>
+  :root {
+    /* Mismo design system que la app (Linear.app dark grayscale) */
+    --bg:            #08090a;
+    --surface:       #0e0f11;
+    --surface-2:     #151718;
+    --surface-3:     #1c1d20;
+    --border:        #1f2023;
+    --border-strong: #2a2c30;
+    --text:          #f7f8f8;
+    --text-muted:    #b4bcd0;
+    --text-dim:      #8a8f98;
+    --text-faint:    #62666d;
+    --danger:        #e5484d;
+
+    /* Paleta arcade (solo para variantes color) */
+    --px-red:    #e5484d;
+    --px-skin:   #ffcaa8;
+    --px-brown:  #5a3a1a;
+    --px-blue:   #2860c0;
+    --px-yellow: #facc15;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Inter', system-ui, sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    padding: 32px 24px 64px;
+  }
+
+  header {
+    max-width: 1100px;
+    margin: 0 auto 28px;
+  }
+  header h1 {
+    font-size: 18px;
+    font-weight: 600;
+    margin: 0 0 6px;
+    letter-spacing: -0.01em;
+  }
+  header p {
+    color: var(--text-dim);
+    margin: 0;
+    font-size: 13px;
+  }
+
+  /* Barra de control global */
+  .controls {
+    max-width: 1100px;
+    margin: 0 auto 24px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 10px 14px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  .controls label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--text-muted);
+    font-size: 13px;
+    cursor: pointer;
+    user-select: none;
+  }
+  .controls .hint {
+    margin-left: auto;
+    color: var(--text-faint);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+  }
+
+  /* Grilla de cards */
+  .grid {
+    max-width: 1100px;
+    margin: 0 auto;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+    gap: 14px;
+  }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .card .title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text);
+  }
+  .card .badge {
+    display: inline-block;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    padding: 2px 6px;
+    border-radius: 4px;
+    background: var(--surface-3);
+    color: var(--text-dim);
+    border: 1px solid var(--border-strong);
+    margin-left: 8px;
+    vertical-align: middle;
+  }
+  .card .badge.rec { background: rgba(247,248,248,0.10); color: var(--text); }
+
+  .stages {
+    display: flex;
+    align-items: flex-end;
+    gap: 18px;
+    padding: 14px 0 8px;
+    border-top: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+  }
+  .stage {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+  }
+  .stage .label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    color: var(--text-faint);
+  }
+  .stage .slot {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .stage.icon-slot .slot { width: 28px; height: 28px; }
+  .stage.zoom-slot .slot { width: 64px; height: 64px; padding: 6px; }
+  .stage.ctx-slot .slot {
+    width: auto; height: 28px; padding: 0 10px;
+    gap: 8px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+  .stage.ctx-slot .slot .running-tag {
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+  .stage.ctx-slot .slot .running-tag.done { color: var(--text-faint); }
+
+  .tradeoff {
+    font-size: 12px;
+    color: var(--text-dim);
+    line-height: 1.45;
+  }
+  .tradeoff strong { color: var(--text-muted); }
+
+  /* ===== Pixel-art SVG base =====
+     Cada pixel = <rect width=1 height=1>. viewBox en grilla.
+     shape-rendering: crispEdges => sin suavizado (pixel nítido). */
+  svg.px { shape-rendering: crispEdges; display: block; }
+
+  /* ===== Animaciones arcade =====
+     Prototype: motion SIEMPRE on (ignoramos prefers-reduced-motion acá).
+     En la app real sí hay que respetarlo; esto es para comparar. */
+  .hammer-rotate {
+    transform-box: fill-box;
+    transform-origin: 20% 90%; /* grip del martillo, donde la mano lo sostiene */
+    animation: hammer-swing 0.22s ease-in-out infinite alternate;
+    will-change: transform;
+  }
+  @keyframes hammer-swing {
+    from { transform: rotate(-75deg); }
+    to   { transform: rotate( 75deg); }
+  }
+
+  /* Mario body bob — leve rebote vertical, refuerza el "trabajando" */
+  .mario-body {
+    transform-box: fill-box;
+    transform-origin: 50% 100%;
+    animation: mario-bob 0.44s ease-in-out infinite alternate;
+    will-change: transform;
+  }
+  @keyframes mario-bob {
+    from { transform: translateY(0); }
+    to   { transform: translateY(-0.6px); }
+  }
+
+  /* Variante 2-frame (swap de sprite entero) */
+  .frame-b { animation: frame-toggle 0.32s steps(1, end) infinite alternate; }
+  @keyframes frame-toggle {
+    from { opacity: 0; }
+    to   { opacity: 1; }
+  }
+
+  /* Solo martillo (sin Mario) — rotación 360 continua mas suave */
+  .hammer-only {
+    transform-box: fill-box;
+    transform-origin: 50% 80%;
+    animation: hammer-solo 0.5s steps(1, end) infinite alternate;
+  }
+
+  /* game-icons wrapper rotate */
+  .gi-rotate {
+    display: inline-flex;
+    animation: gi-swing 0.4s ease-in-out infinite alternate;
+    transform-origin: center bottom;
+  }
+  @keyframes gi-swing {
+    from { transform: rotate(-40deg); }
+    to   { transform: rotate(40deg); }
+  }
+
+  /* CSS border spinner */
+  .css-spin {
+    width: 16px; height: 16px;
+    border: 2px solid var(--border-strong);
+    border-top-color: var(--text-dim);
+    border-radius: 50%;
+    animation: css-spin 0.7s linear infinite;
+  }
+  @keyframes css-spin { to { transform: rotate(360deg); } }
+
+  /* ===== Estado "done": pausa todo ===== */
+  body.done-state .hammer-rotate,
+  body.done-state .frame-b,
+  body.done-state .hammer-only,
+  body.done-state .gi-rotate,
+  body.done-state .css-spin {
+    animation-play-state: paused;
+  }
+  body.done-state .hammer-rotate { transform: rotate(0deg); }
+  body.done-state .running-tag::after { content: "done"; }
+  body.done-state .running-tag:not(.done)::before { content: ""; }
+  .running-tag::after { content: "running…"; }
+
+  /* En la app real: respetar prefers-reduced-motion.
+     Acá lo mostramos como info pero NO nukeamos — queremos ver motion. */
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Icono de tool — comparador de alternativas</h1>
+  <p>Reemplazo del <code style="font-family:'JetBrains Mono',monospace;color:var(--text-muted)">⚙</code> en el bloque de tool del chat. Elegí una variante; después se porta a <code style="font-family:'JetBrains Mono',monospace;color:var(--text-muted)">ToolIcon.svelte</code>.</p>
+</header>
+
+<div class="controls">
+  <label>
+    <input type="checkbox" id="doneToggle" />
+    Estado <strong>done</strong> (pausa animaciones)
+  </label>
+  <span class="hint">Desmarcado = running. Marcado = done.</span>
+</div>
+
+<div id="diag" style="max-width:1100px;margin:0 auto 18px;padding:8px 14px;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:11px;display:flex;gap:16px;flex-wrap:wrap"></div>
+
+<div class="grid" id="grid"></div>
+
+<script>
+  // ===== Paletas pixel-art =====
+  const PALETTE_COLOR = {
+    R: 'var(--px-red)',
+    S: 'var(--px-skin)',
+    B: 'var(--px-brown)',
+    O: 'var(--px-blue)',
+    Y: 'var(--px-yellow)',
+    K: '#0b0c0d',
+  };
+  const PALETTE_MONO = {
+    R: 'var(--text-dim)',
+    S: 'var(--text-faint)',
+    B: 'var(--text-faint)',
+    O: 'var(--text-dim)',
+    Y: 'var(--text)',
+    K: 'var(--bg)',
+  };
+
+  // ===== Mario body (12 cols x 12 rows). Sin martillo. =====
+  // . = transparente
+  const MARIO_BODY = [
+    '...RRR......',
+    '..RRRRR.....',
+    '..BBSSB.....',
+    '..SSSSSB....',
+    '...SBSB.....',
+    '...BBBB.....',
+    '..ROOOOR....',
+    '.ROOOOOOR...',
+    '.ROOOOOOR...',
+    '..OOOOOO....',
+    '..BB..BB....',
+    '.BBBB.BBB...',
+  ];
+
+  // ===== Martillo (4 cols x 5 rows). Pivot = esquina inf-izq (grip). =====
+  const HAMMER = [
+    'YYYY',
+    'YYYY',
+    '.BB.',
+    '.BB.',
+    '.BB.',
+  ];
+
+  // Renderiza un array de strings como SVG de pixeles.
+  // rows: string[], palette: {char: color}, cls: clase opcional para el grupo
+  function pixelSvg(rows, palette, { cls = '', x = 0, y = 0 } = {}) {
+    const w = rows[0].length;
+    const h = rows.length;
+    let rects = '';
+    for (let r = 0; r < h; r++) {
+      for (let c = 0; c < w; c++) {
+        const ch = rows[r][c];
+        const fill = palette[ch];
+        if (!fill) continue; // '.' o desconocido => transparente
+        rects += `<rect x="${x + c}" y="${y + r}" width="1" height="1" fill="${fill}"/>`;
+      }
+    }
+    return `<g class="${cls}">${rects}</g>`;
+  }
+
+  // Mario completo: body + martillo (martillo rotando via CSS .hammer-rotate)
+  function marioSvg(palette, { twoFrame = false } = {}) {
+    const bodyW = MARIO_BODY[0].length;
+    const bodyH = MARIO_BODY.length;
+    // viewBox ampliado para que entre el martillo rotado sin cortarse
+    const vbW = bodyW + 6;
+    const vbH = bodyH + 2;
+    const body = pixelSvg(MARIO_BODY, palette, { cls: 'mario-body', x: 0, y: 0 });
+
+    // Martillo posicionado sobre la mano derecha de Mario (row 7, col 9 aprox)
+    const hx = 9, hy = 5; // mano derecha approx
+    if (twoFrame) {
+      // Frame A: martillo arriba
+      const hammerUp = pixelSvg(HAMMER, palette, { x: hx, y: hy - 4 });
+      // Frame B: martillo al lado (otra posición)
+      const hammerDown = pixelSvg(HAMMER, palette, { x: hx + 1, y: hy - 1 });
+      return `<svg class="px" viewBox="-2 0 ${vbW} ${vbH}" width="100%" height="100%">
+        ${body}
+        <g>${hammerUp}</g>
+        <g class="frame-b">${hammerDown}</g>
+      </svg>`;
+    }
+    const hammer = pixelSvg(HAMMER, palette, { cls: 'hammer-rotate', x: hx, y: hy - 4 });
+    return `<svg class="px" viewBox="-2 0 ${vbW} ${vbH}" width="100%" height="100%">
+      ${body}
+      ${hammer}
+    </svg>`;
+  }
+
+  // Solo martillo (sin Mario)
+  function hammerOnlySvg(palette) {
+    return `<svg class="px" viewBox="0 0 8 8" width="100%" height="100%">
+      ${pixelSvg(HAMMER, palette, { cls: 'hammer-only', x: 2, y: 1 })}
+    </svg>`;
+  }
+
+  // ===== Definición de cards =====
+  const grid = document.getElementById('grid');
+
+  function card({ title, badge, inner, tradeoff }) {
+    const el = document.createElement('div');
+    el.className = 'card';
+    el.innerHTML = `
+      <div class="title">${title}${badge ? `<span class="badge ${badge.cls || ''}">${badge.text}</span>` : ''}</div>
+      <div class="stages">
+        <div class="stage icon-slot">
+          <div class="slot">${inner('icon')}</div>
+          <div class="label">20px (slot real)</div>
+        </div>
+        <div class="stage zoom-slot">
+          <div class="slot">${inner('zoom')}</div>
+          <div class="label">zoom</div>
+        </div>
+        <div class="stage ctx-slot">
+          <div class="slot">
+            ${inner('ctx')}
+            <span class="name">search_web</span>
+            <span class="running-tag"></span>
+          </div>
+          <div class="label">en contexto</div>
+        </div>
+      </div>
+      <div class="tradeoff">${tradeoff}</div>
+    `;
+    return el;
+  }
+
+  // Tamaño para cada stage
+  function sized(html, stage) {
+    // icon: SVG llena el slot; ctx: tamaño chico fijo; zoom: grande
+    return html;
+  }
+
+  // --- Card 1: Mario color, martillo rotando (recomendado) ---
+  grid.appendChild(card({
+    title: 'Mario color + martillo rotando',
+    badge: { text: 'recomendado', cls: 'rec' },
+    inner: (stage) => marioSvg(PALETTE_COLOR, { twoFrame: false }),
+    tradeoff: '<strong>Pro:</strong> fiel al pedido, arcade real, sin deps. <strong>Contra:</strong> punto de color único en UI grayscale; pixel-art hecho a mano (ajuste fino).',
+  }));
+
+  // --- Card 2: Mario monocromo ---
+  grid.appendChild(card({
+    title: 'Mario monocromo + martillo',
+    inner: (stage) => marioSvg(PALETTE_MONO, { twoFrame: false }),
+    tradeoff: '<strong>Pro:</strong> respeta design system, sigue legible como arcade. <strong>Contra:</strong> pierde el "color retro" que pediste.',
+  }));
+
+  // --- Card 3: Mario 2-frame (swap de sprite) ---
+  grid.appendChild(card({
+    title: 'Mario 2-frame (sprite swap)',
+    inner: (stage) => marioSvg(PALETTE_COLOR, { twoFrame: true }),
+    tradeoff: '<strong>Pro:</strong> mas auténtico arcade (frame swap real, no rotación). <strong>Contra:</strong> necesita dibujar 2 poses de martillo.',
+  }));
+
+  // --- Card 4: Solo martillo pixel-art ---
+  grid.appendChild(card({
+    title: 'Solo martillo pixel-art',
+    inner: (stage) => hammerOnlySvg(PALETTE_COLOR),
+    tradeoff: '<strong>Pro:</strong> sutil, encaja mejor en slot chico, menos pixel-art. <strong>Contra:</strong> no es Mario, pierde personaje.',
+  }));
+
+  // --- Card 5: Iconify svg-spinners (genérico) ---
+  grid.appendChild(card({
+    title: 'Iconify svg-spinners (genérico)',
+    badge: { text: 'CDN', cls: '' },
+    inner: (stage) => `
+      <span style="display:inline-flex;gap:6px;align-items:center;color:var(--text-dim)">
+        <iconify-icon icon="svg-spinners:bars-1-fade-2" width="${stage === 'zoom' ? 28 : 16}"></iconify-icon>
+        <iconify-icon icon="svg-spinners:blocks-wave" width="${stage === 'zoom' ? 28 : 16}"></iconify-icon>
+        <iconify-icon icon="svg-spinners:bar-scale" width="${stage === 'zoom' ? 28 : 16}"></iconify-icon>
+      </span>`,
+    tradeoff: '<strong>Pro:</strong> calidad pro, cero trabajo, 200k+ variantes. <strong>Contra:</strong> no es arcade ni Mario; dep CDN + web component.',
+  }));
+
+  // --- Card 6: Iconify game-icons hammer + CSS rotate ---
+  grid.appendChild(card({
+    title: 'game-icons hammer + rotate CSS',
+    badge: { text: 'CDN', cls: '' },
+    inner: (stage) => {
+      const sz = stage === 'zoom' ? 40 : 20;
+      return `<span class="gi-rotate" style="color:var(--text-dim)"><iconify-icon icon="game-icons:hammer-nails" width="${sz}"></iconify-icon></span>`;
+    },
+    tradeoff: '<strong>Pro:</strong> icono pro, animación via CSS, trivial. <strong>Contra:</strong> estilo flat, no pixel-art; no es Mario.',
+  }));
+
+  // --- Card 7: CSS border spinner (baseline) ---
+  grid.appendChild(card({
+    title: 'CSS border spinner (baseline)',
+    inner: (stage) => {
+      const scale = stage === 'zoom' ? 'transform:scale(2.2);transform-origin:center' : '';
+      return `<span class="css-spin" style="${scale}"></span>`;
+    },
+    tradeoff: '<strong>Pro:</strong> cero deps, universal, ~3 líneas. <strong>Contra:</strong> genérico aburrido, nada arcade.',
+  }));
+
+  // --- Toggle global done-state ---
+  const doneToggle = document.getElementById('doneToggle');
+  doneToggle.addEventListener('change', () => {
+    document.body.classList.toggle('done-state', doneToggle.checked);
+    document.querySelectorAll('.running-tag').forEach(t => t.classList.toggle('done', doneToggle.checked));
+  });
+
+  // --- Banner diagnostico ---
+  const diag = document.getElementById('diag');
+  const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const iconifyLoaded = !!window.customElements && customElements.get('iconify-icon');
+  function gs(n) { return getComputedStyle(document.querySelector(n)); }
+  const hammerEl = document.querySelector('.hammer-rotate');
+  const hammerAnim = hammerEl ? getComputedStyle(hammerEl).animationName : '(no elem)';
+  const parts = [
+    `prefers-reduced-motion: <strong style="color:${reduced ? 'var(--danger)' : 'var(--text)'}">${reduced ? 'YES (bloquearia en app real)' : 'no'}</strong>`,
+    `iconify-icon cargado: <strong>${iconifyLoaded ? 'sí' : 'no (cards CDN vacías)'}</strong>`,
+    `.hammer-rotate animation-name: <strong>${hammerAnim}</strong>`,
+  ];
+  diag.innerHTML = parts.join(' &nbsp;|&nbsp; ');
+  diag.style.background = reduced ? 'rgba(229,72,77,0.08)' : 'var(--surface)';
+  diag.style.border = `1px solid ${reduced ? 'rgba(229,72,77,0.4)' : 'var(--border)'}`;
+  diag.style.color = 'var(--text-dim)';
+</script>
+
+</body>
+</html>

@@ -1,0 +1,45 @@
+# Secrets — NEVER commit
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Node / SvelteKit
+node_modules/
+.svelte-kit/
+frontend/build/
+frontend/.svelte-kit/
+*.tsbuildinfo
+
+# Runtime data (DBs, workspaces, sandbox)
+data/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+
+# Editor / tooling local
+.vscode/
+.idea/
+.claude/
+.atl/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build output
+dist/
+build/

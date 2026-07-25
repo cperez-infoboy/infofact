@@ -1,0 +1,31 @@
+# Evita copiar al contexto de build del WebUI todo lo que está en el repo pero
+# no debe entrar en la imagen. .dockerignore se aplica a AMBOS Dockerfile (el
+# del WebUI y el Dockerfile.agent). node_modules/ se excluye en cualquier nivel
+# (incluido frontend/node_modules/); el resto de frontend/ SÍ entra al contexto
+# porque el stage node del Dockerfile lo necesita para `npm run build`.
+.venv/
+data/
+.git/
+.gitignore
+node_modules/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+.env
+.env.*
+!.env.example
+docker-compose.yml
+Dockerfile
+Dockerfile.agent
+.dockerignore
+docs/
+.vscode/
+.claude/
+.gortex/
+.atl/
+opencode.json
+CLAUDE.md
+RTK.md
