@@ -30,6 +30,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # binary at /usr/bin/docker. Found via `apt-cache search docker-cli` and
 # `dpkg -L docker-cli`.
 # ----------------------------------------------------------------------------
+# System libs:
+#   - docker-cli: spawn per-user agent containers via `docker run` / `docker exec`.
+#     CLI only, not the daemon (stays on host, reached via docker.sock bind-mount
+#     from compose). On debian trixie the package is `docker-cli` (docker.io
+#     pulls containerd + dockerd but NO `docker` binary).
 RUN apt-get update && apt-get install -y --no-install-recommends \
       docker-cli \
       ca-certificates \
@@ -50,6 +55,17 @@ WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Replace opencv-python (full GUI build pulled transitively by docling ->
+# rapidocr -> opencv-python) with opencv-python-headless. The full build needs
+# libxcb/libGL/etc. X11+GL system libs that python:3.13-slim doesn't ship.
+# Headless exposes the same `cv2` API without GUI libs, which is what server-
+# side PDF/document processing needs. Order matters: uninstall opencv-python
+# FIRST, then install headless. Reversed, pip wipes the cv2/ dir that headless
+# just wrote (both packages claim the same RECORD entries).
+RUN pip uninstall -y opencv-python \
+ && pip install --no-cache-dir --no-deps opencv-python-headless==5.0.0.93 \
+ && python -c "import cv2; print('cv2', cv2.__version__)"
 
 COPY backend/ ./backend/
 

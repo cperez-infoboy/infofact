@@ -3,6 +3,9 @@
 .env.*
 !.env.example
 
+# Documentos de cliente de prueba (confidenciales, nunca commitear)
+testdata/
+
 # Python
 __pycache__/
 *.py[cod]

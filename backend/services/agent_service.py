@@ -21,6 +21,7 @@ import logging
 from typing import Any
 
 from deepagents import create_deep_agent
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
@@ -142,11 +143,181 @@ def build_agent(
             )
         )
 
+    # Read-only access to the requirements store so the orchestrator can answer
+    # "list / describe / show the decomposition tree of REQ-NNN" directly,
+    # without delegating to the capture subagent. Bound to project_id in the
+    # requirements phase only; mutation tools stay exclusive to the subagent.
+    orchestrator_tools: list[Any] = [web_search, fetch_url]
+    if phase == "requirements" and project_id is not None:
+        from backend.agents.tools.requirements_tools import (
+            make_requirements_read_tools,
+        )
+        orchestrator_tools.extend(make_requirements_read_tools(project_id))
+
     return create_deep_agent(
         model=_build_model(),
         system_prompt=system_prompt,
         backend=sandbox,
-        tools=[web_search, fetch_url],
+        tools=orchestrator_tools,
         subagents=subagents or None,
         checkpointer=checkpointer,
     )
+
+
+# ---------------------------------------------------------------------------
+# Read-only history reconstruction from the checkpointer
+# ---------------------------------------------------------------------------
+#
+# The checkpointer (AsyncSqliteSaver, settings.checkpointer_db) is the
+# authoritative record of what the agent actually did on a session: it stores
+# the full message list per thread, INCLUDING AIMessage.tool_calls and the
+# ToolMessage results, which the SSE layer emits as ephemeral events and never
+# persists to chat_messages. reconstruct_history reads that state so the GET
+# /sessions/{id} endpoint can replay a session faithfully (tools + final
+# answers), not just the lossy assistant accumulation.
+#
+# The boundary stays clean: this lives in agent_service (the agent wrapper), so
+# when phase 3 swaps in a container-per-user transport only THIS function
+# changes (HTTP to the container instead of the local saver) — the router and
+# the schema are untouched. CLAUDE.md Decision 1.
+
+_read_graph: Any = None
+
+
+def _get_read_graph(checkpointer: AsyncSqliteSaver) -> Any:
+    """DeepAgent compiled ONLY to call aget_state: same state schema
+    (messages + files channels), same checkpointer, but a dummy backend and
+    no tools/subagents. aget_state only reads the checkpointer (SQLite) — it
+    never invokes the backend nor the LLM — so the dummy backend is never
+    exercised. Compiled once (module-level cache); thread_id distinguishes
+    sessions, the schema is project-agnostic.
+
+    Assumes a single shared checkpointer for the app's lifetime (true today:
+    the saver is built once in the lifespan). If the saver ever changes per
+    request, key this cache by id(checkpointer).
+    """
+    global _read_graph
+    if _read_graph is None:
+        _read_graph = create_deep_agent(
+            model=_build_model(),
+            system_prompt="read-only-history",
+            backend=DockerSandbox(profile="__read__", project_slug="__read__"),
+            tools=[],
+            subagents=None,
+            checkpointer=checkpointer,
+        )
+    return _read_graph
+
+
+def _coerce_text(content: Any) -> str:
+    """Extract plain text from a BaseMessage content (str or content-block list)."""
+    if isinstance(content, str):
+        return content
+    parts: list[str] = []
+    for block in content or []:
+        if isinstance(block, str):
+            parts.append(block)
+        elif isinstance(block, dict) and block.get("type") == "text":
+            parts.append(str(block.get("text", "")))
+    return "".join(parts)
+
+
+async def reconstruct_history(
+    checkpointer: AsyncSqliteSaver, session_id: int
+) -> list[dict]:
+    """Neutral chat history for a session reconstructed from the checkpointer.
+
+    Each dict is plain (no LangGraph types leak to the router):
+        {id, role, content, created_at,
+         tool_name?, tool_call_id?, tool_args?, status?}
+    role in {'user', 'assistant', 'tool'}.
+
+    Mapping (chronological, as stored by the checkpointer):
+      - HumanMessage  -> {role:'user', content}
+      - AIMessage     -> {role:'assistant', content} (if non-empty text), plus
+                         one {role:'tool', tool_name, tool_call_id, tool_args}
+                         per tool_call (output filled later by its ToolMessage).
+                         Skipped entirely if empty and tool-less (streaming
+                         artefact that would render an invisible bubble).
+      - ToolMessage   -> back-fills content (output) on the matching
+                         role:'tool' item by tool_call_id.
+      - SystemMessage -> skipped.
+
+    Returns [] if the thread does not exist (the router then falls back to
+    chat_messages). created_at is NOT set per item: LangGraph carries no
+    reliable per-message timestamp; the router assigns session.created_at.
+    """
+    graph = _get_read_graph(checkpointer)
+    config = {"configurable": {"thread_id": str(session_id)}}
+    try:
+        snapshot = await graph.aget_state(config)
+    except Exception:
+        logger.exception(
+            "reconstruct_history: aget_state failed for session %s", session_id
+        )
+        return []
+    if snapshot is None or not snapshot.values:
+        return []
+
+    messages = snapshot.values.get("messages") or []
+    out: list[dict] = []
+    # Map tool_call_id -> index in `out` of the role:'tool' item waiting for its
+    # ToolMessage output. Lets a ToolMessage back-fill the right item even when
+    # several tool calls are in flight.
+    pending: dict[str, int] = {}
+
+    for msg in messages:
+        if isinstance(msg, HumanMessage):
+            out.append({
+                "id": f"u-{len(out)}",
+                "role": "user",
+                "content": _coerce_text(msg.content),
+                "created_at": None,
+            })
+        elif isinstance(msg, AIMessage):
+            text = _coerce_text(msg.content)
+            if text:
+                out.append({
+                    "id": f"a-{len(out)}",
+                    "role": "assistant",
+                    "content": text,
+                    "created_at": None,
+                })
+            for tc in msg.tool_calls or []:
+                tc_id = tc.get("id") or f"tc-{len(out)}"
+                item = {
+                    "id": f"t-{len(out)}",
+                    "role": "tool",
+                    "content": "",
+                    "created_at": None,
+                    "tool_name": tc.get("name") or "",
+                    "tool_call_id": tc_id,
+                    "tool_args": tc.get("args") or {},
+                    "status": "done",
+                }
+                pending[tc_id] = len(out)
+                out.append(item)
+        elif isinstance(msg, ToolMessage):
+            tc_id = msg.tool_call_id
+            idx = pending.get(tc_id)
+            if idx is not None:
+                out[idx]["content"] = _coerce_text(msg.content)
+                if not out[idx].get("tool_name") and getattr(msg, "name", None):
+                    out[idx]["tool_name"] = msg.name
+            else:
+                # Orphan ToolMessage (no preceding tool_call seen in state):
+                # emit it directly so the result is not lost.
+                out.append({
+                    "id": f"t-{len(out)}",
+                    "role": "tool",
+                    "content": _coerce_text(msg.content),
+                    "created_at": None,
+                    "tool_name": getattr(msg, "name", None) or "",
+                    "tool_call_id": tc_id,
+                    "tool_args": {},
+                    "status": "done",
+                })
+        elif isinstance(msg, SystemMessage):
+            continue
+
+    return out

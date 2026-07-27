@@ -4,7 +4,7 @@ Validates (without an LLM or the real pipeline):
 - agent_service imports cleanly after the subagent wiring (no circular import,
   all edits syntactically valid).
 - make_requirements_capture_subagent returns a DeepAgents-shaped dict with the
-  capture tool + the 12 editing tools.
+  capture tool + the 12 editing tools + the vision tool when vision is configured.
 - _resolve_target accepts a valid subpath and rejects traversal / missing dirs.
 - run_requirements_capture returns a compact report dict (pipeline mocked).
 
@@ -56,11 +56,33 @@ async def main() -> None:
     check("name is requirements-capture", sub.get("name") == "requirements-capture")
     check("description non-empty", len(sub.get("description", "")) > 20)
     check("system_prompt non-empty", len(sub.get("system_prompt", "")) > 50)
-    check("13 tools (1 capture + 12 editing)", len(sub["tools"]) == 13,
+    from backend.config import settings
+    from backend.agents.tools.requirements_tools import make_requirements_tools
+    from backend.agents.tools.vision_tools import make_vision_tools
+
+    expected_vision = 1 if settings.supports_vision else 0
+    # 1 capture tool + N editing tools (counted dynamically so this never goes
+    # stale when an editing tool is added) + the conditional vision tool.
+    expected_total = 1 + len(make_requirements_tools(1)) + expected_vision
+    check(f"{expected_total} tools (1 capture + editing + "
+          f"{expected_vision} vision)", len(sub["tools"]) == expected_total,
           f"count={len(sub['tools'])}")
     check("capture tool is first",
           sub["tools"][0].name == "run_requirements_capture",
           f"first={sub['tools'][0].name}")
+
+    # Vision tool is registered only when vision is configured.
+    vision_factory = make_vision_tools("p", "s")
+    check("vision factory list len matches flag",
+          len(vision_factory) == expected_vision,
+          f"got={len(vision_factory)}")
+    tool_names = [t.name for t in sub["tools"]]
+    if expected_vision:
+        check("analyze_image registered when vision on",
+              "analyze_image" in tool_names, f"tools={tool_names}")
+    else:
+        check("analyze_image absent when vision off",
+              "analyze_image" not in tool_names)
 
     print("\n== _resolve_target (traversal guard) ==")
     with tempfile.TemporaryDirectory() as tmp:

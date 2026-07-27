@@ -77,6 +77,101 @@ def _item_summary(item: RequirementItem) -> dict[str, Any]:
     }
 
 
+def make_requirements_read_tools(project_id: int) -> list:
+    """Build the read-only tool subset (list / get / build_srs).
+
+    Registered with the orchestrator so it can answer store queries directly,
+    without delegating to the capture subagent. ``project_id`` is closed over
+    (same isolation contract as the editing tools); no mutation tool is exposed,
+    so the orchestrator cannot change the store.
+
+    The three tool bodies are duplicated from ``make_requirements_tools`` on
+    purpose: the editing factory interleaves reads with mutations in its return
+    list, and restructuring it risks the mutation tools. If you change a read
+    tool here, change its twin there too.
+    """
+
+    @tool
+    async def list_requirements(
+        status: StatusValue | None = None,
+        type: ReqTypeValue | None = None,
+        priority: PriorityValue | None = None,
+        include_deleted: bool = False,
+    ) -> dict:
+        """List requirements in the project, optionally filtered.
+
+        Soft-deleted rows (rejected / merged / superseded) are hidden unless
+        include_deleted is true. Returns one compact summary per item.
+        """
+        try:
+            async with AsyncSessionLocal() as session:
+                items = await store.list_requirements(
+                    session,
+                    project_id,
+                    status=ReqStatus(status) if status else None,
+                    type=ReqType(type) if type else None,
+                    priority=Priority(priority) if priority else None,
+                    include_deleted=include_deleted,
+                )
+                return {
+                    "count": len(items),
+                    "items": [_item_summary(it) for it in items],
+                }
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"list_requirements failed: {exc}"}
+
+    @tool
+    async def get_requirement(code: str) -> dict:
+        """Full detail of one requirement: fields, relations, revision history.
+
+        Use this to inspect a requirement before editing, or to review how it
+        changed over time (every mutation is versioned in the revisions list).
+        """
+        try:
+            async with AsyncSessionLocal() as session:
+                req_id = await _code_to_id(session, project_id, code)
+                return await store.get_requirement(session, req_id)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"get_requirement failed: {exc}"}
+
+    @tool
+    async def build_srs() -> dict:
+        """Generate the SRS Markdown from the current requirement store.
+
+        The SRS is built deterministically from RequirementItem rows (never
+        hand-written). Returns the markdown text plus a counts summary so you
+        can paste an excerpt to the user and offer the document for download.
+
+        Call this after capture + validation, when the user asks for the SRS,
+        the requirements matrix, or the deliverable document.
+        """
+        try:
+            async with AsyncSessionLocal() as session:
+                from backend.services.srs_builder import build_srs as _build
+                from backend.models import Project as _Project
+                proj = await session.get(_Project, project_id)
+                name = getattr(proj, "name", "") if proj else ""
+                desc = getattr(proj, "description", "") if proj else ""
+                result = await _build(
+                    session,
+                    project_id,
+                    project_name=name,
+                    project_description=desc,
+                )
+                return {
+                    "markdown": result["markdown"],
+                    "generated_at": result["generated_at"],
+                    "counts": result["counts"],
+                    # Preview: primer KB para que el modelo pueda citar sin
+                    # volcar el markdown completo en el contexto.
+                    "preview": result["markdown"][:1024],
+                }
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"build_srs failed: {exc}"}
+
+    return [list_requirements, get_requirement, build_srs]
+
+
 def make_requirements_tools(project_id: int) -> list:
     """Build the editing tool set bound to one project.
 
@@ -383,6 +478,41 @@ def make_requirements_tools(project_id: int) -> list:
         except Exception as exc:  # noqa: BLE001
             return {"error": f"add_acceptance_criterion failed: {exc}"}
 
+    @tool
+    async def build_srs() -> dict:
+        """Generate the SRS Markdown from the current requirement store.
+
+        The SRS is built deterministically from RequirementItem rows (never
+        hand-written). Returns the markdown text plus a counts summary so you
+        can paste an excerpt to the user and offer the document for download.
+
+        Call this after capture + validation, when the user asks for the SRS,
+        the requirements matrix, or the deliverable document.
+        """
+        try:
+            async with AsyncSessionLocal() as session:
+                from backend.services.srs_builder import build_srs as _build
+                from backend.models import Project as _Project
+                proj = await session.get(_Project, project_id)
+                name = getattr(proj, "name", "") if proj else ""
+                desc = getattr(proj, "description", "") if proj else ""
+                result = await _build(
+                    session,
+                    project_id,
+                    project_name=name,
+                    project_description=desc,
+                )
+                return {
+                    "markdown": result["markdown"],
+                    "generated_at": result["generated_at"],
+                    "counts": result["counts"],
+                    # Preview: primer KB para que el modelo pueda citar sin
+                    # volcar el markdown completo en el contexto.
+                    "preview": result["markdown"][:1024],
+                }
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"build_srs failed: {exc}"}
+
     return [
         add_requirement,
         update_requirement,
@@ -396,4 +526,5 @@ def make_requirements_tools(project_id: int) -> list:
         approve_requirement,
         reject_requirement,
         add_acceptance_criterion,
+        build_srs,
     ]

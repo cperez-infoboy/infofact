@@ -511,9 +511,20 @@ async def list_requirements(
     status: ReqStatus | None = None,
     type: ReqType | None = None,
     priority: Priority | None = None,
+    code: str | None = None,
+    parent_id: int | None = None,
+    derived: bool | None = None,
+    merged_into: int | None = None,
     include_deleted: bool = False,
 ) -> list[RequirementItem]:
-    """Query items by status / type / priority.
+    """Query items by status / type / priority / structure.
+
+    Extra filters:
+      - code: REQ-code prefix match (e.g. "REQ-01" matches REQ-010..REQ-019).
+      - parent_id: only operational sub-requirements of this parent.
+      - derived: True = only derived sub-items; False = only atomic originals.
+      - merged_into: items soft-deleted into this keeper id (set
+        include_deleted=True too, or the MERGED rows are filtered out first).
 
     Soft-deleted rows (REJECTED / MERGED / SUPERSEDED) are excluded unless
     include_deleted is set, so the default view matches the live SRS.
@@ -529,6 +540,14 @@ async def list_requirements(
         stmt = stmt.where(RequirementItem.type == type)
     if priority is not None:
         stmt = stmt.where(RequirementItem.priority == priority)
+    if code is not None:
+        stmt = stmt.where(RequirementItem.code.like(f"{code}%"))
+    if parent_id is not None:
+        stmt = stmt.where(RequirementItem.parent_id == parent_id)
+    if derived is not None:
+        stmt = stmt.where(RequirementItem.derived == derived)
+    if merged_into is not None:
+        stmt = stmt.where(RequirementItem.merged_into == merged_into)
     stmt = stmt.order_by(RequirementItem.code)
     rows = await session.scalars(stmt)
     return list(rows)

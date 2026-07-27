@@ -22,7 +22,7 @@ import os
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
@@ -30,7 +30,9 @@ from backend.config import settings
 from backend.database import AsyncSessionLocal
 from backend.deps import get_current_user
 from backend.models import ChatMessage, ChatSession, Project, User
+from backend.services.agent_service import reconstruct_history
 from backend.services.slugify import slugify
+from backend.services.srs_builder import build_srs as _build_srs
 
 logger = logging.getLogger(__name__)
 
@@ -118,10 +120,14 @@ class SessionCreate(BaseModel):
 
 
 class MessageOut(BaseModel):
-    id: int
+    id: int | str
     role: str
-    content: str
+    content: str = ""
     created_at: datetime
+    tool_name: str | None = None
+    tool_call_id: str | None = None
+    tool_args: dict | None = None
+    status: str | None = None
 
 
 class SessionOut(BaseModel):
@@ -149,6 +155,18 @@ class ProjectOut(BaseModel):
 class ProjectDetail(ProjectOut):
     description: str | None = None
     sessions: list[SessionOut] = []
+
+
+class SrsOut(BaseModel):
+    """Salida del endpoint GET /api/projects/{id}/srs.
+
+    El markdown se genera on-demand desde RequirementItem[] (source of truth
+    estructurada). `counts` permite al frontend pintar resumen sin parsear.
+    """
+    project_id: int
+    markdown: str
+    generated_at: str
+    counts: dict = Field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -272,6 +290,35 @@ async def get_project(
     )
 
 
+@router.get("/{project_id}/srs", response_model=SrsOut)
+async def get_project_srs(
+    project_id: int,
+    user: User = Depends(get_current_user),
+) -> SrsOut:
+    """Genera el SRS Markdown del proyecto desde RequirementItem[].
+
+    El SRS es una vista generada (no persistida como archivo): la fuente de
+    verdad es el store estructurado. 404 si el proyecto no existe o no es
+    propio.
+    """
+    async with AsyncSessionLocal() as db:
+        project = await db.get(Project, project_id)
+        if project is None or project.user_id != user.id:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "not_found")
+        result = await _build_srs(
+            db,
+            project_id,
+            project_name=project.name,
+            project_description=project.description or "",
+        )
+    return SrsOut(
+        project_id=project_id,
+        markdown=result["markdown"],
+        generated_at=result["generated_at"],
+        counts=result["counts"],
+    )
+
+
 # ---------------------------------------------------------------------------
 # Sessions under a project
 # ---------------------------------------------------------------------------
@@ -364,9 +411,15 @@ async def list_sessions(
 @session_router.get("/sessions/{session_id}", response_model=SessionDetail)
 async def get_session_detail(
     session_id: int,
+    request: Request,
     user: User = Depends(get_current_user),
 ) -> SessionDetail:
-    """Detalle de una sesión: metadata + mensajes ordenados por tiempo.
+    """Detalle de una sesión: metadata + mensajes.
+
+    Los mensajes se reconstruyen desde el checkpointer del agente (fuente
+    autoritativa: incluye llamadas a herramientas y sus resultados, que el
+    streaming SSE nunca persiste). Si el thread no existe (sesión sin turnos del
+    agente) o la reconstrucción falla, cae a ``chat_messages`` como fallback.
 
     Verifica ownership cruzando session -> project -> user_id. Mismo 404 si no
     existe o no es propia, sin filtrar existencia.
@@ -382,13 +435,41 @@ async def get_session_detail(
         if project is None or project.user_id != user.id:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "not_found")
 
-        messages = (
-            await db.execute(
-                select(ChatMessage)
-                .where(ChatMessage.session_id == session_id)
-                .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+    # Historial autoritativo desde el checkpointer (tools + resultados).
+    # app.state.checkpointer lo crea el lifespan (mismo objeto que usa el relay
+    # de chat). Si por algún motivo no existe, cae directo al fallback.
+    checkpointer = getattr(request.app.state, "checkpointer", None)
+    items: list[dict] = []
+    if checkpointer is not None:
+        try:
+            items = await reconstruct_history(checkpointer, session_id)
+        except Exception:
+            logger.exception(
+                "reconstruct_history falló para sesión %s; fallback a chat_messages",
+                session_id,
             )
-        ).scalars().all()
+
+    # Fallback: thread inexistente (sesión nueva sin turnos del agente) o
+    # fallo de reconstrucción. Conserva compatibilidad con sesiones que solo
+    # tienen prompts de usuario persistidos.
+    if not items:
+        async with AsyncSessionLocal() as db:
+            rows = (
+                await db.execute(
+                    select(ChatMessage)
+                    .where(ChatMessage.session_id == session_id)
+                    .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+                )
+            ).scalars().all()
+        items = [
+            {
+                "id": m.id,
+                "role": m.role,
+                "content": m.content,
+                "created_at": m.created_at,
+            }
+            for m in rows
+        ]
 
     return SessionDetail(
         id=session.id,
@@ -398,11 +479,15 @@ async def get_session_detail(
         created_at=session.created_at,
         messages=[
             MessageOut(
-                id=m.id,
-                role=m.role,
-                content=m.content,
-                created_at=m.created_at,
+                id=it["id"],
+                role=it["role"],
+                content=it.get("content") or "",
+                created_at=it.get("created_at") or session.created_at,
+                tool_name=it.get("tool_name"),
+                tool_call_id=it.get("tool_call_id"),
+                tool_args=it.get("tool_args"),
+                status=it.get("status"),
             )
-            for m in messages
+            for it in items
         ],
     )

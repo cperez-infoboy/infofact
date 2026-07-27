@@ -2,6 +2,15 @@
 // Archivo .ts PLANO → writable de svelte/store.
 import { writable } from 'svelte/store';
 import { streamMessage, type ToolInput } from '$lib/api/chat';
+import type { MessageOut } from '$lib/api/projects';
+import {
+  captureStage,
+  conflicts,
+  validationReport,
+  addedRequirements,
+  startCapture,
+  endCapture
+} from '$lib/stores/capture';
 
 // --- Tipos de mensaje (union discriminada por `kind`) -----------------------
 // Timeline lineal: cada segmento de texto del agente y cada tool call son
@@ -182,6 +191,9 @@ export async function sendMessage(sessionId: number, content: string): Promise<b
         appendToken(currentAssistantId, delta);
       },
       onToolStart: (name, input) => {
+        // DEBUG: diagnosticar por qué CaptureStatus banner no aparece.
+        // Quitar tras confirmar el flujo de tool_start del subagente.
+        console.log('[chat] onToolStart', { name, input });
         // Cerrar el segmento de texto actual (drop si quedó vacío).
         if (currentAssistantId !== null) {
           closeAssistantMessage(currentAssistantId, true);
@@ -189,8 +201,14 @@ export async function sendMessage(sessionId: number, content: string): Promise<b
         }
         const toolId = pushToolMessage(name, input);
         pendingTools.push({ id: toolId, name });
+        // Si arranca la captura, resetear el estado vivo del pipeline.
+        if (name === 'run_requirements_capture') {
+          console.log('[chat] startCapture() fired');
+          startCapture();
+        }
       },
       onToolEnd: (name, output) => {
+        console.log('[chat] onToolEnd', { name, outputPreview: typeof output === 'string' ? output.slice(0, 200) : output });
         // FIFO match por nombre: primer pending con mismo name.
         const idx = pendingTools.findIndex((p) => p.name === name);
         if (idx >= 0) {
@@ -198,6 +216,22 @@ export async function sendMessage(sessionId: number, content: string): Promise<b
           completeToolMessage(match.id, output);
         }
         // Sin match: no hay tool message para cerrar, ignorar.
+        // Fin de la captura: conservar hallazgos en UI, sólo bajar flag running.
+        if (name === 'run_requirements_capture') {
+          endCapture();
+        }
+      },
+      onProgress: (p) => {
+        captureStage.set(p);
+      },
+      onConflict: (c) => {
+        conflicts.update((list) => [...list, c]);
+      },
+      onValidationReport: (r) => {
+        validationReport.set(r);
+      },
+      onRequirementAdded: (req) => {
+        addedRequirements.update((list) => [...list, req]);
       },
       onCompleted: () => {
         if (currentAssistantId !== null) {
@@ -240,27 +274,41 @@ export function cancelStream(): void {
 }
 
 /** Carga el historial de una sesión (desde GET /api/chat/sessions/{id}) y
- *  lo convierte en Message[]. */
-export function loadHistoryFromDetail(
-  msgs: Array<{ id: number; role: string; content: string; created_at: string }>
-): Message[] {
-  return msgs.map((m) => {
+ *  lo convierte en Message[]. Incluye llamadas a herramientas (role:'tool')
+ *  reconstruidas desde el checkpointer del agente, además de user/assistant. */
+export function loadHistoryFromDetail(msgs: MessageOut[]): Message[] {
+  const out: Message[] = [];
+  for (const m of msgs) {
     if (m.role === 'user') {
-      return {
+      out.push({
         kind: 'user',
         id: `u-${m.id}`,
         content: m.content,
         created_at: m.created_at
-      };
+      });
+    } else if (m.role === 'tool') {
+      out.push({
+        kind: 'tool',
+        id: `t-${m.id}`,
+        name: m.tool_name ?? '',
+        input: (m.tool_args as ToolInput | null | undefined) ?? {},
+        output: m.content || null,
+        status: m.status === 'running' ? 'running' : 'done',
+        created_at: m.created_at
+      });
+    } else {
+      // assistant: omitir blobs vacíos (no renderizan en histórico).
+      if (!m.content) continue;
+      out.push({
+        kind: 'assistant',
+        id: `a-${m.id}`,
+        content: m.content,
+        streaming: false,
+        created_at: m.created_at
+      });
     }
-    return {
-      kind: 'assistant',
-      id: `a-${m.id}`,
-      content: m.content,
-      streaming: false,
-      created_at: m.created_at
-    };
-  });
+  }
+  return out;
 }
 
 /** Resetea para tests. */

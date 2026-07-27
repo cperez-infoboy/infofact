@@ -23,6 +23,7 @@
   } from '$lib/stores/chat';
   import { renderMarkdown } from '$lib/utils/markdown';
   import ToolIcon from './ToolIcon.svelte';
+  import CaptureStatus from './CaptureStatus.svelte';
 
   let { } = $props();
 
@@ -151,6 +152,9 @@
       <span class="text-xs text-text-dim font-mono">#{$currentSession.id}</span>
     {/if}
   </div>
+
+  <!-- Estado vivo del pipeline de captura (eventos finos SSE) -->
+  <CaptureStatus />
 
   <!-- Mensajes -->
   <div class="flex-1 min-h-0 m-2">

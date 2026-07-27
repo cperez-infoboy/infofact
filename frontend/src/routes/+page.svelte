@@ -10,11 +10,16 @@
   import MenuBar from '$lib/components/MenuBar.svelte';
   import FileExplorer from '$lib/components/FileExplorer.svelte';
   import FileViewer from '$lib/components/FileViewer.svelte';
+  import SrsViewer from '$lib/components/SrsViewer.svelte';
   import ChatPanel from '$lib/components/ChatPanel.svelte';
   import StatusBar from '$lib/components/StatusBar.svelte';
   import ResizeHandle from '$lib/components/ResizeHandle.svelte';
+  import { currentProjectId } from '$lib/stores/project';
 
   let { } = $props();
+
+  // Toggle del visor de SRS (overlay sobre el FileViewer).
+  let srsOpen = $state(false);
 
   // Redirige a /login si no hay sesión.
   $effect(() => {
@@ -81,9 +86,25 @@
 
       <ResizeHandle onResize={onExplorerResize} />
 
-      <!-- Viewer (flex-1) -->
-      <div class="flex-1 min-w-0">
+      <!-- Viewer (flex-1): FileViewer o SrsViewer overlay -->
+      <div class="flex-1 min-w-0 relative">
         <FileViewer />
+        {#if srsOpen}
+          <div class="absolute inset-0 z-10">
+            <SrsViewer projectId={$currentProjectId} onClose={() => (srsOpen = false)} />
+          </div>
+        {/if}
+        <!-- Toggle SRS: botón flotante esquina superior del viewer -->
+        <button
+          type="button"
+          class="absolute top-1 right-2 z-20 px-2 py-0.5 text-[10px] font-mono uppercase tracking-wider rounded-sm border border-border bg-surface-2 text-text-dim hover:bg-surface-3 hover:text-text transition-colors {srsOpen
+            ? 'bg-accent text-bg border-accent'
+            : ''}"
+          onclick={() => (srsOpen = !srsOpen)}
+          title="Ver SRS generado desde los requerimientos capturados"
+        >
+          SRS
+        </button>
       </div>
 
       <ResizeHandle onResize={onChatResize} />

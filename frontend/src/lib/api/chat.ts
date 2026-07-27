@@ -8,16 +8,66 @@
 //   event: completed\ndata: {}
 //   event: failed\ndata: {"error": "..."}
 //   event: extraction.progress\ndata: {"stage": "...", "message": "..."}
+//   event: conflict.found\ndata: {kind:"duplicate"|"contradiction", ...}
+//   event: validation.report\ndata: {total, kept, rejected, flagged}
+//   event: requirement.added\ndata: {code, statement, type, priority, ...}
 
 export interface ToolInput {
   [key: string]: unknown;
+}
+
+/** Coarse pipeline stage (extraction.progress). */
+export interface ProgressEvent {
+  stage: string;
+  message: string;
+}
+
+/** Fine event: one per duplicate or contradiction (conflict.found). */
+export interface ConflictDuplicate {
+  kind: 'duplicate';
+  kept_id: string;
+  member_ids: string[];
+  kept_statement: string;
+}
+export interface ConflictContradiction {
+  kind: 'contradiction';
+  a_id: string;
+  b_id: string;
+  reason: string;
+  confidence: number;
+}
+export type ConflictEvent = ConflictDuplicate | ConflictContradiction;
+
+/** Fine event: post-critique summary (validation.report). */
+export interface ValidationReport {
+  total: number;
+  kept: number;
+  rejected: number;
+  flagged: number;
+}
+
+/** Fine event: one per persisted row (requirement.added). */
+export interface RequirementAdded {
+  code: string;
+  statement: string;
+  type: string;
+  priority: string;
+  explicit: boolean;
+  derived: boolean;
+  confidence: number;
+  span_verified: boolean;
+  source: unknown;
+  parent_code?: string;
 }
 
 export interface StreamHandlers {
   onToken?: (delta: string) => void;
   onToolStart?: (name: string, input: ToolInput) => void;
   onToolEnd?: (name: string, output: string) => void;
-  onProgress?: (stage: string, message: string) => void;
+  onProgress?: (p: ProgressEvent) => void;
+  onConflict?: (c: ConflictEvent) => void;
+  onValidationReport?: (r: ValidationReport) => void;
+  onRequirementAdded?: (r: RequirementAdded) => void;
   onCompleted?: () => void;
   onFailed?: (error: string) => void;
 }
@@ -136,6 +186,9 @@ export async function streamMessage(
 }
 
 function dispatchEvent(ev: ParsedEvent, handlers: StreamHandlers): void {
+  // DEBUG: ver todos los eventos SSE que llegan del backend.
+  // Quitar tras diagnosticar el flujo del subagente.
+  console.log('[sse] event', ev.event, ev.data);
   let payload: Record<string, unknown> = {};
   try {
     payload = JSON.parse(ev.data);
@@ -163,10 +216,24 @@ function dispatchEvent(ev: ParsedEvent, handlers: StreamHandlers): void {
       );
       break;
     case 'extraction.progress':
-      handlers.onProgress?.(
-        (payload.stage as string) ?? '',
-        (payload.message as string) ?? ''
-      );
+      handlers.onProgress?.({
+        stage: (payload.stage as string) ?? '',
+        message: (payload.message as string) ?? '',
+      });
+      break;
+    case 'conflict.found':
+      handlers.onConflict?.(payload as unknown as ConflictEvent);
+      break;
+    case 'validation.report':
+      handlers.onValidationReport?.({
+        total: Number(payload.total ?? 0),
+        kept: Number(payload.kept ?? 0),
+        rejected: Number(payload.rejected ?? 0),
+        flagged: Number(payload.flagged ?? 0),
+      });
+      break;
+    case 'requirement.added':
+      handlers.onRequirementAdded?.(payload as unknown as RequirementAdded);
       break;
     case 'completed':
       handlers.onCompleted?.();

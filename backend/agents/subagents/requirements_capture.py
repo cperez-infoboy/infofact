@@ -1,13 +1,19 @@
 """The requirements-capture subagent.
 
-A thin conversational orchestrator that owns two concerns:
-1. run_requirements_capture — a single deterministic tool that runs the full
+A thin conversational orchestrator that owns three concerns:
+1. check_capture_health — a fast pre-flight that probes the environment (deps,
+   LLM endpoint, workspace writability) BEFORE the long pipeline runs, so a
+   broken dependency fails here with a remediation hint instead of mid-capture.
+2. run_requirements_capture — a single deterministic tool that runs the full
    pipeline (ingest -> extract -> consolidate -> critique -> classify -> persist)
    over the project's documents. The heavy lifting is NOT an agentic loop: it is
    one Python function, so the pipeline is deterministic and the subagent only
    decides when to call it and how to report back.
-2. The editing tool set (make_requirements_tools) — approve, reject, merge,
+3. The editing tool set (make_requirements_tools) — approve, reject, merge,
    split, link, resolve, list, get, add, update, add_acceptance_criterion.
+4. The grouping-review tools (make_grouping_tools) — review_grouping builds an
+   editable Markdown merge plan from the live store; apply_grouping_plan merges
+   each group after the user edits it.
 
 The subagent never invents requirements: every item comes from the pipeline
 (with a source span) or from an explicit human add_requirement. Conflicts and
@@ -26,7 +32,10 @@ from typing import Any
 from langchain_core.tools import tool
 
 from backend.services.requirements_service import run_requirements_pipeline
+from backend.agents.pipelines.preflight import check_capture_environment
 from backend.agents.tools.requirements_tools import make_requirements_tools
+from backend.agents.tools.grouping_tools import make_grouping_tools
+from backend.agents.tools.vision_tools import make_vision_tools
 
 
 REQUIREMENTS_CAPTURE_PROMPT = """Eres el subagente de captura y validacion de requerimientos de InfoFact.
@@ -37,19 +46,45 @@ Tu trabajo:
    el proyecto; si el usuario indica una carpeta, pasa su ruta relativa a
    run_requirements_capture.
 
-2. Invocar run_requirements_capture para ejecutar el pipeline completo:
+2. ANTES de capturar, llamar a check_capture_health para verificar el entorno
+   (imports de docling/opencv/tiktoken/sentence-transformers, endpoint LLM,
+   escritura del workspace). Si algun probe falla, reportar el hint de
+   remediacion al usuario y NO invocar run_requirements_capture hasta que se
+   resuelva (asi se evita un bloqueo a mitad de captura).
+
+3. Invocar run_requirements_capture para ejecutar el pipeline completo:
    ingesta, extraccion, consolidacion, critica, clasificacion y persistencia.
    El pipeline es deterministico (una sola funcion); no intentes reimplementar
    sus pasos con otras herramientas.
 
-3. Reportar los hallazgos al usuario: total persistido, documentos procesados,
+4. Reportar los hallazgos al usuario: total persistido, documentos procesados,
    duplicados propuestos, contradicciones detectadas, items marcados para
    revision y items rechazados por posible alucinacion.
 
-4. Ayudar a revisar y editar los requerimientos con las herramientas de edicion:
+5. Ayudar a revisar y editar los requerimientos con las herramientas de edicion:
    listar, ver detalle, aprobar, rechazar, fusionar duplicados, partir items no
    atomicos, enlazar dependencias, resolver conflictos y agregar criterios de
    aceptacion.
+
+6. Revision de agrupamiento (duplicados en el store):
+   - Cuando el usuario pida revisar duplicados o agrupamiento, llamar a
+     review_grouping. Detecta grupos de duplicados (verbatim y semanticos) sobre
+     el store actual y escribe un plan editable en
+     .infofact/grouping-plans/<timestamp>/plan.md, ademas de devolverlo para
+     mostrarlo en el chat.
+   - El usuario revisa el plan y puede pedir cambios (por ejemplo, "en el grupo
+     2, que el keeper sea REQ-012, y borrar el grupo 3"). Reescribir el plan con
+     write_file segun sus indicaciones y volver a mostrarlo para confirmar antes
+     de aplicar.
+   - Cuando el usuario aprueba, llamar a apply_grouping_plan (por defecto aplica
+     el plan propuesto mas reciente). Valida cada REQ contra el store, fusiona
+     cada grupo (union de sources, soft-delete de los perdedores) y es
+     idempotente (re-aplicar un plan ya aplicado reporta already_applied). Reportar
+     el resultado por grupo (applied / already_applied / invalid).
+   - Para listar planes previos (reanudar una revision o auditar lo aplicado),
+     llamar a list_grouping_plans.
+   - NUNCA aplicar un plan sin confirmacion explicita del usuario: las fusiones
+     son destructivas (soft-delete de los perdedores).
 
 Reglas estrictas:
 
@@ -57,7 +92,8 @@ Reglas estrictas:
   source_span) o ser agregado explicitamente por el usuario con add_requirement.
 - Los conflictos y duplicados NO se resuelven automaticamente: los propones y el
   humano decide. Usa link_requirements para marcar y resolve_conflict solo cuando
-  el humano indique el ganador.
+  el humano indique el ganador. Las fusiones del plan de agrupamiento tambien
+  requieren aprobacion explicita del usuario.
 - Las eliminaciones son logicas (soft-delete): el historial siempre se conserva.
 - Habla en espanol neutro. Se conciso y tecnico.
 """
@@ -119,6 +155,38 @@ def _make_emitters():
             return
 
     return _emit_progress, _emit_event
+
+
+def _make_check_health_tool():
+    """Build the check_capture_health tool.
+
+    Wraps ``check_capture_environment`` (pure probes) and streams a coarse
+    progress event so the UI shows 'verificando entorno' before the long capture
+    run. No project closure is needed — the probes read global settings.
+    """
+
+    @tool
+    async def check_capture_health() -> dict:
+        """Verify the capture environment BEFORE running the pipeline.
+
+        Probes dependency imports (docling, opencv, tiktoken,
+        sentence-transformers), LLM endpoint reachability, and workspace
+        writability. Fast (<2s). Call this FIRST, before
+        run_requirements_capture, so a broken dependency fails here with a
+        remediation hint instead of crashing mid-capture.
+        """
+        on_progress, _on_event = _make_emitters()
+        await on_progress("preflight", "Verificando entorno de captura...")
+        report = check_capture_environment()
+        if not report.ok:
+            failing = ", ".join(p.name for p in report.failures())
+            await on_progress(
+                "preflight_failed",
+                f"Entorno con problemas: {failing}",
+            )
+        return report.as_dict()
+
+    return check_capture_health
 
 
 def _make_run_capture_tool(
@@ -201,8 +269,10 @@ def make_requirements_capture_subagent(
 ) -> dict[str, Any]:
     """Build the requirements-capture subagent dict for DeepAgents.
 
-    Tools: the capture pipeline (one deterministic call) + the 12 editing tools.
-    project_id is closed over so the model cannot address another project's rows.
+    Tools: the pre-flight health check + the capture pipeline (one deterministic
+    call) + the editing tools + the grouping-review tools, plus the
+    image-inspection tool when vision is configured. project_id is closed over
+    so the model cannot address another project's rows.
     """
     # Imported here to avoid a config import at module load time (tests that
     # rebind settings work without surprises).
@@ -211,6 +281,7 @@ def make_requirements_capture_subagent(
     host_workspace = (
         Path(settings.workspaces_host_root) / profile / project_slug
     )
+    health_tool = _make_check_health_tool()
     capture_tool = _make_run_capture_tool(
         project_id,
         host_workspace,
@@ -218,6 +289,8 @@ def make_requirements_capture_subagent(
         project_description,
     )
     editing_tools = make_requirements_tools(project_id)
+    grouping_tools = make_grouping_tools(project_id, host_workspace)
+    vision_tools = make_vision_tools(profile, project_slug)
 
     return {
         "name": "requirements-capture",
@@ -226,9 +299,16 @@ def make_requirements_capture_subagent(
             "cliente (RFPs, minutas, especificaciones, contratos) y edita el "
             "store de requerimientos resultante. Usalo cuando el usuario suba "
             "documentos de cliente, pida extraer o validar requerimientos, use "
-            "el comando /captura, o quiera aprobar, rechazar, fusionar o partir "
-            "un requerimiento existente."
+            "el comando /captura, quiera aprobar, rechazar, fusionar o partir "
+            "un requerimiento existente, o pida revisar el agrupamiento de "
+            "duplicados del store."
         ),
         "system_prompt": REQUIREMENTS_CAPTURE_PROMPT,
-        "tools": [capture_tool, *editing_tools],
+        "tools": [
+            health_tool,
+            capture_tool,
+            *editing_tools,
+            *grouping_tools,
+            *vision_tools,
+        ],
     }

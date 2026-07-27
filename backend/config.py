@@ -39,6 +39,18 @@ class Settings(BaseSettings):
     llm_base_url: str = "https://api.z.ai/api/coding/paas/v4"
     llm_model: str = "glm-5.2"
 
+    # Vision (image understanding) for /captura over diagrams and UI mockups.
+    # GLM-5.2 is text-only; vision needs a separate multimodal model. glm-4.6v
+    # is available on the same Coding Plan endpoint + API key as glm-5.2 and
+    # handles diagrams, mockups and generic images (verified against the live
+    # endpoint). glm-5v-turbo (multimodal coding, better for UI mockups) needs a
+    # higher plan; leave llm_vision_model_ui empty to reuse llm_vision_model for
+    # every image kind, or set it once your plan includes it.
+    llm_vision_model: str = "glm-4.6v"
+    llm_vision_model_ui: str = ""  # e.g. "glm-5v-turbo"; empty -> reuse llm_vision_model
+    vision_image_max_bytes: int = 5 * 1024 * 1024  # Z.ai cap: 5MB / 6000x6000 per image
+    vision_max_pictures_per_doc: int = 12  # bound vision calls on image-heavy PDFs
+
     # Agent container lifecycle
     agent_image: str = "infofact-agent"
     # Path en el HOST donde viven los workspaces por perfil. En dev es relativo
@@ -67,6 +79,17 @@ class Settings(BaseSettings):
     # de redirects; si un sitio cuelga, la tool devuelve error en vez de
     # bloquear el turno del agente (ver incidente de la sesión 6).
     web_tool_timeout: int = 15
+
+    @property
+    def supports_vision(self) -> bool:
+        """Whether image understanding is available.
+
+        Gated on API key + a configured vision model — NOT on the text model
+        name: GLM-5.2 cannot see images, but glm-4.6v shares its key and
+        endpoint. When False, the capture pipeline degrades to Docling-only and
+        the analyze_image subagent tool is not registered.
+        """
+        return bool(self.llm_api_key and self.llm_vision_model)
 
 
 settings = Settings()

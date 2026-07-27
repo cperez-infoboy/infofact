@@ -26,6 +26,8 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from backend.config import settings
+
 logger = logging.getLogger(__name__)
 
 # Docling parses these natively (pdf, office, html, images). CSV/MD/TXT are
@@ -36,15 +38,22 @@ logger = logging.getLogger(__name__)
 DOCLING_EXTENSIONS = {
     ".pdf", ".docx", ".doc", ".pptx", ".ppt", ".html", ".htm",
     ".rtf", ".odt", ".png", ".jpg", ".jpeg", ".tiff",
-    ".xlsx", ".xls",
+    ".xlsx", ".xls", ".webp", ".bmp",
 }
 PLAINTEXT_EXTENSIONS = {".txt", ".md", ".csv"}
 DOC_EXTENSIONS = DOCLING_EXTENSIONS | PLAINTEXT_EXTENSIONS
+
+# Standalone raster images. Docling handles their OCR/layout; when vision is
+# available the vision model also describes them semantically.
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tiff", ".webp", ".bmp"}
 
 # Directories that never contain client documents.
 _IGNORED_DIRS = {
     ".git", "node_modules", "__pycache__", ".venv", "venv",
     ".next", "dist", "build", "target", "data",
+    # InfoFact internal metadata (grouping plans, capture reports). Must never
+    # be parsed as a client document — see backend/agents/pipelines/grouping.py.
+    ".infofact",
 }
 
 # Labels Docling attaches to text items that represent document headings.
@@ -160,11 +169,147 @@ def _resolve_docling():
 
 
 def convert_document(path: Path):
-    """Parse one document into a DoclingDocument (layout-aware)."""
+    """Parse one document into a DoclingDocument (layout-aware).
+
+    When vision is configured, PDFs are converted with
+    ``generate_picture_images=True`` so embedded pictures materialize and can be
+    described downstream by ``_describe_embedded_pictures``.
+    """
     DocumentConverter, _HybridChunker = _resolve_docling()
     logger.info("Converting document: %s", path)
-    result = DocumentConverter().convert(path)
+    if _vision_enabled() and path.suffix.lower() == ".pdf":
+        converter = _make_vision_converter()
+    else:
+        converter = DocumentConverter()
+    result = converter.convert(path)
     return result.document
+
+
+# ---------------------------------------------------------------------------
+# Vision layer (semantic image description — only runs when configured)
+# ---------------------------------------------------------------------------
+
+def _vision_enabled() -> bool:
+    """Whether the vision model is available in this deployment."""
+    return settings.supports_vision
+
+
+def _make_vision_converter():
+    """DocumentConverter configured to materialize embedded PDF pictures.
+
+    With ``generate_picture_images=True`` each embedded picture becomes a
+    drawable image that ``_describe_embedded_pictures`` can read. Lazy import;
+    these classes ship with docling.
+    """
+    from docling.document_converter import DocumentConverter, PdfFormatOption
+    from docling.datamodel.base_models import InputFormat
+    from docling.datamodel.pipeline_options import PdfPipelineOptions
+
+    pipeline_options = PdfPipelineOptions()
+    pipeline_options.generate_picture_images = True
+    return DocumentConverter(
+        format_options={
+            InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
+        }
+    )
+
+
+def _pil_to_temp_png(image) -> str:
+    """Persist a PIL image to a temporary PNG file and return its path."""
+    import os
+    import tempfile
+
+    fd, tmp_path = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    image.save(tmp_path, format="PNG")
+    return tmp_path
+
+
+def _picture_page(item) -> int | None:
+    """Best-effort page number from a Docling item's provenance (1-based)."""
+    prov = getattr(item, "prov", None)
+    if not prov:
+        return None
+    try:
+        return getattr(prov[0], "page_no", None)
+    except (IndexError, AttributeError):
+        return None
+
+
+def _describe_standalone_image(path: Path, document_id: str) -> list[Chunk]:
+    """Describe a standalone raster image with the vision model."""
+    try:
+        from backend.agents.vision import describe_image
+
+        description = describe_image(path)
+    except Exception as exc:  # vision must never break ingestion
+        logger.warning("Vision describe failed for %s: %s", path, exc)
+        return []
+    if not description or not description.strip():
+        return []
+    return [Chunk(
+        text=description,
+        document_id=document_id,
+        section_path=path.name,
+        element_kinds=("image_description",),
+    )]
+
+
+def _describe_embedded_pictures(doc, document_id: str) -> list[Chunk]:
+    """Materialize and semantically describe pictures embedded in a document."""
+    try:
+        from docling_core.types.doc import PictureItem
+        from backend.agents.vision import MIN_IMAGE_EDGE, describe_image
+    except ImportError as exc:
+        logger.warning("Picture types unavailable for vision: %s", exc)
+        return []
+
+    max_pictures = settings.vision_max_pictures_per_doc
+    out: list[Chunk] = []
+    count = 0
+    for item, _level in doc.iterate_items(traverse_pictures=True):
+        if not isinstance(item, PictureItem):
+            continue
+        if count >= max_pictures:
+            logger.info(
+                "Vision picture cap (%d) reached for %s; skipping the rest",
+                max_pictures, document_id,
+            )
+            break
+        try:
+            image = item.get_image(doc)
+        except Exception as exc:
+            logger.debug("get_image failed for an embedded picture: %s", exc)
+            continue
+        if image is None:
+            continue
+        # Z.ai rejects images below its minimum edge; skip tiny icons silently
+        # so an icon-heavy document does not flood the log with warnings.
+        if min(image.size) < MIN_IMAGE_EDGE:
+            continue
+        tmp_path = _pil_to_temp_png(image)
+        try:
+            description = describe_image(Path(tmp_path))
+        except Exception as exc:
+            logger.warning("Vision describe failed for an embedded picture: %s", exc)
+            continue
+        finally:
+            import os
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        if not description or not description.strip():
+            continue
+        out.append(Chunk(
+            text=description,
+            document_id=document_id,
+            section_path="Imagen embebida",
+            element_kinds=("image_description",),
+            page=_picture_page(item),
+        ))
+        count += 1
+    return out
 
 
 def _meta(chunk):
@@ -366,6 +511,8 @@ def ingest_document(path: Path) -> tuple[list[Chunk], StructureMap]:
     """Full ingestion of one document: element-aware chunks + structural map.
 
     Plaintext skips Docling; everything else goes through the layout parser.
+    When vision is configured, images (standalone or embedded) are also
+    described semantically and appended as ``image_description`` chunks.
     """
     document_id = str(path)
     suffix = path.suffix.lower()
@@ -381,5 +528,10 @@ def ingest_document(path: Path) -> tuple[list[Chunk], StructureMap]:
 
     doc = convert_document(path)
     chunks = chunk_document(doc, document_id=document_id)
+    if _vision_enabled():
+        if suffix in IMAGE_EXTENSIONS:
+            chunks.extend(_describe_standalone_image(path, document_id))
+        else:
+            chunks.extend(_describe_embedded_pictures(doc, document_id))
     smap = build_structure_map(doc, document_id=document_id)
     return chunks, smap

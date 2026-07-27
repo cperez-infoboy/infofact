@@ -19,10 +19,14 @@ export interface SessionOut {
 }
 
 export interface MessageOut {
-  id: number;
+  id: number | string;
   role: string;
   content: string;
   created_at: string;
+  tool_name?: string | null;
+  tool_call_id?: string | null;
+  tool_args?: Record<string, unknown> | null;
+  status?: string | null;
 }
 
 export interface ProjectDetail extends ProjectOut {
@@ -41,6 +45,21 @@ export interface ProjectCreateBody {
 
 export interface SessionCreateBody {
   title?: string;
+}
+
+export interface SrsCounts {
+  live: number;
+  soft_deleted: number;
+  open_relations: number;
+  by_type: Record<string, number>;
+  by_priority: Record<string, number>;
+}
+
+export interface SrsOut {
+  project_id: number;
+  markdown: string;
+  generated_at: string;
+  counts: SrsCounts;
 }
 
 /** Lista los proyectos del usuario (sin initial_session_id). */
@@ -80,4 +99,9 @@ export function listSessions(projectId: number): Promise<SessionOut[]> {
 /** Detalle de una sesión con sus mensajes. */
 export function getSessionDetail(sessionId: number): Promise<SessionDetail> {
   return apiFetch<SessionDetail>(`/api/chat/sessions/${sessionId}`);
+}
+
+/** Obtiene el SRS Markdown generado desde los RequirementItem del proyecto. */
+export function getProjectSrs(projectId: number): Promise<SrsOut> {
+  return apiFetch<SrsOut>(`/api/projects/${projectId}/srs`);
 }
