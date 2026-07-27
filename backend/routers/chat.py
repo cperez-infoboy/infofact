@@ -132,16 +132,33 @@ def _sanitize_error(exc: Exception) -> str:
 # command como directiva fuerte al subagente requirements-capture. Sin arg =
 # proyecto completo; con arg = subpath relativo al workspace.
 _CAPTURA_PREFIX = "/captura"
+_AGRUPAR_PREFIX = "/agrupar"
 
 
 def _rewrite_command(content: str) -> str:
-    """Reescribe ``/captura [subpath]`` en una directiva al subagente.
+    """Reescribe los slash commands en directivas al subagente.
 
-    El mensaje crudo del usuario (el ``/captura`` literal) ya se persistió en
+    - ``/captura [subpath]`` -> captura y validación de requerimientos.
+    - ``/agrupar`` -> revisión de duplicados (plan de agrupamiento editable).
+
+    El mensaje crudo del usuario (el comando literal) ya se persistió en
     ChatMessage antes del stream; esta reescritura solo cambia lo que recibe el
     agente, para que delegue de forma casi determinista.
     """
     stripped = content.strip()
+
+    if stripped.startswith(_AGRUPAR_PREFIX):
+        # /agrupar no toma argumentos: review_grouping lee todo el store vivo.
+        return (
+            "[DIRECTIVE] Delega al subagente `requirements-capture` para revisar "
+            "el agrupamiento de duplicados del store de requerimientos. Invoca la "
+            "tool `review_grouping` para generar un plan de agrupamiento editable "
+            "(lo escribe bajo .infofact/grouping-plans/ y lo devuelve para mostrar "
+            "al usuario). NO apliques el plan todavía: muéstralo y espera a que el "
+            "usuario lo edite o lo apruebe explícitamente antes de llamar "
+            "`apply_grouping_plan`."
+        )
+
     if not stripped.startswith(_CAPTURA_PREFIX):
         return content
     # Acepta "/captura docs/x" (formato del plan §9.4) y "/captura/docs/x"
