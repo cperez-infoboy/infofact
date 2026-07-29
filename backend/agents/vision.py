@@ -42,34 +42,50 @@ _MAX_IMAGE_EDGE = 6000
 # --- prompts (neutral Spanish; project convention: no voseo, no spanglish) --
 
 _CLASSIFY_SYSTEM = (
-    "Clasificá la imagen adjunta en exactamente una de tres categorías, "
+    "Clasifique la imagen adjunta en exactamente una de tres categorías, "
     "respondiendo solo con la palabra correspondiente:\n"
     "- diagram: diagramas técnicos, de arquitectura, de flujo, ER, UML, "
-    "esquemas, organigramas, mapas conceptuales.\n"
+    "esquemas de base de datos, organigramas, mapas conceptuales.\n"
     "- mockup: bocetos o capturas de interfaz de usuario (pantallas, formularios, "
     "tableros, wireframes).\n"
     "- generic: cualquier otra imagen (logo, foto, gráfico de datos, ilustración).\n"
-    "Respondé con una sola palabra: diagram, mockup o generic."
+    "Responda con una sola palabra: diagram, mockup o generic."
 )
 
 _DIAGRAM_PROMPT = (
-    "Esta imagen es un diagrama técnico o arquitectónico dentro de un documento "
-    "de cliente. Describilo con el detalle necesario para derivar requerimientos "
-    "de software. Estructurá la descripción así:\n"
-    "1. Tipo de diagrama y propósito.\n"
-    "2. Actores, componentes, entidades o nodos (con sus nombres exactos).\n"
-    "3. Relaciones, conexiones, flujos o dependencias (quién se conecta con quién "
-    "y en qué sentido).\n"
-    "4. Procesos, estados, reglas o restricciones visibles (flechas, etiquetas, "
-    "leyendas, anotaciones).\n"
-    "5. Cualquier dato, métrica o parámetro explícito.\n"
-    "Usá nombres y etiquetas tal como aparecen. No inventes lo que no se ve."
+    "Esta imagen es un diagrama técnico dentro de un documento de cliente. "
+    "Primero identifique de qué tipo de diagrama se trata (esquema de base de "
+    "datos o entidad-relación, arquitectura de componentes o despliegue, flujo "
+    "de proceso, diagrama de clases UML, organigrama, etc.) y luego descríbalo "
+    "con el detalle necesario para derivar requerimientos de software, usando el "
+    "marco que corresponda al tipo detectado.\n\n"
+    "Si es un ESQUEMA DE BASE DE DATOS o entidad-relación, estructure así:\n"
+    "1. Entidades o tablas (con sus nombres exactos).\n"
+    "2. Campos, columnas o atributos de cada entidad (nombre y tipo visible: "
+    "texto, número, fecha, booleano, etc.).\n"
+    "3. Claves: primarias (PK) y foráneas (FK), indicando a qué entidad apunta "
+    "cada foránea.\n"
+    "4. Relaciones entre entidades con su cardinalidad (1:1, 1:N, N:M) y, si se "
+    "indica, si es obligatoria u opcional.\n"
+    "5. Restricciones o reglas de integridad visibles (unicidad, no nulo, etc.).\n"
+    "Importante: las entidades son tablas y las relaciones son referencias entre "
+    "tablas; NO las describa como componentes ni como flujos de datos.\n\n"
+    "Si es un diagrama de ARQUITECTURA o COMPONENTES, estructure así:\n"
+    "1. Componentes, servicios o nodos (con sus nombres exactos).\n"
+    "2. Conexiones y dependencias (quién se conecta con quién y en qué sentido).\n"
+    "3. Tecnologías, protocolos o capas visibles.\n"
+    "4. Responsabilidades o reglas implícitas.\n\n"
+    "Si es un diagrama de FLUJO DE PROCESO, estructure así:\n"
+    "1. Actores o roles participantes.\n"
+    "2. Pasos o actividades en orden, con decisiones y bifurcaciones.\n"
+    "3. Eventos de inicio y de fin.\n\n"
+    "Use nombres y etiquetas tal como aparecen. No invente lo que no se ve."
 )
 
 _MOCKUP_PROMPT = (
     "Esta imagen es un boceto o captura de una interfaz de usuario dentro de un "
-    "documento de cliente. Describila con el detalle necesario para derivar "
-    "requerimientos de software. Estructurá la descripción así:\n"
+    "documento de cliente. Descríbala con el detalle necesario para derivar "
+    "requerimientos de software. Estructure la descripción así:\n"
     "1. Pantalla o ventana y su propósito.\n"
     "2. Elementos de interfaz visibles (encabezados, barras, menús, pestañas, "
     "tablas, listas, tarjetas).\n"
@@ -79,14 +95,14 @@ _MOCKUP_PROMPT = (
     "5. Estados, validaciones o reglas implícitas (deshabilitado, error, "
     "obligatoriedad, formatos).\n"
     "6. Navegación o jerarquía entre pantallas, si se infiere.\n"
-    "Usá etiquetas y textos tal como aparecen. No inventes campos no visibles."
+    "Use etiquetas y textos tal como aparecen. No invente campos no visibles."
 )
 
 _GENERIC_PROMPT = (
-    "Describí esta imagen con el detalle necesario para derivar requerimientos "
-    "de software. Identificá elementos de texto (etiquetas, títulos, datos "
+    "Describa esta imagen con el detalle necesario para derivar requerimientos "
+    "de software. Identifique elementos de texto (etiquetas, títulos, datos "
     "numéricos), la naturaleza del contenido y cualquier regla o restricción "
-    "implícita. No inventes lo que no se ve."
+    "implícita. No invente lo que no se ve."
 )
 
 _PROMPT_BY_KIND: dict[str, str] = {
@@ -99,13 +115,22 @@ _PROMPT_BY_KIND: dict[str, str] = {
 # --- internals -------------------------------------------------------------
 
 def _vision_llm(model: str) -> ChatOpenAI:
-    """ChatOpenAI pointed at a vision model. Same endpoint/key as the text model."""
-    if not settings.llm_api_key:
-        raise RuntimeError("LLM_API_KEY is not set; vision unavailable.")
+    """ChatOpenAI pointed at a vision model.
+
+    Uses the vision-specific endpoint/key (LLM_VISION_*) when set, otherwise
+    falls back to the shared LLM_* values -- so vision can target any
+    OpenAI-compatible provider independently of the text agent.
+    """
+    api_key = settings.llm_vision_api_key or settings.llm_api_key
+    if not api_key:
+        raise RuntimeError(
+            "No API key for vision: set LLM_VISION_API_KEY (or LLM_API_KEY)."
+        )
+    base_url = settings.llm_vision_base_url or settings.llm_base_url
     return ChatOpenAI(
         model=model,
-        api_key=settings.llm_api_key,
-        base_url=settings.llm_base_url,
+        api_key=api_key,
+        base_url=base_url,
         temperature=0.0,
         streaming=False,
         stream_chunk_timeout=300,  # GLM can stall mid-stream; matches build_llm

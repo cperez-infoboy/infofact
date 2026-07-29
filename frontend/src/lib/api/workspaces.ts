@@ -7,6 +7,9 @@ export interface TreeNode {
   path: string;
   type: 'file' | 'dir';
   children?: TreeNode[];
+  // true si los hijos ya fueron cargados (lazy loading). Si es false,
+  // la carpeta puede tener hijos aún no explorados por el backend.
+  loaded?: boolean;
 }
 
 export interface FileContent {

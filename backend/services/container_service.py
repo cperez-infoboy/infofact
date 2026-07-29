@@ -78,7 +78,10 @@ async def _create_container(profile: str) -> str:
     # en compose cae bajo /app/data/workspaces/<profile> dentro del WebUI
     # container, que a su vez bind-mountea al host. El target del mount dentro
     # del container del agente SIEMPRE es WORKSPACE_CONTAINER_PATH.
-    ws_path = (Path(settings.workspaces_host_root) / profile).resolve()
+    # workspaces_root ya es absoluto (anclado al repo-root o host-path tal cual);
+    # el .resolve() final es idempotente y mantiene el path visible al host
+    # para el bind-mount DinD del agente.
+    ws_path = (settings.workspaces_root / profile).resolve()
     ws_path.mkdir(parents=True, exist_ok=True)
     # El agente corre uid 1000 en su container; el workspace debe ser
     # escribible por ese uid. Si el backend corre como root (producción),

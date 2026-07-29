@@ -20,7 +20,6 @@ from __future__ import annotations
 import logging
 import os
 from datetime import datetime
-from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
@@ -81,7 +80,7 @@ def _ensure_project_workspace_dir(profile: str, slug: str) -> None:
     del frontend aunque el agente todavía no haya escrito nada.
     """
     try:
-        target = Path(settings.workspaces_host_root) / profile / slug
+        target = settings.workspaces_root / profile / slug
         target.mkdir(parents=True, exist_ok=True)
         # El agente corre uid 1000 en su container; el workspace debe ser
         # escribible por ese uid. Si el backend corre como root (producción),

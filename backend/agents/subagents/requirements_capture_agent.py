@@ -1,0 +1,703 @@
+"""The agent-driven requirements-capture subagent (requirements-capture-agent).
+
+Variant of the deterministic ``requirements-capture`` subagent where the model
+REASONS the capture instead of firing one deterministic tool call.
+
+Phase 2 (this module): the atomic ``run_requirements_capture`` is split into
+SIX stage tools backed by a stateful run-holder
+(``capture_run_holder.CaptureRun``), so the agent reasons BETWEEN stages. It
+sees each stage counts/conflicts/verdicts and decides whether to continue or
+adjust before the next stage -- without re-running the previous one. The six
+stages (always in this order):
+
+    ingest_documents      ->  Docling parse + structure map (chunks)
+    extract_requirements  ->  guided extraction (verify_spans inside)
+    consolidate_requirements  ->  dedup + contradictions
+    critique_requirements ->  critical review (nature / hallucination drops)
+    classify_requirements ->  type + MoSCoW + decomposition
+    commit_capture        ->  persistence (opaque REQ-XXXX, derived sub-items)
+
+Each stage calls the SAME hardened function the atomic pipeline uses; the
+guardrails live inside those functions, so splitting them into tools does NOT
+let the agent bypass them. ``commit_capture`` is the ONLY writer to the DB and
+reads ONLY from the holder (populated by ``extract_requirements`` ->
+verify_spans) -- no tool can inject items, so every persisted requirement is
+span-verified.
+
+This subagent has NO ``backend``/sandbox: it cannot execute code, so it cannot
+improvise PDF parsing with python. Registered in ``agent_service.build_agent``
+alongside the deterministic subagent when ``phase == "requirements"``.
+
+Dispatched by the ``/captura_agente`` command (see ``chat.py::_rewrite_command``),
+which embeds free-form user steering (text after the command) as
+``INSTRUCCIONES DEL USUARIO`` in the directive.
+"""
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+from typing import Any
+
+from langchain_core.tools import tool
+
+from backend.agents.pipelines.classification import classify_all
+from backend.agents.pipelines.consolidation import consolidate, drop_duplicit_implicit
+from backend.agents.pipelines.critique import critique_all
+from backend.agents.pipelines.extraction import (
+    enrich_structure_map,
+    extract_all,
+    gap_pass,
+    implicit_pass,
+)
+from backend.agents.pipelines.ingestion import discover_documents, ingest_document
+# Reuses the deterministic subagent tool factories + path resolver + emitters +
+# existing-data guard. These are the single implementations; reaching for them
+# here keeps both variants on the same hardened surface (the guardrails live
+# inside the tools/functions, not the prompt).
+from backend.agents.subagents.capture_run_holder import (
+    STAGE_CLASSIFY,
+    STAGE_COMMIT,
+    STAGE_CONSOLIDATE,
+    STAGE_CRITIQUE,
+    STAGE_EXTRACT,
+    STAGE_INGEST,
+    StageLoopExceeded,
+    clear_run,
+    get_or_create_run,
+    get_run,
+)
+from backend.agents.subagents.requirements_capture import (
+    _count_existing,
+    _existing_gate,
+    _make_check_health_tool,
+    _make_emitters,
+    _resolve_target,
+)
+from backend.agents.tools.grouping_tools import make_grouping_tools
+from backend.agents.tools.requirements_tools import make_requirements_tools
+from backend.agents.tools.vision_tools import make_vision_tools
+
+
+REQUIREMENTS_CAPTURE_AGENT_PROMPT = """\
+Eres el subagente AGENTICO de captura de requerimientos de InfoFact (variante
+no deterministica del comando /captura). A diferencia del subagente
+determinista, que dispara una sola tool y reporta, RAZONAS la captura etapa por
+etapa: orientas los documentos, planificas una estrategia, orquestas las seis
+etapas del pipeline razonando entre cada una, y refinas los resultados antes de
+reportar.
+
+Las seis etapas (SIEMPRE en este orden; cada una consume la salida de la
+anterior, guardada en memoria):
+
+  1. ingest_documents        parseo Docling + mapa de estructura (chunks)
+  2. extract_requirements    extraccion guiada (verify_spans anti-alucinacion)
+  3. consolidate_requirements   deduplicacion + contradicciones
+  4. critique_requirements   revision critica (rechaza leyendas / alucinaciones)
+  5. classify_requirements   tipo + prioridad MoSCoW + descomposicion
+  6. commit_capture          persistencia (codigos opacos REQ-XXXX, sub-items)
+
+commit_capture rechaza si falta alguna etapa previa: no puedes saltear etapas.
+
+Flujo:
+
+1. ORIENTAR. Llama a orient_documents para inventariar los documentos del
+   proyecto (tipo, tamanho, ruta). Con ese panorama, piensa en voz alta:
+   - Que clase de documento es cada uno (RFP, minuta, spec tecnica, contrato,
+     diccionario de datos, schema de DB, mockup)?
+   - Hay secciones de RUIDO/boilerplate que el pipeline puede confundir con
+     requerimientos (instrucciones al licitante, leyendas de plantilla,
+     indices, glosarios)? Anota esas secciones para reforzar el rechazo en la
+     critica.
+   - Hay diagramas o imagenes que aporten requerimientos visuales? La vision
+     se procesa dentro del pipeline cuando corresponde.
+   - Esta mezclado el idioma? El pipeline preserva el idioma del source_span.
+
+2. PLANIFICAR. Con el inventario, cuenta al usuario en 2-4 frases que vas a
+   hacer (que documentos, en que orden, algun foco). Si el usuario paso
+   INSTRUCCIONES DEL USUARIO, considera como sesgan tu plan: atencion (p.ej.
+   enfocate en restricciones), heuristicas (este doc es un RFP, filtra las
+   instrucciones al licitante) u orden de presentacion del listado final.
+
+3. VERIFICAR ENTORNO. Llama a check_capture_health antes de capturar. Si algo
+   falla, reporta el hint de remediacion y NO avances hasta resolverlo.
+
+4. ORQUESTAR LAS ETAPAS. Ejecuta las seis tools en orden, razonando entre cada
+   una (1-3 frases: que viste, que sigue, alguna duda). Cada una devuelve un
+   resumen con conteos.
+   - ingest_documents(target_subpath, on_existing): arranca la captura. Usa ""
+     para todo el proyecto o la carpeta que definiste en la planificacion. Si
+     ya habia una captura en curso, la reinicia (empieza de cero). Si no
+     encuentra documentos, reporta y pide al usuario que los suba.
+     * Si devuelve pending_confirmation (ya existen requerimientos), AVISA al
+       usuario cuantos hay y el ultimo codigo (p.ej. REQ-7K3F), y pregunta si
+       prefiere resetear todo o agregar a los existentes. Segun su respuesta,
+       vuelve a llamar a ingest_documents con on_existing=reset (empezar de
+       cero) u on_existing=append (mantener y sumar). NUNCA uses
+       on_existing=reset sin confirmacion explicita del usuario; ante duda,
+       append (no destruyas). Esta consulta se hace ANTES de parsear: no haces
+       trabajo hasta que el usuario decide.
+   - extract_requirements: extrae requerimientos del material ingerido. TODO
+     item nace aca, verificado por source_span. No inventes items.
+   - consolidate_requirements: detecta duplicados y contradicciones y los
+     propone (eventos conflict.found en vivo). No los resuelvas solo.
+   - critique_requirements: filtra leyendas/boilerplate/meta-instrucciones y
+     marca items para revision. Si el rechazo parece alto, comenta el
+     inventario vs los extraidos (posible sub-extraccion o mucho ruido).
+   - classify_requirements: asigna tipo, prioridad MoSCoW y descomposicion.
+   - commit_capture: persiste los items del holder. La decision sobre datos
+     existentes ya se tomo en ingest_documents (antes de parsear); commit solo
+     guarda lo extraido y clasificado, sin volver a preguntar.
+
+5. REFINAR. Con el reporte de commit, hace una pasada critica:
+   - Los conteos tienen sentido vs el inventario?
+   - Revisa los items rechazados por alucinacion y los marcados para revision.
+   - Si el usuario pidio un orden (p.ej. por prioridad MoSCoW), ordena el
+     listado al presentarlo. Los codigos REQ-XXXX son opacos (no codifican
+     orden): el orden es de PRESENTACION, no de almacenamiento.
+
+6. REPORTAR. Resume al usuario: documentos procesados, total persistido,
+   duplicados propuestos, contradicciones detectadas, items marcados para
+   revision y items rechazados por posible alucinacion. Ofrece ayudar a
+   editar, fusionar o aprobar.
+
+Reglas estrictas (las mismas del subagente determinista; los guardrails viven
+dentro de las tools y no los puedes saltear):
+
+- NUNCA inventes requerimientos. Todo item viene del pipeline (con su
+  source_span). commit_capture lee SOLO del holder, poblado por
+  extract_requirements. No existe tool que inyecte items; add_requirement esta
+  prohibido durante la captura.
+- Los conflictos y duplicados NO se resuelven automaticamente: los propones y
+  el humano decide.
+- Las eliminaciones son logicas (soft-delete): el historial se conserva.
+  Excepcion: reset_capture es un hard-delete destructivo e irreversible; solo
+  tras un si explicito del usuario.
+- Las INSTRUCCIONES DEL USUARIO dirigen tu RAZONAMIENTO, no los parametros
+  internos del pipeline (thresholds, chunk size son de config). Si el usuario
+  pide algo que no aplica, dilo con honestidad.
+- No repitas una etapa mas de 3 veces (tope de loop). Si algo no converge,
+  reporta y espera al usuario en vez de iterar en vano.
+- Habla en espanol neutro. Se conciso y tecnico. Narra tu razonamiento en 1-3
+  frases entre llamadas a tools.
+"""
+
+
+def _human_size(num_bytes: int) -> str:
+    """Compact human-readable byte size for the document inventory."""
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024.0 or unit == "GB":
+            return f"{int(size)}B" if unit == "B" else f"{size:.1f}{unit}"
+        size /= 1024.0
+    return f"{size:.1f}GB"
+
+
+def _make_orient_tool(host_workspace: Path):
+    """Build the orient_documents tool (lightweight inventory, no parsing).
+
+    Lists every client document under the target with type/size heuristics so
+    the agent can reason about the corpus BEFORE the long capture. Does NOT
+    extract text -- that is Docling job inside ``ingest_documents``.
+    """
+
+    @tool
+    async def orient_documents(target_subpath: str = "") -> dict:
+        """Inventory the project client documents (no text extraction).
+
+        Returns each document relative path, type (extension) and size, plus
+        the resolved target. Use this to orient yourself BEFORE running
+        ingest_documents: decide document order, flag likely noise/boilerplate
+        sections, and note diagrams. This does NOT parse the documents -- text
+        extraction happens inside ingest_documents via Docling.
+        """
+        try:
+            target = _resolve_target(host_workspace, target_subpath)
+        except ValueError as exc:
+            return {"error": str(exc)}
+
+        root = host_workspace.resolve()
+        docs = discover_documents(target)
+        if not docs:
+            return {
+                "target": str(target.relative_to(root)),
+                "documents": [],
+                "total": 0,
+                "message": (
+                    "No se encontraron documentos bajo el target. Pide al "
+                    "usuario que suba los documentos de cliente al workspace "
+                    "del proyecto y reintenta."
+                ),
+            }
+        inventory = []
+        for p in docs:
+            size = p.stat().st_size
+            inventory.append({
+                "path": str(p.relative_to(root)),
+                "type": p.suffix.lower().lstrip(".") or "unknown",
+                "size_bytes": size,
+                "size": _human_size(size),
+            })
+        return {
+            "target": str(target.relative_to(root)),
+            "documents": inventory,
+            "total": len(inventory),
+        }
+
+    return orient_documents
+
+
+def _no_run(required_first: str) -> dict:
+    """Standard reply when a stage tool runs with no active capture."""
+    return {
+        "error": "no_capture_in_progress",
+        "message": (
+            "No hay captura en curso. Llama a " + required_first + " primero "
+            "para inicializar el holder de etapa."
+        ),
+    }
+
+
+def _make_stage_tools(
+    project_id: int,
+    host_workspace: Path,
+    project_name: str,
+    project_description: str,
+) -> list:
+    """Build the six staged-capture tools bound to one project.
+
+    Each tool runs ONE pipeline stage, stores its typed output on the per-project
+    ``CaptureRun`` (so the next stage consumes it without re-running), and emits
+    the same fine events the atomic pipeline emits. ``commit_capture`` is the
+    only DB writer and reads only from the holder. Loop caps (3/stage) stop a
+    stuck agent from re-running a stage forever; the counters survive a
+    re-ingest.
+    """
+
+    def _loop_err(exc: StageLoopExceeded) -> dict:
+        return {
+            "error": "stage_loop_exceeded",
+            "stage": exc.stage,
+            "calls": exc.calls,
+            "cap": exc.cap,
+            "message": (
+                "La etapa " + exc.stage + " supero el tope de "
+                + str(exc.cap) + " intentos. Reporta la situacion al usuario "
+                "y espera su decision en vez de reintentar la misma etapa."
+            ),
+        }
+
+    @tool
+    async def ingest_documents(
+        target_subpath: str = "", on_existing: str = "ask"
+    ) -> dict:
+        """Stage 1/6: parse the project documents with Docling (start capture).
+
+        Discovers client documents under the target, runs Docling per document
+        and annotates the structure map. This STARTS a capture: if one is
+        already in progress it restarts from scratch. Stores chunks + structure
+        maps on the run holder for the later stages. Call this first, before
+        extract_requirements.
+
+        Args:
+            target_subpath: optional folder relative to the project workspace.
+                Omit to process the whole project.
+            on_existing: what to do when requirements already exist in this
+                project. The default "ask" never silently appends: if any
+                requirement exists, returns pending_confirmation (with the
+                counts and last code) INSTEAD of starting -- surface those to
+                the user, then call again with the choice BEFORE any parsing,
+                so no work is wasted. Mirrors run_requirements_capture.
+                - "reset": delete ALL existing requirements + grouping plans
+                  first (hard, irreversible), then parse. Use ONLY after the
+                  user explicitly chose to start over.
+                - "append": keep existing requirements and add the new ones.
+        """
+        try:
+            target = _resolve_target(host_workspace, target_subpath)
+        except ValueError as exc:
+            return {"error": str(exc)}
+
+        # Up-front existing-data guard: ask BEFORE parsing so the user decides
+        # reset/append without waiting for the pipeline. No holder is created
+        # on "block" -- the follow-up call starts clean.
+        try:
+            existing = await _count_existing(project_id)
+            decision = _existing_gate(existing["requirements"], on_existing)
+        except ValueError as exc:
+            return {"error": str(exc)}
+        except Exception as exc:  # noqa: BLE001 -- surface, never crash silently
+            return {"error": "capture pre-check failed: " + str(exc)}
+
+        if decision == "block":
+            n_req = existing["requirements"]
+            last_code = existing["last_code"]
+            suffix = (" (ultimo codigo " + last_code + ")") if last_code else ""
+            return {
+                "pending_confirmation": True,
+                "requirements": n_req,
+                "grouping_plans": existing["grouping_plans"],
+                "last_code": last_code,
+                "message": (
+                    "Ya existen " + str(n_req) + " requerimiento(s) en este "
+                    "proyecto" + suffix + ". Pregunta al usuario si prefiere "
+                    "resetear todo (borrar requerimientos y agrupamientos, "
+                    "empezar de cero) o agregar a los existentes, y vuelve a "
+                    "llamar a ingest_documents con on_existing=reset u "
+                    "on_existing=append."
+                ),
+            }
+
+        if decision == "reset":
+            from backend.database import AsyncSessionLocal
+            from backend.services.requirements_service import (
+                reset_project_capture,
+            )
+            _on_progress_reset, _ = _make_emitters()
+            await _on_progress_reset("reset", "Borrando captura previa...")
+            try:
+                async with AsyncSessionLocal() as session:
+                    await reset_project_capture(session, project_id)
+            except Exception as exc:  # noqa: BLE001
+                return {"error": "reset before capture failed: " + str(exc)}
+
+        run = get_or_create_run(
+            project_id,
+            target,
+            project_name=project_name,
+            project_description=project_description,
+        )
+        try:
+            run.bump(STAGE_INGEST)
+        except StageLoopExceeded as exc:
+            return _loop_err(exc)
+        # A fresh ingest restarts the pipeline: drop prior outputs but keep the
+        # loop-cap counters so re-ingesting cannot dodge the cap.
+        run.target = target
+        run.reset_pipeline_outputs()
+
+        on_progress, _on_event = _make_emitters()
+        await on_progress(STAGE_INGEST, "discover")
+        docs = discover_documents(target)
+        await on_progress(STAGE_INGEST, str(len(docs)) + " documento(s)")
+        if not docs:
+            return {
+                "error": "no_documents",
+                "target": str(target.relative_to(host_workspace.resolve())),
+                "message": (
+                    "No se encontraron documentos bajo el target. Pide al "
+                    "usuario que suba los documentos de cliente al workspace."
+                ),
+            }
+
+        per_doc: list = []
+        doc_texts: dict[str, str] = {}
+        all_chunks: list = []
+        for d in docs:
+            chunks, smap = await asyncio.to_thread(ingest_document, d)
+            await enrich_structure_map(
+                smap,
+                project_name=run.project_name,
+                project_description=run.project_description,
+            )
+            per_doc.append((chunks, smap))
+            doc_texts[smap.document_id] = smap.full_text
+            all_chunks.extend(chunks)
+            await on_progress(STAGE_INGEST, "parseado " + d.name)
+
+        run.docs = docs
+        run.per_doc = per_doc
+        run.doc_texts = doc_texts
+        run.all_chunks = all_chunks
+        run.stages_done.add(STAGE_INGEST)
+        return {
+            "documents": [d.name for d in docs],
+            "total_chunks": len(all_chunks),
+            "stages_done": sorted(run.stages_done),
+        }
+
+    @tool
+    async def extract_requirements() -> dict:
+        """Stage 2/6: extract raw requirements from the ingested chunks.
+
+        Runs the guided extractor (verify_spans inside -- the anti-hallucination
+        anchor), then per-document gap pass and an implicit-pass, dropping
+        duplicit implicits. Every persisted requirement is born here with a
+        verified source span. Requires ingest_documents first.
+        """
+        run = get_run(project_id)
+        if run is None:
+            return _no_run("ingest_documents")
+        try:
+            run.bump(STAGE_EXTRACT)
+        except StageLoopExceeded as exc:
+            return _loop_err(exc)
+
+        on_progress, _on_event = _make_emitters()
+        await on_progress(STAGE_EXTRACT, "extraccion")
+        extracted = await extract_all(
+            run.all_chunks,
+            doc_texts=run.doc_texts,
+            project_name=run.project_name,
+            project_description=run.project_description,
+        )
+        for chunks, smap in run.per_doc:
+            gaps = await gap_pass(
+                chunks,
+                smap,
+                extracted,
+                project_name=run.project_name,
+                project_description=run.project_description,
+            )
+            extracted.extend(gaps)
+        implicits = await implicit_pass(
+            run.all_chunks,
+            doc_texts=run.doc_texts,
+            project_name=run.project_name,
+            project_description=run.project_description,
+        )
+        implicits = drop_duplicit_implicit(implicits, extracted)
+        extracted.extend(implicits)
+
+        run.extracted = extracted
+        run.stages_done.add(STAGE_EXTRACT)
+        await on_progress(STAGE_EXTRACT, str(len(extracted)) + " items crudos")
+        return {
+            "raw_items": len(extracted),
+            "stages_done": sorted(run.stages_done),
+        }
+
+    @tool
+    async def consolidate_requirements() -> dict:
+        """Stage 3/6: deduplicate and detect contradictions (propose, never auto-resolve).
+
+        Runs exact + two-tier semantic dedup and contradiction detection over
+        the extracted items. Emits a conflict.found event per duplicate and
+        contradiction so the UI shows them live. Duplicates/contradictions are
+        PROPOSED -- the human decides. Requires extract_requirements first.
+        """
+        run = get_run(project_id)
+        if run is None:
+            return _no_run("ingest_documents")
+        try:
+            run.bump(STAGE_CONSOLIDATE)
+        except StageLoopExceeded as exc:
+            return _loop_err(exc)
+
+        on_progress, on_event = _make_emitters()
+        await on_progress(STAGE_CONSOLIDATE, "dedup + contradicciones")
+        cons = await consolidate(run.extracted)
+        for dup in cons.duplicates:
+            await on_event("conflict.found", {
+                "kind": "duplicate",
+                "kept_id": dup.kept_id,
+                "member_ids": dup.member_ids,
+                "kept_statement": dup.kept_statement,
+            })
+        for pair in cons.contradictions:
+            await on_event("conflict.found", {
+                "kind": "contradiction",
+                "a_id": pair.a_id,
+                "b_id": pair.b_id,
+                "reason": pair.reason,
+                "confidence": pair.confidence,
+            })
+
+        run.cons = cons
+        run.stages_done.add(STAGE_CONSOLIDATE)
+        return {
+            "items": len(cons.items),
+            "duplicates": len(cons.duplicates),
+            "contradictions": len(cons.contradictions),
+            "stages_done": sorted(run.stages_done),
+        }
+
+    @tool
+    async def critique_requirements() -> dict:
+        """Stage 4/6: critical review (drop non-requirements / hallucinations).
+
+        Runs the generator-critic loop over the consolidated items, dropping
+        legends/boilerplate/meta-instructions and likely hallucinations, and
+        flagging items that need human review. Emits a validation.report event
+        with the kept/rejected/flagged counts. Requires consolidate_requirements
+        first.
+        """
+        run = get_run(project_id)
+        if run is None or run.cons is None:
+            return _no_run("consolidate_requirements")
+        try:
+            run.bump(STAGE_CRITIQUE)
+        except StageLoopExceeded as exc:
+            return _loop_err(exc)
+
+        on_progress, on_event = _make_emitters()
+        await on_progress(STAGE_CRITIQUE, "revision critica")
+        crit = await critique_all(run.cons.items)
+        await on_event("validation.report", {
+            "total": len(run.cons.items),
+            "kept": crit.stats.get("kept", len(crit.items)),
+            "rejected": len(crit.rejected),
+            "flagged": len(crit.flagged),
+        })
+
+        run.crit = crit
+        run.stages_done.add(STAGE_CRITIQUE)
+        return {
+            "kept": crit.stats.get("kept", len(crit.items)),
+            "rejected": len(crit.rejected),
+            "flagged": len(crit.flagged),
+            "stages_done": sorted(run.stages_done),
+        }
+
+    @tool
+    async def classify_requirements() -> dict:
+        """Stage 5/6: classify (type + MoSCoW + decomposition).
+
+        Runs the classifier over the critiqued items, assigning type
+        (functional/non-functional/...), priority (MoSCoW) and optional
+        decomposition into sub-items. Requires critique_requirements first.
+        """
+        run = get_run(project_id)
+        if run is None or run.crit is None:
+            return _no_run("critique_requirements")
+        try:
+            run.bump(STAGE_CLASSIFY)
+        except StageLoopExceeded as exc:
+            return _loop_err(exc)
+
+        on_progress, _on_event = _make_emitters()
+        await on_progress(STAGE_CLASSIFY, "clasificacion")
+        cls = await classify_all(run.crit.items)
+
+        run.cls = cls
+        run.stages_done.add(STAGE_CLASSIFY)
+        return {
+            "classified": len(cls.decisions),
+            "sub_items": cls.stats.get("sub_items", 0),
+            "stages_done": sorted(run.stages_done),
+        }
+
+    @tool
+    async def commit_capture() -> dict:
+        """Stage 6/6: persist the staged requirements (the only DB writer).
+
+        Writes the classified items to the store with opaque REQ-XXXX codes and
+        derived sub-items. Requires every prior stage to have run; refuses
+        (missing_stages) otherwise.
+
+        The existing-data guard already ran in ingest_documents (up-front,
+        BEFORE parsing): by the time commit runs the user has already chosen
+        reset/append, so commit takes no on_existing argument and does not
+        re-ask -- it just persists the staged items.
+        """
+        run = get_run(project_id)
+        if run is None:
+            return _no_run("ingest_documents")
+        try:
+            run.bump(STAGE_COMMIT)
+        except StageLoopExceeded as exc:
+            return _loop_err(exc)
+
+        missing = run.missing_stages_before_commit()
+        if missing:
+            return {
+                "error": "missing_stages",
+                "missing": missing,
+                "message": (
+                    "Faltan etapas previas antes de commit_capture. Llama a "
+                    "cada una en orden (ingest -> extract -> consolidate -> "
+                    "critique -> classify) y vuelve a intentar."
+                ),
+            }
+
+        on_progress, on_event = _make_emitters()
+        from backend.database import AsyncSessionLocal
+        from backend.services.requirements_service import _persist
+
+        await on_progress("persist", "guardando")
+        try:
+            async with AsyncSessionLocal() as session:
+                ids = await _persist(
+                    session, project_id, run.crit.items, run.cls, on_event
+                )
+        except Exception as exc:  # noqa: BLE001 -- surface to the model
+            return {"error": "persist failed: " + str(exc)}
+
+        run.committed_ids = ids
+        summary = {
+            "persisted": len(ids),
+            "sub_items": run.cls.stats.get("sub_items", 0) if run.cls else 0,
+            "raw_extracted": len(run.extracted),
+            "duplicates_proposed": len(run.cons.duplicates) if run.cons else 0,
+            "contradictions": len(run.cons.contradictions) if run.cons else 0,
+            "flagged_for_review": len(run.crit.flagged) if run.crit else 0,
+            "rejected_hallucination": len(run.crit.rejected) if run.crit else 0,
+        }
+        clear_run(project_id)
+        return summary
+
+    return [
+        ingest_documents,
+        extract_requirements,
+        consolidate_requirements,
+        critique_requirements,
+        classify_requirements,
+        commit_capture,
+    ]
+
+
+def make_requirements_capture_agent_subagent(
+    *,
+    project_id: int,
+    profile: str,
+    project_slug: str,
+    project_name: str = "",
+    project_description: str = "",
+) -> dict[str, Any]:
+    """Build the agent-driven requirements-capture subagent for DeepAgents.
+
+    Six staged tools (ingest -> extract -> consolidate -> critique -> classify
+    -> commit) backed by a stateful run-holder, so the agent reasons BETWEEN
+    stages instead of firing one atomic tool. Plus orient_documents, the health
+    pre-flight, and the shared editing/grouping/vision tools. NO
+    ``backend``/sandbox: the subagent cannot execute code, so it is forced to
+    use ingest_documents (Docling) for ingestion instead of improvising manual
+    parsing. ``commit_capture`` is the only DB writer and reads only from the
+    holder (span-verified items from extract_requirements).
+    """
+    # Imported here to avoid a config import at module load time (matches the
+    # deterministic factory; tests that rebind settings work without surprises).
+    from backend.config import settings
+
+    host_workspace = settings.workspaces_root / profile / project_slug
+
+    health_tool = _make_check_health_tool()
+    orient_tool = _make_orient_tool(host_workspace)
+    stage_tools = _make_stage_tools(
+        project_id, host_workspace, project_name, project_description
+    )
+    editing_tools = make_requirements_tools(project_id)
+    grouping_tools = make_grouping_tools(project_id)
+    vision_tools = make_vision_tools(profile, project_slug)
+
+    return {
+        "name": "requirements-capture-agent",
+        "description": (
+            "Variante AGENTICA de la captura de requerimientos: razona la "
+            "extraccion etapa por etapa (orienta los documentos, planifica, "
+            "orquesta las seis etapas del pipeline y refina) en lugar de "
+            "disparar una sola tool. Usalo cuando el usuario use el comando "
+            "/captura_agente o pida una captura guiada con instrucciones de "
+            "steering. Comparte las mismas tools de edicion/agrupamiento/vision "
+            "y los mismos guardrails que el subagente requirements-capture; la "
+            "diferencia es que razona y decide entre etapas."
+        ),
+        "system_prompt": REQUIREMENTS_CAPTURE_AGENT_PROMPT,
+        "tools": [
+            health_tool,
+            orient_tool,
+            *stage_tools,
+            *editing_tools,
+            *grouping_tools,
+            *vision_tools,
+        ],
+    }

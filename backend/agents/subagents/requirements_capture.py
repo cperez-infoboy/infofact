@@ -52,6 +52,17 @@ Tu trabajo:
    remediacion al usuario y NO invocar run_requirements_capture hasta que se
    resuelva (asi se evita un bloqueo a mitad de captura).
 
+2b. run_requirements_capture se protege solo: si ya existen requerimientos en
+   el proyecto, NO corre sino que devuelve pending_confirmation con cuantos hay
+   y el ultimo codigo (p.ej. REQ-7K3F). Cuando eso pase, AVISA al usuario los
+   numeros y preguntale si prefiere resetear todo (borrar requerimientos +
+   agrupamientos y empezar de cero) o agregar a los existentes. Segun su
+   respuesta, vuelve a llamar a run_requirements_capture con
+   on_existing='reset' (empezar de cero) u on_existing='append' (mantener lo
+   existente y sumar los nuevos). NUNCA uses on_existing='reset' sin
+   confirmacion explicita del usuario; ante duda, append (no destruyas). Para
+   consultar el estado sin disparar la captura, usa capture_status.
+
 3. Invocar run_requirements_capture para ejecutar el pipeline completo:
    ingesta, extraccion, consolidacion, critica, clasificacion y persistencia.
    El pipeline es deterministico (una sola funcion); no intentes reimplementar
@@ -69,18 +80,19 @@ Tu trabajo:
 6. Revision de agrupamiento (duplicados en el store):
    - Cuando el usuario pida revisar duplicados o agrupamiento, llamar a
      review_grouping. Detecta grupos de duplicados (verbatim y semanticos) sobre
-     el store actual y escribe un plan editable en
-     .infofact/grouping-plans/<timestamp>/plan.md, ademas de devolverlo para
-     mostrarlo en el chat.
+     el store actual y persiste un plan editable en la base de datos
+     (grouping_plans), devolviendo cada grupo con su id, keeper, miembros,
+     razon y confianza para mostrarlo en el chat.
    - El usuario revisa el plan y puede pedir cambios (por ejemplo, "en el grupo
-     2, que el keeper sea REQ-012, y borrar el grupo 3"). Reescribir el plan con
-     write_file segun sus indicaciones y volver a mostrarlo para confirmar antes
-     de aplicar.
+     2, que el keeper sea REQ-7K3F" o "rechazar el grupo 3"). Aplicar los cambios
+     con set_group_decision (aceptar o rechazar un grupo) y edit_group (cambiar
+     el keeper o los miembros por codigo REQ), y volver a mostrar el plan para
+     confirmar antes de aplicar.
    - Cuando el usuario aprueba, llamar a apply_grouping_plan (por defecto aplica
-     el plan propuesto mas reciente). Valida cada REQ contra el store, fusiona
-     cada grupo (union de sources, soft-delete de los perdedores) y es
-     idempotente (re-aplicar un plan ya aplicado reporta already_applied). Reportar
-     el resultado por grupo (applied / already_applied / invalid).
+     el plan propuesto mas reciente). Solo fusiona los grupos marcados como
+     accept (union de sources, soft-delete de los perdedores) y es idempotente
+     (re-aplicar un plan ya aplicado reporta already_applied). Reportar el
+     resultado por grupo (applied / already_applied / invalid).
    - Para listar planes previos (reanudar una revision o auditar lo aplicado),
      llamar a list_grouping_plans.
    - NUNCA aplicar un plan sin confirmacion explicita del usuario: las fusiones
@@ -95,6 +107,9 @@ Reglas estrictas:
   el humano indique el ganador. Las fusiones del plan de agrupamiento tambien
   requieren aprobacion explicita del usuario.
 - Las eliminaciones son logicas (soft-delete): el historial siempre se conserva.
+  Excepcion: reset_capture es un hard-delete destructivo e irreversible que
+  borra TODOS los requerimientos, relaciones, revisiones y planes del proyecto.
+  Solo lo llamas tras un "si" explicito del usuario; nunca por iniciativa propia.
 - Habla en espanol neutro. Se conciso y tecnico.
 """
 
@@ -115,6 +130,69 @@ def _resolve_target(host_workspace: Path, subpath: str) -> Path:
     if not target.exists():
         raise ValueError(f"target '{target}' does not exist")
     return target
+
+
+def _existing_gate(existing_count: int, on_existing: str) -> str:
+    """Decide what run_requirements_capture does given existing rows.
+
+    Pure policy (no I/O) so it is unit-tested in isolation. Returns one of:
+      - "block":   requirements exist and the caller has not decided yet -> the
+                   tool must return pending_confirmation and NOT run.
+      - "reset":   wipe existing rows first, then run.
+      - "proceed": run without wiping (nothing exists, or the user chose append).
+
+    on_existing must be "ask" (default), "reset" or "append"; anything else
+    raises ValueError so the tool surfaces a clear error instead of silently
+    defaulting.
+    """
+    if on_existing not in {"ask", "reset", "append"}:
+        raise ValueError(
+            "on_existing must be 'ask', 'reset' or 'append', got "
+            f"{on_existing!r}"
+        )
+    if on_existing == "append":
+        return "proceed"
+    if on_existing == "reset":
+        return "reset" if existing_count > 0 else "proceed"
+    # on_existing == "ask"
+    return "block" if existing_count > 0 else "proceed"
+
+
+async def _count_existing(project_id: int) -> dict:
+    """Count existing requirement + grouping rows for one project (preflight).
+
+    Used by run_requirements_capture guard to decide whether a capture would
+    append over existing data. Counts ALL rows (including soft-deleted) so the
+    guard fires whenever the project has been captured before, even if every
+    row was later rejected -- matches capture_status accounting.
+    """
+    from sqlalchemy import func, select
+
+    from backend.database import AsyncSessionLocal
+    from backend.models.requirement import GroupingPlan, RequirementItem
+
+    async with AsyncSessionLocal() as session:
+        req_count = await session.scalar(
+            select(func.count())
+            .select_from(RequirementItem)
+            .where(RequirementItem.project_id == project_id)
+        )
+        plan_count = await session.scalar(
+            select(func.count())
+            .select_from(GroupingPlan)
+            .where(GroupingPlan.project_id == project_id)
+        )
+        last_code = await session.scalar(
+            select(RequirementItem.code)
+            .where(RequirementItem.project_id == project_id)
+            .order_by(RequirementItem.id.desc())
+            .limit(1)
+        )
+        return {
+            "requirements": int(req_count or 0),
+            "grouping_plans": int(plan_count or 0),
+            "last_code": last_code,
+        }
 
 
 def _make_emitters():
@@ -205,12 +283,23 @@ def _make_run_capture_tool(
     @tool
     async def run_requirements_capture(
         target_subpath: str = "",
+        on_existing: str = "ask",
     ) -> dict:
         """Run the full capture pipeline over the project's documents.
 
         Args:
             target_subpath: optional folder relative to the project workspace.
                 Omit to process the whole project.
+            on_existing: what to do when requirements already exist in this
+                project. The default "ask" never silently appends: if any
+                requirement exists, the tool returns pending_confirmation (with
+                the counts and last code) instead of running -- surface those to
+                the user, then call again with the user's choice.
+                - "reset": delete ALL existing requirements + grouping plans
+                  first (hard, irreversible; the next capture starts
+                  fresh), then run. Use ONLY after the user explicitly chose
+                  to start over.
+                - "append": keep existing requirements and add the new ones.
 
         Returns a report: documents processed, requirements persisted, proposed
         duplicates, contradictions, flagged items (needs review), and rejected
@@ -222,8 +311,54 @@ def _make_run_capture_tool(
         except ValueError as exc:
             return {"error": str(exc)}
 
+        # Guardrail: refuse to silently append over an existing capture. The
+        # system prompt also asks the agent to probe capture_status first, but
+        # this enforces the check at the tool level so a forgotten pre-check
+        # cannot accumulate duplicates across runs.
         try:
-            on_progress, on_event = _make_emitters()
+            existing = await _count_existing(project_id)
+            decision = _existing_gate(existing["requirements"], on_existing)
+        except ValueError as exc:
+            return {"error": str(exc)}
+        except Exception as exc:  # noqa: BLE001 — surface, never crash silently
+            return {"error": f"capture pre-check failed: {exc}"}
+
+        if decision == "block":
+            return {
+                "pending_confirmation": True,
+                "requirements": existing["requirements"],
+                "grouping_plans": existing["grouping_plans"],
+                "last_code": existing["last_code"],
+                "message": (
+                    f"Ya existen {existing['requirements']} requerimiento(s) "
+                    f"en este proyecto"
+                    + (
+                        f" (ultimo codigo {existing['last_code']})"
+                        if existing["last_code"]
+                        else ""
+                    )
+                    + ". Pregunta al usuario si prefiere resetear todo "
+                    "(borrar requerimientos y agrupamientos, empezar "
+                    "de cero) o agregar a los existentes, y vuelve a llamar "
+                    "con on_existing='reset' u on_existing='append'."
+                ),
+            }
+
+        on_progress, on_event = _make_emitters()
+
+        if decision == "reset":
+            from backend.database import AsyncSessionLocal
+            from backend.services.requirements_service import (
+                reset_project_capture,
+            )
+            await on_progress("reset", "Borrando captura previa...")
+            try:
+                async with AsyncSessionLocal() as session:
+                    await reset_project_capture(session, project_id)
+            except Exception as exc:  # noqa: BLE001
+                return {"error": f"reset before capture failed: {exc}"}
+
+        try:
             report = await run_requirements_pipeline(
                 project_id,
                 target,
@@ -279,7 +414,7 @@ def make_requirements_capture_subagent(
     from backend.config import settings
 
     host_workspace = (
-        Path(settings.workspaces_host_root) / profile / project_slug
+        settings.workspaces_root / profile / project_slug
     )
     health_tool = _make_check_health_tool()
     capture_tool = _make_run_capture_tool(
@@ -289,7 +424,7 @@ def make_requirements_capture_subagent(
         project_description,
     )
     editing_tools = make_requirements_tools(project_id)
-    grouping_tools = make_grouping_tools(project_id, host_workspace)
+    grouping_tools = make_grouping_tools(project_id)
     vision_tools = make_vision_tools(profile, project_slug)
 
     return {

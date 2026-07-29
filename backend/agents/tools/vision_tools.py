@@ -29,7 +29,7 @@ def make_vision_tools(profile: str, project_slug: str) -> list:
     if not settings.supports_vision:
         return []
 
-    host_workspace = Path(settings.workspaces_host_root) / profile / project_slug
+    host_workspace = settings.workspaces_root / profile / project_slug
 
     def _resolve(image_path: str) -> Path:
         """Resolve a workspace-relative image path, refusing traversal.

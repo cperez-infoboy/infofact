@@ -1,10 +1,11 @@
 """Smoke test for requirements_service persistence (step 7).
 
-Validates _persist + _next_code_seq against a real in-memory SQLite DB:
-- codes are sequential (REQ-001, REQ-002, ...) with no collision on rerun.
+Validates _persist against a real in-memory SQLite DB:
+- codes are opaque (REQ-XXXX, Crockford base32), unique per project.
 - source JSON carries document_id / section / page / quote.
 - decomposition sub-items get parent_id + derived=True + inherited source.
 - unverified items land as UNVERIFIED, the rest as DRAFT.
+- a second allocation never collides with existing codes.
 """
 import asyncio
 import sys
@@ -23,10 +24,8 @@ from backend.agents.pipelines.classification import (
 from backend.agents.pipelines.extraction import RawRequirement
 from backend.models.base import Base
 from backend.models.requirement import ReqStatus, RequirementItem
-from backend.services.requirements_service import (
-    _next_code_seq,
-    _persist,
-)
+from backend.services._req_codes import OPAQUE_CODE_RE, gen_opaque_code
+from backend.services.requirements_service import _persist
 
 PROJECT_ID = 1
 
@@ -82,22 +81,22 @@ async def main():
     async with Session() as session:
         rows = (await session.execute(
             select(RequirementItem).where(RequirementItem.project_id == PROJECT_ID)
-            .order_by(RequirementItem.code)
+            .order_by(RequirementItem.id)
         )).scalars().all()
 
     # 2 parents + 2 derived sub-items = 4 rows.
     assert len(rows) == 4, f"expected 4 rows, got {len(rows)}"
     codes = [r.code for r in rows]
-    assert codes == ["REQ-001", "REQ-002", "REQ-003", "REQ-004"], codes
-    print("sequential codes OK:", codes)
+    assert all(OPAQUE_CODE_RE.match(c) for c in codes), codes
+    assert len(set(codes)) == 4, f"code collision: {codes}"
+    print("opaque unique codes OK:", codes)
 
-    # Sub-items are contiguous after their parent: REQ-001=parent0, 002=sub0,
-    # 003=sub1, 004=parent1. Select by derived flag, not position.
+    # Select by derived flag; parents in insertion order (by id).
     parents = [r for r in rows if not r.derived]
     subs = [r for r in rows if r.derived]
     assert len(parents) == 2 and len(subs) == 2, (len(parents), len(subs))
-    parent0 = next(r for r in parents if r.code == "REQ-001")
-    parent1 = next(r for r in parents if r.code == "REQ-004")
+    parent0 = min(parents, key=lambda r: r.id)  # d0, inserted first
+    parent1 = max(parents, key=lambda r: r.id)  # d1
     subs_of_d0 = [r for r in subs if r.parent_id == parent0.id]
     assert len(subs_of_d0) == 2
 
@@ -112,19 +111,20 @@ async def main():
     assert parent1.status == ReqStatus.UNVERIFIED, parent1.status
     print("parent1 unverified->UNVERIFIED OK:", parent1.code, parent1.type.value)
 
-    # sub-items: derived, parent_id set, inherited source, contiguous codes.
+    # sub-items: derived, parent_id set, inherited source, opaque codes.
     sub_codes = sorted(r.code for r in subs_of_d0)
-    assert sub_codes == ["REQ-002", "REQ-003"], sub_codes
+    assert all(OPAQUE_CODE_RE.match(c) for c in sub_codes), sub_codes
     for s in subs_of_d0:
         assert s.derived is True and s.parent_id == parent0.id
         assert s.source["quote"] == "seguridad obligatoria"  # inherited
     print("sub-items derived + parent_id + inherited source OK:", sub_codes)
 
-    # Rerun: codes continue from the max, no collision.
+    # Rerun: a fresh allocation never collides with the existing 4 codes.
     async with Session() as session:
-        nxt = await _next_code_seq(session, PROJECT_ID)
-    assert nxt == 5, f"expected next seq 5, got {nxt}"
-    print("rerun code sequence OK: next =", nxt)
+        fresh = await gen_opaque_code(session, PROJECT_ID)
+    assert OPAQUE_CODE_RE.match(fresh), fresh
+    assert fresh not in codes, f"collision on rerun: {fresh} in {codes}"
+    print("rerun allocation OK (no collision):", fresh)
 
     await engine.dispose()
     print("\nALL requirements_service persist smoke checks PASSED")

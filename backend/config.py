@@ -4,6 +4,8 @@ Secrets are NOT placed inside the agent container; only the backend reads them.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Punto de montaje FIJO dentro del container del agente.
@@ -15,6 +17,13 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # No es una settings: NO cambia nunca. Si lo movieras, habría que tocar esos
 # tres sitios a la vez o el agente operaría en un directorio distinto al montado.
 WORKSPACE_CONTAINER_PATH = "/workspaces"
+
+# Root del repo (padre del paquete backend). Sirve para anclar paths de datos
+# RELATIVOS (p. ej. workspaces_host_root) de forma independiente al CWD del
+# proceso, que puede derivar en sesiones largas y romper la resolucion de rutas.
+# Los paths ABSOLUTOS (compose: host-path para el bind-mount DinD del agente) se
+# usan tal cual en workspaces_root.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class Settings(BaseSettings):
@@ -40,16 +49,30 @@ class Settings(BaseSettings):
     llm_model: str = "glm-5.2"
 
     # Vision (image understanding) for /captura over diagrams and UI mockups.
-    # GLM-5.2 is text-only; vision needs a separate multimodal model. glm-4.6v
-    # is available on the same Coding Plan endpoint + API key as glm-5.2 and
-    # handles diagrams, mockups and generic images (verified against the live
-    # endpoint). glm-5v-turbo (multimodal coding, better for UI mockups) needs a
-    # higher plan; leave llm_vision_model_ui empty to reuse llm_vision_model for
-    # every image kind, or set it once your plan includes it.
+    # GLM-5.2 is text-only; vision needs a separate multimodal model. By default
+    # it reuses the agent's endpoint + key (z.ai/glm-4.6v), but vision can point
+    # at ANY OpenAI-compatible provider with multimodal capability by setting its
+    # own base_url + api_key + model. Example -- route vision to OpenRouter:
+    #   LLM_VISION_BASE_URL=https://openrouter.ai/api/v1
+    #   LLM_VISION_API_KEY=sk-or-...
+    #   LLM_VISION_MODEL=google/gemini-...   (or any vision-capable model)
+    # Both LLM_VISION_* overrides default to empty and fall back to the agent's
+    # shared values, so existing deployments keep working unchanged.
+    # glm-5v-turbo (multimodal coding, better for UI mockups) needs a higher plan;
+    # leave llm_vision_model_ui empty to reuse llm_vision_model for every image
+    # kind, or set it once your plan includes it.
     llm_vision_model: str = "glm-4.6v"
     llm_vision_model_ui: str = ""  # e.g. "glm-5v-turbo"; empty -> reuse llm_vision_model
+    llm_vision_api_key: str = ""  # vision-only API key; empty -> reuse llm_api_key
+    llm_vision_base_url: str = ""  # OpenAI-compatible vision endpoint; empty -> reuse llm_base_url
     vision_image_max_bytes: int = 5 * 1024 * 1024  # Z.ai cap: 5MB / 6000x6000 per image
     vision_max_pictures_per_doc: int = 12  # bound vision calls on image-heavy PDFs
+    # Rasterization scale for PDF pictures handed to the vision model. Docling's
+    # default (1.0 ~ 72 DPI) renders vector diagrams (ER schemas, architecture)
+    # too small to read -- e.g. the SIGSA DB schema rasterized to 317x594 and
+    # became illegible, so glm-4.6v hallucinated placeholders. 4.0 (~288 DPI)
+    # makes dense schemas readable. Lower to cut vision cost on simpler docs.
+    vision_images_scale: float = 4.0
 
     # Agent container lifecycle
     agent_image: str = "infofact-agent"
@@ -84,12 +107,29 @@ class Settings(BaseSettings):
     def supports_vision(self) -> bool:
         """Whether image understanding is available.
 
-        Gated on API key + a configured vision model — NOT on the text model
-        name: GLM-5.2 cannot see images, but glm-4.6v shares its key and
-        endpoint. When False, the capture pipeline degrades to Docling-only and
+        Gated on an API key + a configured vision model — NOT on the text model
+        name: GLM-5.2 cannot see images. The key may be the vision-specific one
+        (LLM_VISION_API_KEY) or, falling back, the shared LLM_API_KEY. When False,
+        the capture pipeline degrades to Docling-only and
         the analyze_image subagent tool is not registered.
         """
-        return bool(self.llm_api_key and self.llm_vision_model)
+        return bool((self.llm_vision_api_key or self.llm_api_key) and self.llm_vision_model)
+
+    @property
+    def workspaces_root(self) -> Path:
+        """Workspace root absoluto, independiente del CWD del proceso.
+
+        Los valores RELATIVOS (dev: ``./data/workspaces``) se anclan al root
+        del repo para que resolverlos despues no dependa del CWD, que deriva en
+        sesiones largas y rompe la resolucion de rutas del workspace. Los
+        valores ABSOLUTOS (compose: host-path para el bind-mount DinD del
+        agente) se devuelven tales cuales: el bind-mount necesita el path
+        visible desde el host.
+        """
+        p = Path(self.workspaces_host_root)
+        if not p.is_absolute():
+            p = _REPO_ROOT / p
+        return p.resolve()
 
 
 settings = Settings()

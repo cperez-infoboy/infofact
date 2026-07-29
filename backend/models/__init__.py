@@ -5,6 +5,10 @@ from backend.models.chat_session import ChatSession
 from backend.models.project import Project
 from backend.models.requirement import (
     ChangedBy,
+    GroupDecision,
+    GroupingGroup,
+    GroupingPlan,
+    PlanStatus,
     Priority,
     RelationKind,
     RelationStatus,
@@ -25,10 +29,14 @@ __all__ = [
     "RequirementItem",
     "RequirementRelation",
     "RequirementRevision",
+    "GroupingPlan",
+    "GroupingGroup",
     "ReqType",
     "Priority",
     "ReqStatus",
     "RelationKind",
     "RelationStatus",
     "ChangedBy",
+    "PlanStatus",
+    "GroupDecision",
 ]

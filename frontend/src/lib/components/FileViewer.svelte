@@ -1,35 +1,43 @@
 <script lang="ts">
-  // Visor de archivos con tabs (LRU≤15 gestionado por el store).
-  // - Ctrl/Cmd+S dispara saveActive().
-  // - Textarea enlazado bidireccional con el contenido del tab activo.
-  // - El indicador "•" marca tabs dirty.
+  // Visor central con tabs. Soporta tabs de archivo (textarea editable) y
+  // tabs de "vista" (requerimientos / agrupamiento), discriminados por `kind`.
+  // - Ctrl/Cmd+S dispara saveActive() (solo aplica a archivos).
+  // - Store LRU≤15 (stores/tabs.ts); los view tabs son sticky.
   // Runes OK (.svelte).
-  import { openTabs, activeTabPath, setActive, closeTab, markDirty, saveActive, tabsError } from '$lib/stores/tabs';
+  import {
+    openTabs,
+    activeTabId,
+    setActive,
+    closeTab,
+    markDirty,
+    saveActive,
+    tabsError
+  } from '$lib/stores/tabs';
+  import { currentProjectId } from '$lib/stores/project';
+  import RequirementsExplorer from '$lib/components/RequirementsExplorer.svelte';
+  import GroupingPlanPanel from '$lib/components/GroupingPlanPanel.svelte';
 
   let { } = $props();
 
-  let activeTab = $derived(
-    $openTabs.find((t) => t.path === $activeTabPath) ?? null
-  );
+  let activeTab = $derived($openTabs.find((t) => t.id === $activeTabId) ?? null);
 
   function handleInput(e: Event) {
     const value = (e.target as HTMLTextAreaElement).value;
-    if ($activeTabPath) {
-      markDirty($activeTabPath, value);
+    if ($activeTabId) {
+      markDirty($activeTabId, value);
     }
   }
 
   function handleKeydown(e: KeyboardEvent) {
-    // Ctrl/Cmd+S → guardar.
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
       e.preventDefault();
       saveActive();
     }
   }
 
-  function handleClose(path: string, e: MouseEvent) {
+  function handleClose(id: string, e: MouseEvent) {
     e.stopPropagation();
-    closeTab(path);
+    closeTab(id);
   }
 </script>
 
@@ -38,30 +46,32 @@
   <div
     class="h-9 flex items-stretch border-b border-border overflow-x-auto bg-surface-2"
   >
-    {#each $openTabs as tab (tab.path)}
+    {#each $openTabs as tab (tab.id)}
       <div
-        class="group flex items-center gap-2 px-3 text-xs whitespace-nowrap border-r border-border transition-colors cursor-pointer
-               {tab.path === $activeTabPath
+        class="group flex items-center gap-2 px-3 text-xs whitespace-nowrap border-r border-border transition-colors cursor-pointer {tab.id ===
+        $activeTabId
           ? 'bg-surface text-text border-b-2 border-b-accent'
           : 'bg-bg text-text-dim hover:bg-surface-2 hover:text-text'}"
-        onclick={() => setActive(tab.path)}
-        title={tab.path}
+        onclick={() => setActive(tab.id)}
+        title={tab.kind === 'file' ? tab.path : tab.name}
         role="tab"
-        aria-selected={tab.path === $activeTabPath}
+        aria-selected={tab.id === $activeTabId}
         tabindex="0"
         onkeydown={(e) => {
           if (e.key === 'Enter' || e.key === ' ') {
             e.preventDefault();
-            setActive(tab.path);
+            setActive(tab.id);
           }
         }}
       >
         <span>{tab.name}</span>
-        {#if tab.dirty}<span class="text-text-dim" title="sin guardar">●</span>{/if}
+        {#if tab.kind === 'file' && tab.dirty}
+          <span class="text-text-dim" title="sin guardar">●</span>
+        {/if}
         <button
           type="button"
           class="opacity-0 group-hover:opacity-100 hover:bg-surface-3 px-1 text-text-dim hover:text-text"
-          onclick={(e) => handleClose(tab.path, e)}
+          onclick={(e) => handleClose(tab.id, e)}
           aria-label="Cerrar tab {tab.name}">×</button
         >
       </div>
@@ -69,16 +79,14 @@
   </div>
 
   {#if $tabsError}
-    <div
-      class="px-3 py-1 text-xs text-danger bg-danger/5 border-b border-danger/30"
-    >
+    <div class="px-3 py-1 text-xs text-danger bg-danger/5 border-b border-danger/30">
       ! {$tabsError}
     </div>
   {/if}
 
-  <!-- Contenido -->
-  <div class="flex-1 min-h-0">
-    {#if activeTab}
+  <!-- Contenido: switch por kind -->
+  <div class="flex-1 min-h-0 min-w-0 overflow-hidden">
+    {#if activeTab?.kind === 'file'}
       <textarea
         class="w-full h-full resize-none bg-bg text-text font-mono text-sm p-4 focus:outline-none"
         value={activeTab.content}
@@ -88,23 +96,25 @@
         autocomplete="off"
         autocapitalize="off"
       ></textarea>
+    {:else if activeTab?.kind === 'requirements'}
+      <RequirementsExplorer projectId={$currentProjectId} />
+    {:else if activeTab?.kind === 'grouping'}
+      <GroupingPlanPanel projectId={$currentProjectId} />
     {:else}
       <div
         class="h-full flex items-center justify-center text-text-dim text-sm font-mono"
       >
-        Abre un archivo del explorador
+        Abre un archivo o una vista del proyecto
       </div>
     {/if}
   </div>
 
-  <!-- Footer del viewer: guardar -->
-  {#if activeTab}
+  <!-- Footer del viewer: guardar (solo archivos) -->
+  {#if activeTab?.kind === 'file'}
     <div
       class="h-8 flex items-center justify-between px-3 border-t border-border bg-bg text-xs"
     >
-      <span class="text-text-dim truncate" title={activeTab.path}
-        >{activeTab.path}</span
-      >
+      <span class="text-text-dim truncate" title={activeTab.path}>{activeTab.path}</span>
       <button
         type="button"
         class="px-2 py-0.5 bg-accent text-bg hover:bg-accent-hover disabled:opacity-50 transition-colors"

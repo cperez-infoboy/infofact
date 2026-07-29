@@ -31,6 +31,9 @@ from backend.agents.tools import fetch_url, web_search
 from backend.agents.subagents.requirements_capture import (
     make_requirements_capture_subagent,
 )
+from backend.agents.subagents.requirements_capture_agent import (
+    make_requirements_capture_agent_subagent,
+)
 from backend.config import settings
 
 logger = logging.getLogger(__name__)
@@ -135,6 +138,15 @@ def build_agent(
     if phase == "requirements" and project_id is not None:
         subagents.append(
             make_requirements_capture_subagent(
+                project_id=project_id,
+                profile=profile,
+                project_slug=project_slug,
+                project_name=project_name or "",
+                project_description=project_description or "",
+            )
+        )
+        subagents.append(
+            make_requirements_capture_agent_subagent(
                 project_id=project_id,
                 profile=profile,
                 project_slug=project_slug,

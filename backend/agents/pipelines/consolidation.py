@@ -112,6 +112,43 @@ def exact_dedup(items: list[RawRequirement]) -> list[list[RawRequirement]]:
     return list(buckets.values())
 
 
+def drop_duplicit_implicit(
+    implicits: list[RawRequirement],
+    explicits: list[RawRequirement],
+) -> list[RawRequirement]:
+    """Drop implicit items whose source_span already backs an explicit item.
+
+    ``implicit_pass`` is meant to surface ASSUMPTIONS — requirements not stated
+    verbatim but necessary. When it reformulates a requirement that was already
+    extracted verbatim, it produces a false implicit that the cosine threshold
+    (0.85) often misses: the rewording drifts the embedding below the bar even
+    though both items cite the same original text.
+
+    Matching on the normalized ``source_span`` is deterministic and
+    high-precision — the span is the verbatim fingerprint of the source, so two
+    items sharing it come from the same passage. An implicit whose span matches
+    an explicit span is almost certainly a reworded duplicate, not an
+    assumption; drop it before consolidation runs.
+    """
+    explicit_spans = {
+        normalize(it.source_span) for it in explicits if it.source_span
+    }
+    kept: list[RawRequirement] = []
+    dropped = 0
+    for it in implicits:
+        if it.source_span and normalize(it.source_span) in explicit_spans:
+            dropped += 1
+            continue
+        kept.append(it)
+    if dropped:
+        logger.info(
+            "drop_duplicit_implicit: removed %d implicit item(s) whose "
+            "source_span already backs an explicit requirement",
+            dropped,
+        )
+    return kept
+
+
 # ---------------------------------------------------------------------------
 # Embeddings (lazy singleton, host-side)
 # ---------------------------------------------------------------------------

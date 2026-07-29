@@ -1,334 +1,199 @@
-"""Subagent tools for the grouping-review workflow.
+"""Subagent tools for the grouping-review workflow (DB-backed).
 
-review_grouping     — build a plan from the live store, write it to
-                      .infofact/grouping-plans/<ts>/plan.md, return it for chat.
-apply_grouping_plan — parse a (user-edited) plan, validate refs against the
-                      store, run the merges idempotently, rewrite frontmatter.
-list_grouping_plans — list existing plan dirs so a previous review can resume.
+review_grouping     — build a plan from the live store, persist it to the
+                      grouping_plans table, return the groups for chat.
+set_group_decision  — accept / reject / reset a group's curation decision.
+edit_group          — change a group's keeper and/or members (REQ-codes
+                      resolved to ids against the live store).
+apply_grouping_plan — merge every 'accept' group idempotently, set plan status.
+list_grouping_plans — list persisted plans so a previous review can resume.
 
-All tools close over project_id + the host workspace path; each opens a fresh
-DB session. They never load the heavy models beyond what build_grouping_plan
-already needs (embeddings, same as consolidation).
+All tools close over ``project_id``; each opens a fresh DB session. The plan is
+a DB row (shared source of truth): the agent and the requirements UI curate the
+SAME GroupingPlan / GroupingGroup rows. The Markdown export is read-only
+(``grouping_store.export_plan_md``) and never the store.
 
 Design notes
 ------------
-- Plans live under ``<workspace>/.infofact/grouping-plans/<timestamp>/plan.md``.
-  ``.infofact`` is in ``_IGNORED_DIRS`` (ingestion.py) so the capture pipeline
-  never parses a plan as a client document.
-- ``apply_grouping_plan`` validates EVERY referenced code against the store
-  before mutating, and is idempotent: a group whose members are already
+- ``apply_grouping_plan`` is idempotent: a group whose members are already
   ``MERGED`` into the keeper is reported ``already_applied`` and skipped, never
   re-merged (merge_requirements appends revisions, so a blind re-apply would
-  duplicate the audit trail).
-- The plan is the single source of truth for what gets merged; the
-  conversation is just how the user edits it.
+  duplicate the audit trail). See grouping_store._apply_one.
+- Editing is structural (DB rows), never textual: the user accepts/rejects or
+  picks a different keeper via set_group_decision / edit_group, then applies.
+  There is no plan file to rewrite.
+- NUNCA aplicar un plan sin confirmacion explicita del usuario: las fusiones
+  son destructivas (soft-delete de los perdedores como MERGED).
 """
 from __future__ import annotations
 
 import logging
-import re
-from datetime import datetime
-from pathlib import Path
+from typing import Optional
 
 from langchain_core.tools import tool
 
-from backend.agents.pipelines.grouping import (
-    PlanParseError,
-    build_grouping_plan,
-    parse_plan_md,
-    serialize_plan_md,
-)
+from backend.agents.pipelines.grouping import build_grouping_plan
 from backend.database import AsyncSessionLocal
-from backend.models.requirement import RequirementItem, ReqStatus
+from backend.models.requirement import GroupDecision
+from backend.services import grouping_store as gstore
 from backend.services import requirement_store as store
 
 logger = logging.getLogger(__name__)
 
-_PLAN_DIRNAME = "grouping-plans"
-_PLAN_FILENAME = "plan.md"
 
+def make_grouping_tools(project_id: int) -> list:
+    """Build the grouping-review tools bound to one project (DB-backed).
 
-def _plans_root(host_workspace: Path) -> Path:
-    return host_workspace / ".infofact" / _PLAN_DIRNAME
+    The plan lives in the DB (shared with the requirements UI); no workspace
+    path is needed anymore.
+    """
 
-
-def _ts_dir() -> str:
-    """ISO timestamp without ':' (invalid in Windows paths; sorts chronologically)."""
-    return datetime.now().strftime("%Y-%m-%dT%H%M%S")
-
-
-def make_grouping_tools(project_id: int, host_workspace: Path) -> list:
-    """Build the grouping-review tools bound to one project + workspace."""
-
-    def _rel(p: Path) -> str:
-        try:
-            return str(p.relative_to(host_workspace))
-        except ValueError:
-            return str(p)
+    async def _codes_to_ids() -> dict[str, int]:
+        """REQ-code -> RequirementItem.id map for the project (live snapshot)."""
+        async with AsyncSessionLocal() as session:
+            items = await store.list_requirements(
+                session, project_id, include_deleted=True
+            )
+        return {it.code: it.id for it in items}
 
     @tool
     async def review_grouping() -> dict:
-        """Detect duplicate requirements and produce an editable merge plan.
+        """Detect duplicate requirements and persist an editable merge plan.
 
         Reads the live requirement store, finds duplicate groups (verbatim and
-        semantic, reusing the consolidation dedup), and writes a Markdown plan
-        to .infofact/grouping-plans/<timestamp>/plan.md. Returns the plan text
-        so it can be shown in the chat for the user to review and edit.
+        semantic, reusing the consolidation dedup), and persists the plan to the
+        grouping_plans table. Returns the plan id and the groups (each with its
+        id, keeper + member REQ-codes, reason, confidence and current decision)
+        so they can be shown in the chat for the user to review.
 
-        Does NOT merge anything. After the user edits the plan
-        conversationally (e.g. "en el grupo 2, que el keeper sea REQ-012 y
-        borrá el grupo 3"), call apply_grouping_plan.
+        Does NOT merge anything. After the user curates the plan conversationally
+        -- accept/reject groups with set_group_decision, change a keeper or
+        members with edit_group -- call apply_grouping_plan.
         """
         try:
             async with AsyncSessionLocal() as session:
                 plan = await build_grouping_plan(
                     session, project_id, project=str(project_id),
                 )
-            md = serialize_plan_md(plan)
-            plan_dir = _plans_root(host_workspace) / _ts_dir()
-            plan_dir.mkdir(parents=True, exist_ok=True)
-            plan_path = plan_dir / _PLAN_FILENAME
-            plan_path.write_text(md, encoding="utf-8")
+                plan_id = await gstore.persist_plan(session, plan, project_id)
+                data = await gstore.get_plan(session, plan_id)
             return {
-                "plan_path": _rel(plan_path),
+                "plan_id": plan_id,
                 "group_count": len(plan.groups),
-                "groups": [
-                    {
-                        "keeper": g.keeper_code,
-                        "members": g.member_codes,
-                        "reason": g.reason,
-                        "confidence": g.confidence,
-                    }
-                    for g in plan.groups
-                ],
-                "markdown": md,
+                "groups": data["groups"] if data else [],
             }
-        except Exception as exc:  # noqa: BLE001 — surface to the model
+        except Exception as exc:  # noqa: BLE001 -- surface to the model
             return {"error": f"review_grouping failed: {exc}"}
 
     @tool
-    async def apply_grouping_plan(plan_path: str = "") -> dict:
-        """Apply a (possibly user-edited) grouping plan: merge each group.
+    async def set_group_decision(group_id: int, decision: str) -> dict:
+        """Set a group's curation decision: 'accept', 'reject' or 'pending'.
 
-        Args:
-            plan_path: path to plan.md relative to the project workspace. Empty
-                picks the most recent status:proposed plan.
-
-        Each group merges its members into the keeper (sources unioned, members
-        soft-deleted as MERGED). Idempotent: a group whose members are already
-        MERGED into the keeper is reported 'already_applied' and skipped.
-        Groups with an unknown/already-merged keeper or missing members are
-        reported 'invalid'. Rewrites the plan's frontmatter status to
-        applied / partially-applied.
+        Use after review_grouping to mark which duplicate groups the user wants
+        merged (accept) or skipped (reject). Only 'accept' groups are merged by
+        apply_grouping_plan. 'pending' resets a previous choice.
         """
-        root = _plans_root(host_workspace)
         try:
-            md_path = _resolve_plan_path(host_workspace, plan_path, root)
-            md = md_path.read_text(encoding="utf-8")
-            plan = parse_plan_md(md)
-        except PlanParseError as exc:
-            return {"error": f"plan parse failed: {exc}"}
-        except FileNotFoundError as exc:
-            return {"error": str(exc)}
-        except Exception as exc:  # noqa: BLE001
-            return {"error": f"apply_grouping_plan failed: {exc}"}
-
-        if not plan.groups:
+            dec = GroupDecision(decision)
+        except ValueError:
             return {
-                "plan_path": _rel(md_path), "status": "applied",
-                "applied": 0, "already_applied": 0, "invalid": 0,
-                "groups": [], "note": "el plan no tiene grupos",
+                "error": f"decision invalida: {decision!r} "
+                "(usá accept | reject | pending)",
             }
-
-        results: list[dict] = []
-        applied = already = invalid = 0
         try:
             async with AsyncSessionLocal() as session:
-                snapshot = await store.list_requirements(
-                    session, project_id, include_deleted=True,
+                result = await gstore.set_group_decision(session, group_id, dec)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"set_group_decision failed: {exc}"}
+        if result is None:
+            return {"error": f"grupo {group_id} no existe"}
+        return result
+
+    @tool
+    async def edit_group(
+        group_id: int,
+        keeper_code: Optional[str] = None,
+        member_codes: Optional[list[str]] = None,
+    ) -> dict:
+        """Change a group's keeper and/or members (by REQ-code).
+
+        Codes are resolved against the live store and the group row is updated.
+        Pass only the fields to change. Example: the user says "en el grupo 2,
+        que el keeper sea REQ-012" -> edit_group(2, keeper_code="REQ-012").
+        """
+        try:
+            kwargs: dict = {}
+            if keeper_code is not None or member_codes is not None:
+                codes = await _codes_to_ids()
+            if keeper_code is not None:
+                if keeper_code not in codes:
+                    return {"error": f"keeper no existe: {keeper_code}"}
+                kwargs["keeper_id"] = codes[keeper_code]
+            if member_codes is not None:
+                missing = [c for c in member_codes if c not in codes]
+                if missing:
+                    return {"error": f"miembros no existen: {missing}"}
+                kwargs["member_ids"] = [codes[c] for c in member_codes]
+            async with AsyncSessionLocal() as session:
+                result = await gstore.update_group(session, group_id, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"edit_group failed: {exc}"}
+        if result is None:
+            return {"error": f"grupo {group_id} no existe"}
+        return result
+
+    @tool
+    async def apply_grouping_plan(plan_id: Optional[int] = None) -> dict:
+        """Apply a grouping plan: merge every 'accept' group idempotently.
+
+        Args:
+            plan_id: id of the plan to apply. None picks the most recent
+                status:'proposed' plan (else the most recent plan overall).
+
+        Each accepted group merges its members into the keeper (sources unioned,
+        members soft-deleted as MERGED). Idempotent: already-merged groups report
+        'already_applied' and are skipped; invalid groups (unknown/merged keeper
+        or missing members) are reported 'invalid'. Sets plan status to
+        applied / partially-applied. NUNCA llamar sin confirmacion explicita del
+        usuario.
+        """
+        try:
+            async with AsyncSessionLocal() as session:
+                pid = plan_id
+                if pid is None:
+                    plans = await gstore.list_plans(session, project_id)
+                    if not plans:
+                        return {
+                            "error": "no hay planes de agrupamiento; "
+                            "llamá a review_grouping primero",
+                        }
+                    pid = next(
+                        (p["id"] for p in plans if p["status"] == "proposed"),
+                        plans[0]["id"],
+                    )
+                result = await gstore.apply_plan(
+                    session, pid, changed_by="agent"
                 )
-                by_code = {it.code: it for it in snapshot}
-                for g in plan.groups:
-                    outcome = await _apply_one_group(session, by_code, g)
-                    results.append(outcome)
-                    if outcome["status"] == "applied":
-                        applied += 1
-                    elif outcome["status"] == "already_applied":
-                        already += 1
-                    else:
-                        invalid += 1
         except Exception as exc:  # noqa: BLE001
             return {"error": f"apply_grouping_plan failed: {exc}"}
-
-        if invalid == 0 and already == 0:
-            final_status = "applied"
-        elif applied > 0:
-            final_status = "partially-applied"
-        else:
-            final_status = plan.status  # nothing applied; leave as-is
-        _rewrite_status(md_path, md, final_status)
-
-        return {
-            "plan_path": _rel(md_path),
-            "status": final_status,
-            "applied": applied,
-            "already_applied": already,
-            "invalid": invalid,
-            "groups": results,
-        }
+        return result
 
     @tool
     async def list_grouping_plans() -> dict:
-        """List grouping-plan directories under .infofact/grouping-plans/.
+        """List persisted grouping plans for the project (newest first).
 
-        Each entry has the timestamp dir name, the frontmatter status, and the
-        group count. Use this to resume a previous review or audit what was
-        applied.
+        Each entry: id, status (proposed/applied/partially-applied),
+        generated_at, applied_at, total groups and accepted count. Use to resume
+        a review or audit what was applied.
         """
-        root = _plans_root(host_workspace)
-        if not root.exists():
-            return {"plans": []}
-        out: list[dict] = []
-        for d in sorted((p for p in root.iterdir() if p.is_dir()), reverse=True):
-            plan_file = d / _PLAN_FILENAME
-            if not plan_file.exists():
-                continue
-            try:
-                plan = parse_plan_md(plan_file.read_text(encoding="utf-8"))
-                out.append({
-                    "dir": d.name,
-                    "status": plan.status,
-                    "groups": len(plan.groups),
-                    "path": _rel(plan_file),
-                })
-            except PlanParseError:
-                out.append({
-                    "dir": d.name, "status": "unparseable",
-                    "path": _rel(plan_file),
-                })
-        return {"plans": out}
+        async with AsyncSessionLocal() as session:
+            plans = await gstore.list_plans(session, project_id)
+        return {"plans": plans}
 
-    return [review_grouping, apply_grouping_plan, list_grouping_plans]
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-async def _apply_one_group(session, by_code: dict, group) -> dict:
-    """Merge one group idempotently. Returns an outcome dict.
-
-    ``by_code`` is refreshed in place as merges land, so later groups in the
-    same plan see updated status (a member merged in group 1 may be referenced
-    again — reported already_applied, not re-merged).
-    """
-    keeper = by_code.get(group.keeper_code)
-    if keeper is None:
-        return {
-            "keeper": group.keeper_code, "status": "invalid",
-            "reason": f"{group.keeper_code} no existe en el proyecto",
-        }
-    if keeper.status == ReqStatus.MERGED:
-        return {
-            "keeper": group.keeper_code, "status": "invalid",
-            "reason": f"el keeper {group.keeper_code} ya está MERGED",
-        }
-
-    member_items: list = []
-    missing: list[str] = []
-    for code in group.member_codes:
-        item = by_code.get(code)
-        if item is None:
-            missing.append(code)
-        else:
-            member_items.append(item)
-    if missing:
-        return {
-            "keeper": group.keeper_code, "status": "invalid",
-            "reason": f"miembros no encontrados: {', '.join(missing)}",
-        }
-
-    live = [m for m in member_items if m.status != ReqStatus.MERGED]
-    merged_into_keeper = [
-        m for m in member_items
-        if m.status == ReqStatus.MERGED and m.merged_into == keeper.id
+    return [
+        review_grouping,
+        set_group_decision,
+        edit_group,
+        apply_grouping_plan,
+        list_grouping_plans,
     ]
-    if not live:
-        # No live members: either fully applied already, or merged elsewhere.
-        if member_items and len(merged_into_keeper) == len(member_items):
-            return {
-                "keeper": group.keeper_code, "status": "already_applied",
-                "members": group.member_codes,
-            }
-        return {
-            "keeper": group.keeper_code, "status": "invalid",
-            "reason": "todos los miembros ya están MERGED pero no en este keeper",
-        }
-
-    ids = [keeper.id] + [m.id for m in live]
-    try:
-        kept = await store.merge_requirements(
-            session, ids, keep_id=keeper.id,
-            reason="grouping_plan", changed_by="agent",
-        )
-    except Exception as exc:  # noqa: BLE001
-        return {
-            "keeper": group.keeper_code, "status": "invalid",
-            "reason": f"merge falló: {exc}",
-        }
-
-    # Refresh the snapshot so subsequent groups in this plan see MERGED state.
-    for m in live:
-        refreshed = await session.get(RequirementItem, m.id)
-        if refreshed is not None:
-            by_code[m.code] = refreshed
-    return {
-        "keeper": kept.code, "status": "applied",
-        "members": [m.code for m in live],
-        "merged_count": len(live),
-    }
-
-
-def _resolve_plan_path(
-    host_workspace: Path, plan_path: str, root: Path,
-) -> Path:
-    """Resolve the plan to apply: explicit path, else most-recent proposed."""
-    if plan_path:
-        candidate = host_workspace / plan_path
-        if not candidate.exists():
-            raise FileNotFoundError(f"plan no encontrado: {plan_path}")
-        return candidate
-    if not root.exists():
-        raise FileNotFoundError(
-            "no hay planes de agrupamiento; llamá a review_grouping primero"
-        )
-    dirs = sorted(
-        (d for d in root.iterdir() if d.is_dir() and (d / _PLAN_FILENAME).exists()),
-        reverse=True,
-    )
-    for d in dirs:
-        try:
-            plan = parse_plan_md((d / _PLAN_FILENAME).read_text(encoding="utf-8"))
-        except PlanParseError:
-            continue
-        if plan.status == "proposed":
-            return d / _PLAN_FILENAME
-    if dirs:
-        return dirs[0] / _PLAN_FILENAME
-    raise FileNotFoundError(
-        "no hay planes de agrupamiento; llamá a review_grouping primero"
-    )
-
-
-def _rewrite_status(plan_path: Path, original_md: str, new_status: str) -> None:
-    """Update the frontmatter status line in-place (best effort, never fatal)."""
-    new_md, count = re.subn(
-        r"^status:\s*\S+", f"status: {new_status}", original_md,
-        count=1, flags=re.MULTILINE,
-    )
-    if count == 0:
-        return  # no status line in frontmatter — leave the file untouched
-    try:
-        plan_path.write_text(new_md, encoding="utf-8")
-    except OSError:
-        logger.warning("no se pudo reescribir el status del plan %s", plan_path)

@@ -14,7 +14,7 @@ Stage order (each consumes the previous stage's typed output):
   3. CONSOLIDATE  consolidate (exact + two-tier semantic dedup + contradictions)
   4. CRITIQUE   critique_all (generator-critic loop, dangling pre-check)
   5. CLASSIFY   classify_all (type + MoSCoW + optional decomposition)
-  6. PERSIST    RequirementItem rows (code sequential per project, source JSON,
+  6. PERSIST    RequirementItem rows (opaque REQ-XXXX codes, source JSON,
                 derived sub-items with parent_id)
 
 `on_progress` is an optional async callback (stage, message) the caller wires to
@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -45,6 +44,7 @@ from backend.agents.pipelines.classification import (
 from backend.agents.pipelines.consolidation import (
     ConsolidationResult,
     consolidate,
+    drop_duplicit_implicit,
 )
 from backend.agents.pipelines.critique import CritiqueResult, critique_all
 from backend.agents.pipelines.extraction import (
@@ -66,6 +66,7 @@ from backend.models.requirement import (
     ReqType,
     RequirementItem,
 )
+from backend.services._req_codes import gen_opaque_code
 
 logger = logging.getLogger(__name__)
 
@@ -88,28 +89,6 @@ class CaptureReport:
 # ---------------------------------------------------------------------------
 # Persistence helpers
 # ---------------------------------------------------------------------------
-
-_CODE_NUM_RE = re.compile(r"(\d+)$")
-
-
-async def _next_code_seq(session: AsyncSession, project_id: int) -> int:
-    """Next available numeric suffix for REQ-NNN in this project.
-
-    Parses existing codes (not a COUNT) so soft-deleted rows (REJECTED / MERGED
-    / SUPERSEDED) do not cause collisions — they stay in the table.
-    """
-    rows = await session.execute(
-        select(RequirementItem.code).where(
-            RequirementItem.project_id == project_id
-        )
-    )
-    max_n = 0
-    for (code,) in rows.all():
-        m = _CODE_NUM_RE.search(code or "")
-        if m:
-            max_n = max(max_n, int(m.group(1)))
-    return max_n + 1
-
 
 def _source_from_raw(it: RawRequirement) -> dict:
     """Build the JSON `source` payload from a raw item.
@@ -141,10 +120,10 @@ async def _persist(
 ) -> list[int]:
     """Write RequirementItem rows. Returns the persisted parent ids.
 
-    Codes are contiguous within a project: parent first, then its decomposition
-    sub-items, then the next parent. Codes are PRE-ASSIGNED in one pass before
-    any row is created — mixing the parent's `seq += 1` with the children's
-    produced non-contiguous codes that collided on a later flush.
+    Codes are opaque (Crockford base32), allocated uniquely per project: parent
+    first, then its decomposition sub-items, then the next parent. Codes are
+    PRE-ASSIGNED in one pass before any row is created — a shared ``reserved``
+    set prevents collisions before the rows are flushed.
 
     Sub-items from decomposition are written as derived rows with parent_id set
     and the parent's source inherited (preserves traceability to the original
@@ -162,23 +141,26 @@ async def _persist(
         except Exception:
             logger.exception("on_event failed (requirement.added)")
 
-    seq = await _next_code_seq(session, project_id)
-
-    # Pass 0 — pre-assign contiguous codes (parent + its subs) per item.
+    # Pass 0 — pre-assign unique opaque codes (parent + its subs) per item.
+    # A shared `reserved` set guarantees no collision within this batch before
+    # the rows are flushed.
+    reserved: set[str] = set()
     plan: list[tuple[str, RawRequirement, ClassificationDecision | None,
                      list, list[str]]] = []
     for it in items:
         decision = classification.decisions.get(it.id)
-        parent_code = f"REQ-{seq:03d}"
-        seq += 1
+        parent_code = await gen_opaque_code(
+            session, project_id, reserved=reserved
+        )
         sub_parts: list = (
             classification.decompositions.get(it.id, [])
             if decision and decision.decomposition_needed else []
         )
         sub_codes: list[str] = []
         for _ in sub_parts:
-            sub_codes.append(f"REQ-{seq:03d}")
-            seq += 1
+            sub_codes.append(
+                await gen_opaque_code(session, project_id, reserved=reserved)
+            )
         plan.append((parent_code, it, decision, sub_parts, sub_codes))
 
     created_ids: list[int] = []
@@ -263,6 +245,36 @@ async def _persist(
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
+
+
+async def reset_project_capture(
+    session: AsyncSession, project_id: int
+) -> dict:
+    """Wipe every requirement + grouping row for a project (start over).
+
+    Deletes grouping plans FIRST (their groups reference requirement_items via
+    keeper_id), then requirements (relations, revisions, items) — dependency
+    order, so it is correct whether or not SQLite enforces the CASCADE pragma.
+
+    Single transaction: the store helpers flush but do not commit, so this
+    commit is atomic. After it the old rows are gone, so the next capture
+    allocates fresh opaque codes with nothing reserved.
+
+    Destructive and irreversible — callers (the reset_capture agent tool) must
+    gate this behind explicit user confirmation.
+    """
+    from backend.services.requirement_store import delete_all_requirements
+    from backend.services.grouping_store import delete_all_plans
+
+    plans = await delete_all_plans(session, project_id)
+    reqs = await delete_all_requirements(session, project_id)
+    await session.commit()
+    logger.info(
+        "reset_project_capture(project_id=%s): deleted %d requirement(s), %d plan(s)",
+        project_id, reqs, plans,
+    )
+    return {"deleted_requirements": reqs, "deleted_plans": plans}
+
 
 async def run_requirements_pipeline(
     project_id: int,
@@ -352,6 +364,9 @@ async def run_requirements_pipeline(
             project_name=project_name,
             project_description=project_description,
         )
+        # Drop false implicits: an item whose source_span already backs an
+        # explicit requirement is a reworded duplicate, not an assumption.
+        implicits = drop_duplicit_implicit(implicits, extracted)
         extracted.extend(implicits)
         await _emit("extract", f"{len(extracted)} items crudos")
 

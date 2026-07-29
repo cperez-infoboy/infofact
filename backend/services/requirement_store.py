@@ -19,10 +19,9 @@ lifecycles; a fresh AsyncSessionLocal per tool call is the intended pattern.
 """
 from __future__ import annotations
 
-import re
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.models.requirement import (
@@ -35,8 +34,8 @@ from backend.models.requirement import (
     RequirementRelation,
     RequirementRevision,
 )
+from backend.services._req_codes import gen_opaque_code
 
-_CODE_NUM_RE = re.compile(r"(\d+)$")
 _SOFT_DELETED = frozenset(
     {ReqStatus.REJECTED, ReqStatus.MERGED, ReqStatus.SUPERSEDED}
 )
@@ -47,24 +46,13 @@ _CHANGE_REASON_MAX = 64  # RequirementRevision.change_reason column width
 
 
 async def _next_code(session: AsyncSession, project_id: int) -> str:
-    """Next contiguous REQ-NNN code for the project.
+    """Allocate a unique opaque REQ-XXXX code for the project.
 
-    Parses existing codes (not a COUNT) so soft-deleted rows do not collide:
-    they remain in the table and their suffixes are still "occupied".
-    Mirrors requirements_service._next_code_seq on purpose; keeping a local
-    copy avoids reaching into another module's private API.
+    Thin delegate over ``gen_opaque_code`` so the editing surface and the
+    pipeline share one generator. Codes are opaque (Crockford base32): gaps
+    after merge/delete don't read as lost requirements.
     """
-    rows = await session.execute(
-        select(RequirementItem.code).where(
-            RequirementItem.project_id == project_id
-        )
-    )
-    max_n = 0
-    for (code,) in rows.all():
-        m = _CODE_NUM_RE.search(code or "")
-        if m:
-            max_n = max(max_n, int(m.group(1)))
-    return f"REQ-{max_n + 1:03d}"
+    return await gen_opaque_code(session, project_id)
 
 
 def _snapshot(item: RequirementItem) -> dict[str, Any]:
@@ -153,7 +141,7 @@ async def add_requirement(
     created_by: str = "agent",
     reason: str = "add",
 ) -> RequirementItem:
-    """Create a DRAFT item with the next contiguous code.
+    """Create a DRAFT item with the next opaque code.
 
     Manually added items may have no source (human entry); in that case
     span_verified is False by default and the status stays DRAFT until the
@@ -284,6 +272,57 @@ async def delete_requirement(
     return await reject_requirement(
         session, req_id, reason=reason, changed_by=changed_by
     )
+
+
+async def delete_all_requirements(
+    session: AsyncSession, project_id: int
+) -> int:
+    """Hard-delete every requirement row for a project (fresh opaque codes).
+
+    Wipes requirement_relations, requirement_revisions and requirement_items for
+    the project. Children first, then the items: the FKs are ondelete=CASCADE,
+    but SQLite only honors CASCADE with PRAGMA foreign_keys=ON, so we delete in
+    dependency order to be correct regardless of the pragma.
+
+    Unlike the per-item ``delete_requirement`` (soft-delete for audit), this is
+    a true wipe — only ``reset_project_capture`` should call it, when the user
+    explicitly asks to start over. Does NOT commit; the caller owns the
+    transaction so a multi-store reset stays atomic. Returns the item count.
+    """
+    count = await session.scalar(
+        select(func.count()).select_from(RequirementItem).where(
+            RequirementItem.project_id == project_id
+        )
+    )
+    total = int(count or 0)
+    if total == 0:
+        return 0
+    item_ids = select(RequirementItem.id).where(
+        RequirementItem.project_id == project_id
+    )
+    # Relations reference items via from_id AND to_id; clear both endpoints.
+    await session.execute(
+        delete(RequirementRelation).where(
+            RequirementRelation.from_id.in_(item_ids)
+        )
+    )
+    await session.execute(
+        delete(RequirementRelation).where(
+            RequirementRelation.to_id.in_(item_ids)
+        )
+    )
+    await session.execute(
+        delete(RequirementRevision).where(
+            RequirementRevision.req_id.in_(item_ids)
+        )
+    )
+    await session.execute(
+        delete(RequirementItem).where(
+            RequirementItem.project_id == project_id
+        )
+    )
+    await session.flush()
+    return total
 
 
 # --- structural mutations ---------------------------------------------------
@@ -520,7 +559,7 @@ async def list_requirements(
     """Query items by status / type / priority / structure.
 
     Extra filters:
-      - code: REQ-code prefix match (e.g. "REQ-01" matches REQ-010..REQ-019).
+      - code: REQ-code prefix match (e.g. "REQ-7K" matches "REQ-7K3F").
       - parent_id: only operational sub-requirements of this parent.
       - derived: True = only derived sub-items; False = only atomic originals.
       - merged_into: items soft-deleted into this keeper id (set
@@ -548,7 +587,7 @@ async def list_requirements(
         stmt = stmt.where(RequirementItem.derived == derived)
     if merged_into is not None:
         stmt = stmt.where(RequirementItem.merged_into == merged_into)
-    stmt = stmt.order_by(RequirementItem.code)
+    stmt = stmt.order_by(RequirementItem.id)
     rows = await session.scalars(stmt)
     return list(rows)
 
@@ -562,6 +601,14 @@ async def get_requirement(
     caller sees every edge touching this item regardless of direction.
     """
     item = await _get_item(session, req_id)
+
+    parent_code: str | None = None
+    if item.parent_id is not None:
+        parent_code = await session.scalar(
+            select(RequirementItem.code).where(
+                RequirementItem.id == item.parent_id
+            )
+        )
 
     rel_from = await session.scalars(
         select(RequirementRelation).where(
@@ -602,6 +649,7 @@ async def get_requirement(
         "explicit": item.explicit,
         "derived": item.derived,
         "parent_id": item.parent_id,
+        "parent_code": parent_code,
         "confidence": item.confidence,
         "span_verified": item.span_verified,
         "acceptance_criteria": list(item.acceptance_criteria or []),

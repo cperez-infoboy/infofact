@@ -207,6 +207,7 @@ def _make_vision_converter():
 
     pipeline_options = PdfPipelineOptions()
     pipeline_options.generate_picture_images = True
+    pipeline_options.images_scale = settings.vision_images_scale
     return DocumentConverter(
         format_options={
             InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
@@ -285,7 +286,11 @@ def _describe_embedded_pictures(doc, document_id: str) -> list[Chunk]:
             continue
         # Z.ai rejects images below its minimum edge; skip tiny icons silently
         # so an icon-heavy document does not flood the log with warnings.
-        if min(image.size) < MIN_IMAGE_EDGE:
+        # images_scale ups the rasterized resolution; raise the minimum-edge
+        # floor proportionally so upscaled logos/icons are still skipped (a 64px
+        # icon at scale 4.0 is 256px but carries no new content). This keeps the
+        # picture cap for real diagrams instead of spending it on noise.
+        if min(image.size) < MIN_IMAGE_EDGE * settings.vision_images_scale:
             continue
         tmp_path = _pil_to_temp_png(image)
         try:

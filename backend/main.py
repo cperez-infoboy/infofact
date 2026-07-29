@@ -142,6 +142,11 @@ app.include_router(projects.router, prefix="/api/projects", tags=["projects"])
 # /api/chat porque routers/chat.py es solo streaming SSE y no se toca.
 app.include_router(projects.session_router, prefix="/api/chat", tags=["sessions"])
 # Explorar / editar archivos del workspace del usuario.
+# Requerimientos + planes de agrupamiento: UI y agente comparten la misma DB
+# (decision por grupo + status por plan = guarda de idempotencia compartida).
+from backend.routers import requirements as requirements_router
+app.include_router(requirements_router.router, prefix="/api", tags=["requirements"])
+# Explorar / editar archivos del workspace del usuario.
 app.include_router(workspaces.router, prefix="/api/workspaces", tags=["workspaces"])
 
 

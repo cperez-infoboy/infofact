@@ -1,31 +1,40 @@
 <script lang="ts">
-  // Nodo recursivo del árbol del workspace. Componente aparte porque
-  // `<svelte:self>` está deprecado en Svelte 5: se usa un componente
-  // independiente que se referencia a sí mismo por import explícito.
+  // Nodo recursivo del árbol del workspace con carga lazy.
+  //
+  // Las carpetas cuyos hijos no se cargaron (loaded=false) los traen del
+  // backend al expandirse por primera vez (loadChildren). Componente
+  // aparte porque `<svelte:self>` está deprecado en Svelte 5: se usa un
+  // componente independiente que se referencia a sí mismo por import.
   //
   // Runes OK (.svelte).
   import type { TreeNode } from '$lib/api/workspaces';
-  import { openTab, activeTabPath } from '$lib/stores/tabs';
+  import { openTab, activeTabId } from '$lib/stores/tabs';
+  import { loadChildren, loadingPaths } from '$lib/stores/workspace';
   import Self from './FileTreeNode.svelte';
 
   let { node, depth = 0 }: { node: TreeNode; depth?: number } = $props();
 
-  // Top-level (depth 0) expandido por defecto. Como `depth` viene de prop
-  // inmutable por render, lo leemos en un derived para que Svelte 5 no
-  // flaggee "state referenced locally".
-  let top = $derived(depth < 1);
-  let expanded = $state(true);
-  $effect(() => {
-    if (top) expanded = true;
-  });
+  // Top-level (depth 0) arranca expandido; el resto colapsado, para
+  // soportar lazy loading (no expandir lo que aún no se cargó). `depth`
+  // es un prop inmutable por render: solo interesa su valor inicial
+  // como semilla de $state, no su reactividad.
+  // svelte-ignore state_referenced_locally
+  let expanded = $state(depth < 1);
 
   let isDir = $derived(node.type === 'dir');
-  let isActive = $derived($activeTabPath === node.path);
+  let isActive = $derived($activeTabId === node.path);
   let indent = $derived(depth * 12 + 4);
+  let loaded = $derived(node.loaded ?? false);
+  let isLoading = $derived($loadingPaths.has(node.path));
 
   async function handleClick() {
     if (isDir) {
-      expanded = !expanded;
+      const willExpand = !expanded;
+      expanded = willExpand;
+      // Si se expande y los hijos no están cargados, traerlos.
+      if (willExpand && !loaded) {
+        await loadChildren(node.path);
+      }
       return;
     }
     await openTab(node.path);
@@ -45,9 +54,15 @@
     aria-expanded={isDir ? expanded : undefined}
   >
     {#if isDir}
-      <span class="text-xs w-3 inline-block text-text-faint"
-        >{expanded ? '▾' : '▸'}</span
-      >
+      <span class="text-xs w-3 inline-block text-text-faint">
+        {#if isLoading}
+          ⟳
+        {:else if expanded}
+          ▾
+        {:else}
+          ▸
+        {/if}
+      </span>
     {:else}
       <span class="text-xs w-3 inline-block"></span>
     {/if}

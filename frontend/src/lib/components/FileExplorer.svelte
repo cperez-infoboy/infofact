@@ -24,7 +24,7 @@
   // así que cubre el primer render sin duplicar el fetch de onMount.
   $effect(() => {
     const id = $currentProjectId;
-    if (id !== null) refreshTree();
+    if (id !== null) refreshTree(".", true);
   });
 
   onDestroy(() => {
@@ -40,7 +40,7 @@
     <button
       type="button"
       class="text-xs px-2 py-0.5 hover:bg-surface-3 hover:text-text text-text-dim transition-colors"
-      onclick={() => refreshTree()}
+      onclick={() => refreshTree(".", true)}
       disabled={$workspaceLoading}
       title="Refrescar"
       aria-label="Refrescar árbol"

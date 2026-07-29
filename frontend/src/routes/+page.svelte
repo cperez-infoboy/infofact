@@ -3,6 +3,10 @@
   // 3 paneles (Explorer | Viewer | Chat) con resize handles persistentes
   // en localStorage. Header (MenuBar) arriba, StatusBar abajo. Full viewport.
   //
+  // Requerimientos y Agrupamiento se abren como tabs top-level del visor
+  // central (peers de los tabs de archivo), vía openView('requirements'|'grouping').
+  // SRS sigue siendo un overlay (futuro: migrar a tab).
+  //
   // Runes OK (.svelte).
   import { goto } from '$app/navigation';
   import { onMount } from 'svelte';
@@ -15,6 +19,7 @@
   import StatusBar from '$lib/components/StatusBar.svelte';
   import ResizeHandle from '$lib/components/ResizeHandle.svelte';
   import { currentProjectId } from '$lib/stores/project';
+  import { openView, activeTabId } from '$lib/stores/tabs';
 
   let { } = $props();
 
@@ -73,9 +78,7 @@
 <svelte:head><title>InfoFact — IDE</title></svelte:head>
 
 {#if $authStore}
-  <div
-    class="h-screen w-screen flex flex-col bg-bg text-text overflow-hidden"
-  >
+  <div class="h-screen w-screen flex flex-col bg-bg text-text overflow-hidden">
     <MenuBar />
 
     <main class="flex-1 flex min-h-0">
@@ -86,15 +89,15 @@
 
       <ResizeHandle onResize={onExplorerResize} />
 
-      <!-- Viewer (flex-1): FileViewer o SrsViewer overlay -->
-      <div class="flex-1 min-w-0 relative">
+      <!-- Viewer (flex-1): FileViewer con tabs (archivos + vistas) o SrsViewer overlay -->
+      <div class="flex-1 min-w-0 relative overflow-hidden">
         <FileViewer />
         {#if srsOpen}
           <div class="absolute inset-0 z-10">
             <SrsViewer projectId={$currentProjectId} onClose={() => (srsOpen = false)} />
           </div>
         {/if}
-        <!-- Toggle SRS: botón flotante esquina superior del viewer -->
+        <!-- Botones de vistas: abren tabs en el FileViewer (REQS / AGR) -->
         <button
           type="button"
           class="absolute top-1 right-2 z-20 px-2 py-0.5 text-[10px] font-mono uppercase tracking-wider rounded-sm border border-border bg-surface-2 text-text-dim hover:bg-surface-3 hover:text-text transition-colors {srsOpen
@@ -104,6 +107,28 @@
           title="Ver SRS generado desde los requerimientos capturados"
         >
           SRS
+        </button>
+        <button
+          type="button"
+          class="absolute top-1 right-12 z-20 px-2 py-0.5 text-[10px] font-mono uppercase tracking-wider rounded-sm border border-border bg-surface-2 text-text-dim hover:bg-surface-3 hover:text-text transition-colors {$activeTabId ===
+          'requirements'
+            ? 'bg-accent text-bg border-accent'
+            : ''}"
+          onclick={() => openView('requirements')}
+          title="Ver y editar requerimientos capturados"
+        >
+          REQS
+        </button>
+        <button
+          type="button"
+          class="absolute top-1 right-24 z-20 px-2 py-0.5 text-[10px] font-mono uppercase tracking-wider rounded-sm border border-border bg-surface-2 text-text-dim hover:bg-surface-3 hover:text-text transition-colors {$activeTabId ===
+          'grouping'
+            ? 'bg-accent text-bg border-accent'
+            : ''}"
+          onclick={() => openView('grouping')}
+          title="Ver planes de agrupamiento y fusiones"
+        >
+          AGR
         </button>
       </div>
 

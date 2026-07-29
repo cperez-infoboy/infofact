@@ -18,7 +18,6 @@ import logging
 import os
 import tempfile
 from dataclasses import dataclass, field
-from pathlib import Path
 from urllib import request as urllib_request
 
 from backend.config import settings
@@ -110,7 +109,7 @@ def _probe_llm() -> ProbeResult:
 
 def _probe_workspace() -> ProbeResult:
     """Write probe: the workspace mount must be writable (HA/NFS can be RO)."""
-    root = Path(settings.workspaces_host_root)
+    root = settings.workspaces_root
     try:
         root.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=root, suffix=".preflight")

@@ -12,6 +12,15 @@ import {
   endCapture
 } from '$lib/stores/capture';
 
+// --- Captura: qué tools abren/cierran el banner vivo --------------------
+// startCapture() resetea el estado del pipeline (wipes conflictos/reportes),
+// así que dispara UNA vez por captura: al abrirla (run_requirements_capture
+// del subagente determinista, o ingest_documents del agentico por etapas) y
+// al cerrarla (commit_capture). Las tools de etapa intermedias sólo emiten
+// fine events que se acumulan; no reinician el banner.
+const CAPTURE_START_TOOLS = new Set(['run_requirements_capture', 'ingest_documents']);
+const CAPTURE_END_TOOLS = new Set(['run_requirements_capture', 'commit_capture']);
+
 // --- Tipos de mensaje (union discriminada por `kind`) -----------------------
 // Timeline lineal: cada segmento de texto del agente y cada tool call son
 // mensajes top-level independientes, renderizados en orden cronológico.
@@ -202,8 +211,8 @@ export async function sendMessage(sessionId: number, content: string): Promise<b
         const toolId = pushToolMessage(name, input);
         pendingTools.push({ id: toolId, name });
         // Si arranca la captura, resetear el estado vivo del pipeline.
-        if (name === 'run_requirements_capture') {
-          console.log('[chat] startCapture() fired');
+        if (CAPTURE_START_TOOLS.has(name)) {
+          console.log('[chat] startCapture() fired', name);
           startCapture();
         }
       },
@@ -217,7 +226,8 @@ export async function sendMessage(sessionId: number, content: string): Promise<b
         }
         // Sin match: no hay tool message para cerrar, ignorar.
         // Fin de la captura: conservar hallazgos en UI, sólo bajar flag running.
-        if (name === 'run_requirements_capture') {
+        // commit_capture cierra la variante agentica por etapas.
+        if (CAPTURE_END_TOOLS.has(name)) {
           endCapture();
         }
       },

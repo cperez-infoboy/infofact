@@ -133,6 +133,146 @@ def _sanitize_error(exc: Exception) -> str:
 # proyecto completo; con arg = subpath relativo al workspace.
 _CAPTURA_PREFIX = "/captura"
 _AGRUPAR_PREFIX = "/agrupar"
+# /captura_agente MUST be matched before /captura: "/captura_agente"
+# startswith("/captura"), so the generic /captura branch would otherwise
+# swallow it and parse "_agente ..." as a target_subpath. Accepts _ and -.
+_CAPTURA_AGENTE_PREFIXES = ("/captura_agente", "/captura-agente")
+
+# Marcadores de decision del usuario sobre los requerimientos existentes. La
+# guardia router-level solo deja pasar la captura cuando el texto los contiene
+# de forma inequivoca; un texto ambiguo (p. ej. "agregar detalle a X") no cuenta
+# como decision append, para que la guardia siga consultando en lugar de dejar
+# pasar la captura y pisar datos sin confirmacion.
+_RESET_MARKERS = (
+    "resetear", "resetea", "reset", "de cero", "empezar de cero",
+    "borrar todo", "eliminar todo",
+)
+_APPEND_MARKERS = (
+    "append", "agregar a los existentes", "sumar a los existentes",
+    "mantener los existentes", "conservar los existentes",
+    "agregarlos", "sumarlos", "mantenerlos", "conservarlos",
+)
+
+
+def _user_existing_decision(content: str) -> str | None:
+    """Devuelve 'reset' o 'append' si el texto expresa una decision explicita
+    sobre los requerimientos existentes; si no, None (debe consultarse).
+
+    Conservadora: solo frases inequivocas. Es el pilar que cierra el bypass por
+    el cual el subagente agent-driven elegia ``on_existing`` por si solo.
+    """
+    low = content.lower()
+    if any(m in low for m in _RESET_MARKERS):
+        return "reset"
+    if any(m in low for m in _APPEND_MARKERS):
+        return "append"
+    return None
+
+
+def _is_capture_command(content: str) -> bool:
+    stripped = content.strip().lower()
+    return stripped.startswith(_CAPTURA_AGENTE_PREFIXES) or stripped.startswith(
+        _CAPTURA_PREFIX
+    )
+
+
+def _extract_decision_and_subpath(rest: str) -> tuple[str, str | None]:
+    """Separa la decision reset/append del subpath en el argumento de /captura.
+
+    Quita el marcador de decision del texto para no tratarlo como un path (p.
+    ej. "/captura resetear" -> subpath="", decision="reset").
+    """
+    low = rest.lower()
+    for marker in _RESET_MARKERS:
+        idx = low.find(marker)
+        if idx >= 0:
+            sub = (rest[:idx] + rest[idx + len(marker) :]).strip().lstrip("/").strip()
+            return sub, "reset"
+    for marker in _APPEND_MARKERS:
+        idx = low.find(marker)
+        if idx >= 0:
+            sub = (rest[:idx] + rest[idx + len(marker) :]).strip().lstrip("/").strip()
+            return sub, "append"
+    return rest.strip().lstrip("/").strip(), None
+
+
+async def _capture_gate_message(project_id: int, content: str) -> str | None:
+    """Guardia router-level (inviolable) para captura sobre datos existentes.
+
+    Antes de despachar cualquier comando de captura al agente, cuenta los
+    requerimientos existentes. Si hay datos previos y el usuario no expreso una
+    decision explicita (reset/append), devuelve un mensaje de confirmacion para
+    mostrar en lugar de ejecutar el agente. None => procede con la captura.
+    """
+    if not _is_capture_command(content):
+        return None
+    if _user_existing_decision(content) is not None:
+        return None
+    from backend.agents.subagents.requirements_capture import _count_existing
+
+    existing = await _count_existing(project_id)
+    n = existing.get("requirements", 0)
+    if n <= 0:
+        return None
+    last = existing.get("last_code")
+    suffix = f" (ultimo codigo: {last})" if last else ""
+    return (
+        f"Ya existen {n} requerimiento(s) en este proyecto{suffix}. Antes de "
+        "capturar, decide que hacer con ellos:\n\n"
+        "- Reenvia el comando con **resetear** para borrar todos los "
+        "requerimientos y agrupamientos y empezar de cero (irreversible).\n"
+        "- Reenvia el comando con **agregar a los existentes** para conservarlos "
+        "y sumar los nuevos.\n\n"
+        "Ejemplo: `/captura_agente resetear` o "
+        "`/captura_agente agregar a los existentes`. Puedes repetir tus "
+        "instrucciones de captura junto con la decision."
+    )
+
+
+def _captura_agente_directive(user_instructions: str) -> str:
+    """Construye la directiva para el subagente agent-driven de captura.
+
+    El orquestador delega a ``requirements-capture-agent`` via la tool ``task``.
+    El texto libre despues del comando se reenvia como steering que el agente
+    incorpora en orientar/planificar. Si el texto expresa una decision sobre los
+    datos existentes (reset/append), se propaga explicitamente para que el
+    agente la aplique en ``ingest_documents`` sin volver a consultar.
+    """
+    directive = (
+        "[DIRECTIVE] Delega INMEDIATAMENTE al subagente "
+        "`requirements-capture-agent` (usando la tool `task`) para capturar y "
+        "validar requerimientos del proyecto. NO explores el sistema de "
+        "archivos antes de delegar (sin ls, glob, read_file ni execute): el "
+        "subagente ubica los documentos del proyecto via orient_documents. "
+        "Este subagente RAZONA la captura etapa por etapa: orienta los "
+        "documentos, planifica y ejecuta las seis etapas del pipeline "
+        "(ingest_documents con Docling -> extract_requirements -> "
+        "consolidate_requirements -> critique_requirements -> "
+        "classify_requirements -> commit_capture) y refina antes de reportar. "
+        "La ingesta de texto es UNICAMENTE via ingest_documents; no extraer el "
+        "documento a mano."
+    )
+    decision = _user_existing_decision(user_instructions)
+    if decision == "reset":
+        directive += (
+            ' [DECISION] El usuario decidio empezar de cero: invoca '
+            'ingest_documents con on_existing="reset".'
+        )
+    elif decision == "append":
+        directive += (
+            ' [DECISION] El usuario decidio conservar los existentes: invoca '
+            'ingest_documents con on_existing="append".'
+        )
+    if user_instructions:
+        # chr(34) is the ASCII double quote; used here to keep literal quotes
+        # around the user text without f-string escape sequences.
+        directive += " INSTRUCCIONES DEL USUARIO: "
+        directive += chr(34) + user_instructions + chr(34)
+        directive += (
+            " (incorporalas en la orientacion/planificacion; dirigen el "
+            "razonamiento, no parametros internos del pipeline)."
+        )
+    return directive
 
 
 def _rewrite_command(content: str) -> str:
@@ -159,22 +299,37 @@ def _rewrite_command(content: str) -> str:
             "`apply_grouping_plan`."
         )
 
+    # /captura_agente (and /captura-agente) -> agent-driven subagent. Checked
+    # BEFORE the /captura branch because "/captura_agente" startswith
+    # "/captura". Text after the command is user steering, not a subpath.
+    for _prefix in _CAPTURA_AGENTE_PREFIXES:
+        if stripped.startswith(_prefix):
+            _user_instructions = (
+                stripped[len(_prefix):].strip().lstrip("/").strip()
+            )
+            return _captura_agente_directive(_user_instructions)
+
     if not stripped.startswith(_CAPTURA_PREFIX):
         return content
     # Acepta "/captura docs/x" (formato del plan §9.4) y "/captura/docs/x"
     # (sin espacio); normaliza barra inicial. El subpath es siempre relativo
-    # al workspace, nunca absoluto.
+    # al workspace, nunca absoluto. Si el texto trae una decision sobre los
+    # datos existentes (reset/append), se propaga como on_existing; si no,
+    # on_existing="ask" (solo frena si hay datos, pero la guardia router-level
+    # ya impidio llegar aca con datos previos sin decision explicita).
     rest = stripped[len(_CAPTURA_PREFIX):].strip().lstrip("/")
-    subpath = rest.strip()
+    subpath, decision = _extract_decision_and_subpath(rest)
     if subpath:
-        target_clause = f' con target_subpath="{subpath}"'
+        target_clause = f' target_subpath="{subpath}"'
     else:
-        target_clause = ' con target_subpath="" (proyecto completo)'
+        target_clause = ' target_subpath="" (proyecto completo)'
+    on_existing = decision or "ask"
     return (
         "[DIRECTIVE] Delega al subagente `requirements-capture` para ejecutar la "
         "captura y validación de requerimientos del proyecto. Invoca la tool "
-        f"`run_requirements_capture`{target_clause}. Cuando termine, reporta al "
-        "usuario: documentos procesados, total extraído, duplicados propuestos, "
+        f"`run_requirements_capture` con{target_clause} y "
+        f'on_existing="{on_existing}". Cuando termine, reporta al usuario: '
+        "documentos procesados, total extraído, duplicados propuestos, "
         "contradicciones detectadas, items marcados para revisión y items "
         "rechazados por alucinación. Luego ofrece ayudar a editar, fusionar o "
         "aprobar los requerimientos."
@@ -210,6 +365,31 @@ async def send_message(
         # si el agente falla a mitad de camino.
         db.add(ChatMessage(session_id=session_id, role="user", content=body.content))
         await db.commit()
+
+    # Guardia router-level (inviolable) para captura sobre datos existentes: si
+    # el comando es de captura y hay requerimientos previos sin una decision
+    # explicita, NO despachamos al agente; mostramos una confirmacion. Cierra el
+    # bypass del subagente agent-driven que elegia on_existing por si solo.
+    gate_msg = await _capture_gate_message(project.id, body.content)
+    if gate_msg is not None:
+        async with AsyncSessionLocal() as db:
+            db.add(
+                ChatMessage(
+                    session_id=session_id, role="assistant", content=gate_msg
+                )
+            )
+            await db.commit()
+        async def _gate_stream() -> AsyncGenerator[str, None]:
+            try:
+                yield _sse("token", {"delta": gate_msg})
+                yield _sse("completed", {"message": gate_msg})
+            finally:
+                _active_streams.discard(key)
+        return StreamingResponse(
+            _gate_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     # Arranca el container del usuario si no está corriendo.
     await ensure_container(user.profile)

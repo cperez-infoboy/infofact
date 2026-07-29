@@ -12,7 +12,7 @@ Design:
 - Each tool opens its own AsyncSessionLocal, calls the store, returns a plain
   dict. Errors become {"error": ...} dicts so the model sees structured
   feedback instead of a crashed tool call.
-- Tools speak `code` (the human-visible "REQ-NNN" handle), not the integer id:
+- Tools speak `code` (the human-visible "REQ-XXXX" handle), not the integer id:
   the model reads codes from list output and references them. Code->id
   resolution lives here (adapter concern), the store stays id-centric.
 """
@@ -53,7 +53,7 @@ RelationKindValue = Literal["duplicate", "contradicts", "depends_on"]
 async def _code_to_id(
     session: AsyncSession, project_id: int, code: str
 ) -> int:
-    """Resolve a REQ-NNN code to its integer id within the project."""
+    """Resolve a REQ-XXXX code to its integer id within the project."""
     item_id = await session.scalar(
         select(RequirementItem.id).where(
             RequirementItem.project_id == project_id,
@@ -188,7 +188,7 @@ def make_requirements_tools(project_id: int) -> list:
         source_section: str | None = None,
         source_page: int | None = None,
     ) -> dict:
-        """Create a new DRAFT requirement with the next contiguous code.
+        """Create a new DRAFT requirement with a fresh opaque code.
 
         Use this to record a requirement that the pipeline missed or that a
         human contributes during review. If source_quote is provided it becomes
@@ -513,6 +513,63 @@ def make_requirements_tools(project_id: int) -> list:
         except Exception as exc:  # noqa: BLE001
             return {"error": f"build_srs failed: {exc}"}
 
+    @tool
+    async def capture_status() -> dict:
+        """Count existing requirements + grouping plans for THIS project.
+
+        Call this BEFORE run_requirements_capture. If requirements > 0, tell the
+        user how many exist and the last code, then ask whether to reset
+        everything or append. Never reset without explicit user confirmation.
+        """
+        try:
+            async with AsyncSessionLocal() as session:
+                from sqlalchemy import func, select
+                from backend.models.requirement import (
+                    GroupingPlan,
+                    RequirementItem,
+                )
+                req_count = await session.scalar(
+                    select(func.count())
+                    .select_from(RequirementItem)
+                    .where(RequirementItem.project_id == project_id)
+                )
+                plan_count = await session.scalar(
+                    select(func.count())
+                    .select_from(GroupingPlan)
+                    .where(GroupingPlan.project_id == project_id)
+                )
+                last_code = await session.scalar(
+                    select(RequirementItem.code)
+                    .where(RequirementItem.project_id == project_id)
+                    .order_by(RequirementItem.id.desc())
+                    .limit(1)
+                )
+                return {
+                    "requirements": int(req_count or 0),
+                    "grouping_plans": int(plan_count or 0),
+                    "last_code": last_code,
+                }
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"capture_status failed: {exc}"}
+
+    @tool
+    async def reset_capture() -> dict:
+        """Delete ALL requirements + grouping plans for THIS project (hard).
+
+        Destructive and irreversible: removes every requirement, relation,
+        revision and grouping plan/group so the next capture starts fresh.
+        ONLY call this after the user explicitly confirmed they want
+        to reset — never on your own initiative. When unsure, do NOT reset.
+        """
+        try:
+            async with AsyncSessionLocal() as session:
+                from backend.services.requirements_service import (
+                    reset_project_capture,
+                )
+                return await reset_project_capture(session, project_id)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"reset_capture failed: {exc}"}
+
     return [
         add_requirement,
         update_requirement,
@@ -527,4 +584,6 @@ def make_requirements_tools(project_id: int) -> list:
         reject_requirement,
         add_acceptance_criterion,
         build_srs,
+        capture_status,
+        reset_capture,
     ]

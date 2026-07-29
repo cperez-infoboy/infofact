@@ -58,12 +58,15 @@ async def _resolve_owned_project(project_id: int, user: User) -> Project:
 async def get_tree(
     project_id: int = Query(..., description="Projecto al que pertenece el workspace"),
     path: str = Query(".", max_length=512),
+    max_depth: int = Query(3, ge=1, le=10, description="Profundidad máxima del árbol"),
     user: User = Depends(get_current_user),
 ) -> dict:
     """Devuelve un árbol JSON del workspace del proyecto."""
     project = await _resolve_owned_project(project_id, user)
     try:
-        tree = await file_service.list_tree(user.profile, project.slug, path=path)
+        tree = await file_service.list_tree(
+            user.profile, project.slug, path=path, max_depth=max_depth
+        )
     except ValueError:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid_path")
     return tree
