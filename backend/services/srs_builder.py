@@ -33,7 +33,7 @@ from backend.models.requirement import (
     RequirementRelation,
     RelationKind,
 )
-from backend.services.requirement_store import list_requirements
+from backend.services.requirement_store import _source_list, list_requirements
 from sqlalchemy import select
 
 
@@ -75,24 +75,32 @@ _LIVE_STATUSES: frozenset[ReqStatus] = frozenset(
 
 
 def _fmt_source(item: RequirementItem) -> str:
-    """Cita literal con referencia de sección/página; '' si no hay source."""
-    src = item.source or {}
-    quote = src.get("quote") or ""
-    section = src.get("section") or ""
-    page = src.get("page")
-    parts: list[str] = []
-    if section:
-        parts.append(str(section))
-    if page is not None:
-        parts.append(f"p.{page}")
-    ref = ", ".join(parts)
-    if not quote and not ref:
-        return ""
-    if quote and ref:
-        return f'> "{quote}" ({ref})'
-    if quote:
-        return f'> "{quote}"'
-    return f"> ({ref})"
+    """Cita literal con referencia de sección/página; '' si no hay source.
+
+    ``item.source`` se guarda como dict, **lista de dicts** (tras un merge de
+    varios spans) o None. ``_source_list`` normaliza a una lista; formateamos
+    cada fuente y unimos las múltiples con salto de línea.
+    """
+    blocks: list[str] = []
+    for s in _source_list(item):
+        if not isinstance(s, dict):
+            continue
+        quote = s.get("quote") or ""
+        section = s.get("section") or ""
+        page = s.get("page")
+        ref_bits: list[str] = []
+        if section:
+            ref_bits.append(str(section))
+        if page is not None:
+            ref_bits.append(f"p.{page}")
+        ref = ", ".join(ref_bits)
+        if quote and ref:
+            blocks.append(f'> "{quote}" ({ref})')
+        elif quote:
+            blocks.append(f'> "{quote}"')
+        elif ref:
+            blocks.append(f"> ({ref})")
+    return "\n".join(blocks)
 
 
 def _fmt_criteria(item: RequirementItem) -> str:
