@@ -11,6 +11,11 @@
 //   event: conflict.found\ndata: {kind:"duplicate"|"contradiction", ...}
 //   event: validation.report\ndata: {total, kept, rejected, flagged}
 //   event: requirement.added\ndata: {code, statement, type, priority, ...}
+//   event: srs.progress\ndata: {"stage": "...", "message": "..."}
+//   event: quality.found\ndata: {rule_id, severity, dimension, message}
+//   event: goal.inferred\ndata: {code, kind, statement, status}
+//   event: coverage.report\ndata: {total, functional, nfr, gaps_25010, ...}
+//   event: srs.ready\ndata: {version, status, requirement_count, ...}
 
 export interface ToolInput {
   [key: string]: unknown;
@@ -60,6 +65,42 @@ export interface RequirementAdded {
   parent_code?: string;
 }
 
+/** Fine event del subagente srs-agent: un hallazgo accionable (quality.found). */
+export interface QualityFoundEvent {
+  rule_id: string;
+  severity: string;
+  dimension: string;
+  message: string;
+}
+
+/** Fine event: un goal inferido (goal.inferred). */
+export interface GoalInferredEvent {
+  code: string;
+  kind: string;
+  statement: string;
+  status: string;
+}
+
+/** Fine event: reporte de cobertura en vivo (coverage.report). */
+export interface CoverageReportEvent {
+  total: number;
+  functional: number;
+  nfr: number;
+  gaps_25010: string[];
+  unrealized_goals: unknown[];
+  unmitigated_obstacles: unknown[];
+}
+
+/** Fine event: SRS candidato listo (srs.ready). */
+export interface SrsReadyEvent {
+  version: number;
+  status: string;
+  requirement_count: number;
+  findings: number;
+  blockers: number;
+  goals: number;
+}
+
 export interface StreamHandlers {
   onToken?: (delta: string) => void;
   onToolStart?: (name: string, input: ToolInput) => void;
@@ -68,6 +109,12 @@ export interface StreamHandlers {
   onConflict?: (c: ConflictEvent) => void;
   onValidationReport?: (r: ValidationReport) => void;
   onRequirementAdded?: (r: RequirementAdded) => void;
+  // Fine events del subagente srs-agent (comando /srs).
+  onSrsProgress?: (p: ProgressEvent) => void;
+  onQualityFound?: (f: QualityFoundEvent) => void;
+  onGoalInferred?: (g: GoalInferredEvent) => void;
+  onCoverageReport?: (c: CoverageReportEvent) => void;
+  onSrsReady?: (r: SrsReadyEvent) => void;
   onCompleted?: () => void;
   onFailed?: (error: string) => void;
 }
@@ -234,6 +281,24 @@ function dispatchEvent(ev: ParsedEvent, handlers: StreamHandlers): void {
       break;
     case 'requirement.added':
       handlers.onRequirementAdded?.(payload as unknown as RequirementAdded);
+      break;
+    case 'srs.progress':
+      handlers.onSrsProgress?.({
+        stage: (payload.stage as string) ?? '',
+        message: (payload.message as string) ?? '',
+      });
+      break;
+    case 'quality.found':
+      handlers.onQualityFound?.(payload as unknown as QualityFoundEvent);
+      break;
+    case 'goal.inferred':
+      handlers.onGoalInferred?.(payload as unknown as GoalInferredEvent);
+      break;
+    case 'coverage.report':
+      handlers.onCoverageReport?.(payload as unknown as CoverageReportEvent);
+      break;
+    case 'srs.ready':
+      handlers.onSrsReady?.(payload as unknown as SrsReadyEvent);
       break;
     case 'completed':
       handlers.onCompleted?.();

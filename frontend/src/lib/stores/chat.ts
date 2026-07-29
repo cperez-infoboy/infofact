@@ -11,6 +11,13 @@ import {
   startCapture,
   endCapture
 } from '$lib/stores/capture';
+import {
+  onSrsProgress,
+  onQualityFound,
+  onGoalInferred,
+  onCoverageReport,
+  onSrsReady
+} from '$lib/stores/srs';
 
 // --- Captura: qué tools abren/cierran el banner vivo --------------------
 // startCapture() resetea el estado del pipeline (wipes conflictos/reportes),
@@ -243,6 +250,13 @@ export async function sendMessage(sessionId: number, content: string): Promise<b
       onRequirementAdded: (req) => {
         addedRequirements.update((list) => [...list, req]);
       },
+      // Fine events del subagente srs-agent (comando /srs): el store SRS
+      // auto-inicia el run en el primer srs.progress y lo cierra en srs.ready.
+      onSrsProgress: (p) => onSrsProgress(p),
+      onQualityFound: (f) => onQualityFound(f),
+      onGoalInferred: (g) => onGoalInferred(g),
+      onCoverageReport: (c) => onCoverageReport(c),
+      onSrsReady: (r) => onSrsReady(r),
       onCompleted: () => {
         if (currentAssistantId !== null) {
           closeAssistantMessage(currentAssistantId, true);
