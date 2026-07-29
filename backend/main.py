@@ -146,6 +146,8 @@ app.include_router(projects.session_router, prefix="/api/chat", tags=["sessions"
 # (decision por grupo + status por plan = guarda de idempotencia compartida).
 from backend.routers import requirements as requirements_router
 app.include_router(requirements_router.router, prefix="/api", tags=["requirements"])
+from backend.routers import srs as srs_router
+app.include_router(srs_router.router, prefix="/api", tags=["srs"])
 # Explorar / editar archivos del workspace del usuario.
 app.include_router(workspaces.router, prefix="/api/workspaces", tags=["workspaces"])
 

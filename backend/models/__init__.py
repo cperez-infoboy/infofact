@@ -18,6 +18,21 @@ from backend.models.requirement import (
     RequirementRelation,
     RequirementRevision,
 )
+from backend.models.srs import (
+    FindingDimension,
+    FindingScope,
+    FindingSeverity,
+    FindingStatus,
+    Goal,
+    GoalKind,
+    GoalLink,
+    GoalStatus,
+    LinkRelation,
+    LinkStatus,
+    RequirementFinding,
+    SrsDocument,
+    SrsStatus,
+)
 from backend.models.user import User
 
 __all__ = [
@@ -39,4 +54,17 @@ __all__ = [
     "ChangedBy",
     "PlanStatus",
     "GroupDecision",
+    "RequirementFinding",
+    "Goal",
+    "GoalLink",
+    "SrsDocument",
+    "FindingScope",
+    "FindingDimension",
+    "FindingSeverity",
+    "FindingStatus",
+    "GoalKind",
+    "GoalStatus",
+    "LinkRelation",
+    "LinkStatus",
+    "SrsStatus",
 ]
