@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.models.requirement import ReqStatus, RequirementItem
 from backend.models.srs import (
+    FindingSeverity,
     FindingStatus,
     Goal,
     GoalLink,
@@ -122,6 +123,83 @@ async def list_findings_for_req(
     return await list_findings(session, project_id, req_id=req_id)
 
 
+# ---------------------------------------------------------------------------
+# Deduplicación de hallazgos antes de persistir (guarda contra la constraint).
+#
+# ``UniqueConstraint(req_id, rule_id)`` prohíbe dos hallazgos con el mismo
+# (req_id, rule_id). El motor LLM de calidad (``srs_quality._verdict_to_findings``)
+# puede emitir varios hallazgos con el mismo ``rule_id`` para un mismo req
+# (p. ej. dos términos ambiguos -> ``ambiguous_term`` x2). Sin dedupe, el
+# segundo INSERT revienta la constraint y hace rollback de TODA la tanda,
+# dejando el SRS sin hallazgos. Colapsamos por (req_id, rule_id) quedándonos
+# con el más severo y concatenando los mensajes distintos.
+#
+# Los hallazgos de conjunto (scope=SET, req_id=None) NO colisionan: SQLite
+# trata los NULL como distintos bajo UNIQUE -> se conservan todos.
+# ---------------------------------------------------------------------------
+
+# Rank por severidad: menor número = más crítico (se conserva en el merge).
+_SEVERITY_RANK = {
+    FindingSeverity.BLOCKER.value: 0,
+    FindingSeverity.MAJOR.value: 1,
+    FindingSeverity.MINOR.value: 2,
+    FindingSeverity.INFO.value: 3,
+}
+
+
+def _severity_value(fd: dict[str, Any]) -> str:
+    """Normaliza ``severity`` del dict a su valor string ('blocker', ...).
+
+    El motor puede entregar el enum o el string; homogeneizamos a string para
+    indexar ``_SEVERITY_RANK`` y para comparar sin distinguir tipos.
+    """
+    sev = fd.get("severity")
+    return sev.value if hasattr(sev, "value") else str(sev)
+
+
+def _dedupe_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Colapsa hallazgos duplicados por ``(req_id, rule_id)``.
+
+    Mantiene intactos los hallazgos de conjunto (``req_id`` None). Para los de
+    ítem agrupa por ``(req_id, rule_id)`` y se queda con uno solo conservando
+    la severidad más alta, y la unión de mensajes distintos separados por
+    ``' · '`` (dimension/suggestion/ears_pattern del ganador más severo).
+    """
+    deduped: list[dict[str, Any]] = []
+    buckets: dict[tuple[int, str], list[dict[str, Any]]] = {}
+
+    for fd in findings:
+        req_id = fd.get("req_id")
+        if req_id is None:
+            # Hallazgo de conjunto: UNIQUE(NULL, ...) no colisiona -> directo.
+            deduped.append(fd)
+            continue
+        key = (req_id, fd.get("rule_id"))
+        buckets.setdefault(key, []).append(fd)
+
+    for group in buckets.values():
+        if len(group) == 1:
+            deduped.append(group[0])
+            continue
+        # Ganador = más severo (rank menor). Empate -> el primero del grupo.
+        winner = min(
+            group, key=lambda g: _SEVERITY_RANK.get(_severity_value(g), 99)
+        )
+        merged = dict(winner)
+        seen: set[str] = set()
+        messages: list[str] = []
+        for g in group:
+            msg = (g.get("message") or "").strip()
+            if msg and msg not in seen:
+                seen.add(msg)
+                messages.append(msg)
+        if messages:
+            merged["message"] = " · ".join(messages)
+        deduped.append(merged)
+
+    return deduped
+
+
 async def replace_findings(
     session: AsyncSession,
     project_id: int,
@@ -135,6 +213,7 @@ async def replace_findings(
     lleva scope/dimension/rule_id/severity/message/suggestion y opcionalmente
     req_id/ears_pattern/detected_by.
     """
+    findings = _dedupe_findings(findings)
     await session.execute(
         delete(RequirementFinding).where(
             RequirementFinding.project_id == project_id
@@ -306,25 +385,38 @@ async def replace_goals(
             code_to_id[gd["code"]] = row.id
 
     # 2) Inserta links resolviendo goal_code -> id y req_code -> id.
+    # Dedupe por (goal_id, req_id, relation): UniqueConstraint("goal_id",
+    # "req_id", "relation") prohibiría dos aristas idénticas y haría rollback
+    # de goals + links enteros. El LLM puede repetir un mismo link.
     link_rows: list[GoalLink] = []
+    seen_edges: set[tuple[int, int, str]] = set()
     for ld in links:
         goal_id = code_to_id.get(ld["goal_code"])
         req_id = req_by_code.get(ld["req_code"])
         if goal_id is None or req_id is None:
             continue  # referencia no resuelta: se descarta silenciosamente
+        relation = ld["relation"]
+        relation_val = relation.value if hasattr(relation, "value") else str(relation)
+        edge = (goal_id, req_id, relation_val)
+        if edge in seen_edges:
+            continue  # arista duplicada (mismo goal+req+relation) -> descartada
+        seen_edges.add(edge)
         link_rows.append(
             GoalLink(
                 goal_id=goal_id,
                 req_id=req_id,
-                relation=ld["relation"],
+                relation=relation,
                 rationale=ld.get("rationale"),
             )
         )
     session.add_all(link_rows)
     await session.commit()
 
+    # Distinct goal ids: code_to_id mapea (opaque + alias) -> id, así que su
+    # len() duplica cuando el payload trae alias. Contamos ids reales para no
+    # inflar el reporte del agente (bug "28 goals vs 14 persistidos").
     return {
-        "goals": len(code_to_id),
+        "goals": len({gid for gid in code_to_id.values()}),
         "links": len(link_rows),
     }
 
