@@ -34,24 +34,27 @@ from backend.agents.subagents.requirements_capture import (
 from backend.agents.subagents.requirements_capture_agent import (
     make_requirements_capture_agent_subagent,
 )
+from backend.agents.subagents.srs_agent import make_srs_agent_subagent
 from backend.config import settings
 
 logger = logging.getLogger(__name__)
 
 PHASE_PROMPTS: dict[str, str] = {
     "requirements": (
-        "Eres un analista de requerimientos de software. Tu directorio de "
-        "trabajo actual es la raíz del workspace del proyecto. Usa las "
-        "herramientas del filesystem para leer, escribir y editar documentos. "
-        "Entrega un SRS (Software Requirements Specification), historias de "
-        "usuario con criterios de aceptación en Gherkin y una lista de "
-        "supuestos. Guarda todo como Markdown dentro de la carpeta docs/ "
-        "(por ejemplo: docs/srs.md, docs/user-stories.md). Usa rutas "
-        "relativas a tu directorio actual (docs/srs.md); son la forma "
-        "preferida y la más robusta. NUNCA crees una carpeta llamada "
-        "workspaces dentro de tu directorio actual: ya estás adentro del "
-        "workspace del proyecto. Si ejecutas comandos shell (git init, "
-        "mkdir, ls), hazlo directamente en tu directorio actual."
+        "Eres el orquestador de la fase de requerimientos de InfoFact. "
+        "Trabajas en el workspace del proyecto y DELEGAS el trabajo pesado a "
+        "subagentes especializados mediante la tool `task`:\n"
+        "- `/captura_agente`: extrae y cura requerimientos desde documentos "
+        "(subagente `requirements-capture-agent`). Los requerimientos se "
+        "persisten como filas tipadas (RequirementItem), NO como Markdown.\n"
+        "- `/srs`: sintetiza el SRS de alta calidad a partir de los "
+        "requerimientos capturados — análisis de calidad (INCOSE/smells/EARS), "
+        "modelado de goals (GORE) y cobertura (ISO 25010) — y persiste un "
+        "SrsDocument versionado (subagente `srs-agent`).\n"
+        "Tienes herramientas de LECTURA para inspeccionar requerimientos, el "
+        "SRS, su calidad, cobertura, goals y trazabilidad sin delegar. "
+        "Responde en español neutro. No escribas el SRS a mano: el subagente "
+        "`srs-agent` lo genera y persiste a partir de los requerimientos."
     ),
 }
 
@@ -154,6 +157,15 @@ def build_agent(
                 project_description=project_description or "",
             )
         )
+        subagents.append(
+            make_srs_agent_subagent(
+                project_id=project_id,
+                profile=profile,
+                project_slug=project_slug,
+                project_name=project_name or "",
+                project_description=project_description or "",
+            )
+        )
 
     # Read-only access to the requirements store so the orchestrator can answer
     # "list / describe / show the decomposition tree of REQ-NNN" directly,
@@ -165,6 +177,8 @@ def build_agent(
             make_requirements_read_tools,
         )
         orchestrator_tools.extend(make_requirements_read_tools(project_id))
+        from backend.agents.tools.srs_tools import make_srs_read_tools
+        orchestrator_tools.extend(make_srs_read_tools(project_id))
 
     return create_deep_agent(
         model=_build_model(),

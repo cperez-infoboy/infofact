@@ -64,7 +64,8 @@ _NEGATION_RE = re.compile(
 
 # Absolutos no verificables.
 _ABSOLUTE_RE = re.compile(
-    r"\b(100\s*%|siempre|nunca|todos?|always|never|all)\b", re.IGNORECASE
+    r"(?:100\s*%|\b(?:siempre|nunca|todos?|always|never|all)\b)",
+    re.IGNORECASE,
 )
 
 # Pronombres: referencia ambigua.

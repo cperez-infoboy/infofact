@@ -137,6 +137,9 @@ _AGRUPAR_PREFIX = "/agrupar"
 # startswith("/captura"), so the generic /captura branch would otherwise
 # swallow it and parse "_agente ..." as a target_subpath. Accepts _ and -.
 _CAPTURA_AGENTE_PREFIXES = ("/captura_agente", "/captura-agente")
+# /srs (síntesis de SRS) -> subagente srs-agent. Sin conflicto de prefijo
+# con /captura ni /agrupar (no comparten raíz).
+_SRS_PREFIX = "/srs"
 
 # Marcadores de decision del usuario sobre los requerimientos existentes. La
 # guardia router-level solo deja pasar la captura cuando el texto los contiene
@@ -275,11 +278,49 @@ def _captura_agente_directive(user_instructions: str) -> str:
     return directive
 
 
+def _srs_directive(user_instructions: str) -> str:
+    """Directiva para el comando ``/srs`` (espejo de ``_captura_agente_directive``).
+
+    Delega al subagente ``srs-agent`` la generación del SRS a partir de los
+    requerimientos YA capturados. Sin gate router-level propio: cada invocación
+    crea una versión CANDIDATE nueva (versionado, no destructivo sobre los
+    requerimientos ni sobre versiones previas). El subagente gestiona el caso
+    "no hay requerimientos vivos" informándolo al usuario.
+    """
+    directive = (
+        "[DIRECTIVE] Delega INMEDIATAMENTE al subagente `srs-agent` (usando la "
+        "tool `task`) para generar el SRS del proyecto a partir de los "
+        "requerimientos YA capturados. NO explores el sistema de archivos antes "
+        "de delegar (sin ls, glob, read_file ni execute): el subagente lee los "
+        "requerimientos vivos del store. Este subagente RAZONA la generación "
+        "etapa por etapa en este orden: analyze_quality (calidad INCOSE + "
+        "smells + EARS + ambigüedad LLM) -> infer_goals (modelo de goals GORE, "
+        "los persiste) -> check_coverage (ISO 25010 + secciones 29148 + "
+        "cobertura de goals) -> commit_srs (persiste un SrsDocument CANDIDATE). "
+        "La cobertura DEBE ir después de goals (depende de ellos). Si no hay "
+        "requerimientos vivos, el subagente lo informará: el usuario debe "
+        "capturar primero con /captura_agente. Cuando termine, reporta al "
+        "usuario: versión generada, requerimientos incluidos, hallazgos por "
+        "severidad, gaps de cobertura y goals inferidos."
+    )
+    if user_instructions:
+        # chr(34) is the ASCII double quote; keeps literal quotes around the
+        # user text without f-string escape sequences (mismo truco que captura).
+        directive += " INSTRUCCIONES DEL USUARIO: "
+        directive += chr(34) + user_instructions + chr(34)
+        directive += (
+            " (incorporalas en el razonamiento entre etapas; dirigen el "
+            "razonamiento, no parámetros internos del pipeline)."
+        )
+    return directive
+
+
 def _rewrite_command(content: str) -> str:
     """Reescribe los slash commands en directivas al subagente.
 
     - ``/captura [subpath]`` -> captura y validación de requerimientos.
     - ``/agrupar`` -> revisión de duplicados (plan de agrupamiento editable).
+    - ``/srs [steering]`` -> generación del SRS (calidad + goals + cobertura + commit).
 
     El mensaje crudo del usuario (el comando literal) ya se persistió en
     ChatMessage antes del stream; esta reescritura solo cambia lo que recibe el
@@ -298,6 +339,14 @@ def _rewrite_command(content: str) -> str:
             "usuario lo edite o lo apruebe explícitamente antes de llamar "
             "`apply_grouping_plan`."
         )
+
+    # /srs -> generación de SRS (subagente srs-agent). Texto tras el comando
+    # es steering del usuario, no un subpath. Se chequea antes del fallback.
+    if stripped.startswith(_SRS_PREFIX):
+        _user_instructions = (
+            stripped[len(_SRS_PREFIX):].strip().lstrip("/").strip()
+        )
+        return _srs_directive(_user_instructions)
 
     # /captura_agente (and /captura-agente) -> agent-driven subagent. Checked
     # BEFORE the /captura branch because "/captura_agente" startswith
