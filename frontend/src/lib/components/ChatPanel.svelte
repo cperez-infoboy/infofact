@@ -24,6 +24,7 @@
   import { renderMarkdown } from '$lib/utils/markdown';
   import ToolIcon from './ToolIcon.svelte';
   import CaptureStatus from './CaptureStatus.svelte';
+  import SrsStatus from './SrsStatus.svelte';
 
   let { } = $props();
 
@@ -155,6 +156,9 @@
 
   <!-- Estado vivo del pipeline de captura (eventos finos SSE) -->
   <CaptureStatus />
+
+  <!-- Estado vivo de la generación de SRS (eventos finos SSE) -->
+  <SrsStatus />
 
   <!-- Mensajes -->
   <div class="flex-1 min-h-0 m-2">
