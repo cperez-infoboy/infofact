@@ -5,6 +5,8 @@ import { streamMessage, type ToolInput } from '$lib/api/chat';
 import type { MessageOut } from '$lib/api/projects';
 import {
   captureStage,
+  captureTimings,
+  captureTotalMs,
   conflicts,
   validationReport,
   addedRequirements,
@@ -240,6 +242,19 @@ export async function sendMessage(sessionId: number, content: string): Promise<b
       },
       onProgress: (p) => {
         captureStage.set(p);
+        // Profiling: acumular wall-clock por etapa conforme llegan los
+        // eventos phase:"end"; al llegar stage:"done" se reemplaza con el
+        // dict completo + el total, para que el banner muestre el desglose.
+        if (p.phase === 'end' && typeof p.elapsed_ms === 'number') {
+          // Local const: acceder a p.elapsed_ms dentro de la arrow pierde el
+          // narrowing y tipa el spread como Record<string, number | undefined>.
+          const elapsed = p.elapsed_ms;
+          captureTimings.update((t) => ({ ...t, [p.stage]: elapsed }));
+        }
+        if (p.stage === 'done' && p.timings) {
+          captureTimings.set(p.timings);
+          if (typeof p.total_ms === 'number') captureTotalMs.set(p.total_ms);
+        }
       },
       onConflict: (c) => {
         conflicts.update((list) => [...list, c]);

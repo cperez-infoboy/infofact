@@ -12,6 +12,8 @@
   import {
     captureStage,
     captureRunning,
+    captureTimings,
+    captureTotalMs,
     conflicts,
     validationReport,
     addedRequirements,
@@ -39,6 +41,7 @@
   // Etiquetas legibles para cada stage del backend.
   const STAGE_LABELS: Record<string, string> = {
     ingest: 'Ingesta',
+    conventions: 'Convenciones',
     extract: 'Extracción',
     consolidate: 'Consolidación',
     critique: 'Crítica',
@@ -49,6 +52,55 @@
 
   // Últimos 5 requisitos añadidos (para no volcar la lista entera en DOM).
   let recentRequirements = $derived($addedRequirements.slice(-5).reverse());
+
+  // --- Profiling: desglose de tiempos por etapa ---------------------------
+  // Orden canónico del pipeline; las etapas sin tiempo se filtran al render.
+  const STAGE_ORDER = [
+    'ingest',
+    'conventions',
+    'extract',
+    'consolidate',
+    'critique',
+    'classify',
+    'persist'
+  ];
+
+  /** Formatea milisegundos a algo legible: 950ms / 12.3s / 3m 05s. */
+  function fmtMs(ms: number): string {
+    if (ms < 1000) return `${Math.round(ms)}ms`;
+    if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+    const totalSec = Math.round(ms / 1000);
+    const m = Math.floor(totalSec / 60);
+    const s = totalSec % 60;
+    return `${m}m ${String(s).padStart(2, '0')}s`;
+  }
+
+  /** Filas de tiempos en orden de pipeline (sólo las etapas con tiempo). */
+  let timingRows = $derived(
+    STAGE_ORDER.filter((k) => k in $captureTimings).map((k) => ({
+      stage: k,
+      label: STAGE_LABELS[k] ?? k,
+      ms: $captureTimings[k]
+    }))
+  );
+
+  let hasTimings = $derived(timingRows.length > 0);
+
+  /** Etapa dominante (>= 50% del total), si la hay, para resaltarla. */
+  let dominantStage = $derived.by(() => {
+    const total = $captureTotalMs;
+    if (!total) return null;
+    let max = 0;
+    let key: string | null = null;
+    for (const k of STAGE_ORDER) {
+      const v = $captureTimings[k];
+      if (v && v > max) {
+        max = v;
+        key = k;
+      }
+    }
+    return max / total >= 0.5 ? key : null;
+  });
 
   function stageLabel(stage: string | undefined): string {
     if (!stage) return 'Procesando';
@@ -117,6 +169,45 @@
             <div class="text-text-faint text-[10px]">REV</div>
             <div class="text-text-dim">{$validationReport.flagged}</div>
           </div>
+        </div>
+      </div>
+    {/if}
+
+    <!-- Tiempos por etapa (profiling) -->
+    {#if hasTimings}
+      <div class="rounded-sm border border-border bg-surface px-2 py-1.5">
+        <div class="flex items-center justify-between mb-1">
+          <span class="font-mono text-text-faint uppercase tracking-wider">
+            Tiempos por etapa
+          </span>
+          {#if $captureTotalMs}
+            <span class="font-mono text-text-faint text-[10px]">
+              total {fmtMs($captureTotalMs)}
+            </span>
+          {/if}
+        </div>
+        <div class="space-y-1">
+          {#each timingRows as row (row.stage)}
+            {@const pct = $captureTotalMs ? Math.round((row.ms / $captureTotalMs) * 100) : 0}
+            {@const isDominant = dominantStage === row.stage}
+            <div class="flex items-center gap-2 font-mono text-[11px]">
+              <span
+                class="w-24 shrink-0 {isDominant ? 'text-accent font-bold' : 'text-text-dim'}"
+              >
+                {row.label}
+              </span>
+              <div class="relative flex-1 h-1.5 rounded-sm bg-surface-2 overflow-hidden">
+                <div
+                  class="absolute inset-y-0 left-0 {isDominant ? 'bg-accent' : 'bg-accent/40'}"
+                  style="width: {pct}%"
+                ></div>
+              </div>
+              <span class="w-14 shrink-0 text-right {isDominant ? 'text-accent' : 'text-text'}">
+                {fmtMs(row.ms)}
+              </span>
+              <span class="w-8 shrink-0 text-right text-text-faint">{pct}%</span>
+            </div>
+          {/each}
         </div>
       </div>
     {/if}

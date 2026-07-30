@@ -21,10 +21,21 @@ export interface ToolInput {
   [key: string]: unknown;
 }
 
-/** Coarse pipeline stage (extraction.progress). */
+/** Coarse pipeline stage (extraction.progress).
+ *
+ *  Payload de profiling opcional (wall-clock por etapa):
+ *  - phase: "start" | "end" marca el límite de una etapa.
+ *  - elapsed_ms: wall-clock de la etapa, en phase:"end".
+ *  - timings: dict completo por etapa (ms), sólo en stage:"done".
+ *  - total_ms: suma de timings, sólo en stage:"done".
+ */
 export interface ProgressEvent {
   stage: string;
   message: string;
+  phase?: string;
+  elapsed_ms?: number;
+  timings?: Record<string, number>;
+  total_ms?: number;
 }
 
 /** Fine event: one per duplicate or contradiction (conflict.found). */
@@ -266,6 +277,15 @@ function dispatchEvent(ev: ParsedEvent, handlers: StreamHandlers): void {
       handlers.onProgress?.({
         stage: (payload.stage as string) ?? '',
         message: (payload.message as string) ?? '',
+        phase: typeof payload.phase === 'string' ? payload.phase : undefined,
+        elapsed_ms:
+          typeof payload.elapsed_ms === 'number' ? payload.elapsed_ms : undefined,
+        timings:
+          payload.timings && typeof payload.timings === 'object'
+            ? (payload.timings as Record<string, number>)
+            : undefined,
+        total_ms:
+          typeof payload.total_ms === 'number' ? payload.total_ms : undefined,
       });
       break;
     case 'conflict.found':

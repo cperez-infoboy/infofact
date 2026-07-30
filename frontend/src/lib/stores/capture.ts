@@ -31,6 +31,13 @@ export const addedRequirements = writable<RequirementAdded[]>([]);
 /** True mientras corre la tool run_requirements_capture. */
 export const captureRunning = writable<boolean>(false);
 
+/** Wall-clock (ms) por etapa. Se llena con los eventos phase:"end" y se
+ *  reemplaza con el dict completo al llegar stage:"done". */
+export const captureTimings = writable<Record<string, number>>({});
+
+/** Suma de captureTimings (ms); llega en el evento stage:"done". */
+export const captureTotalMs = writable<number>(0);
+
 // --- Derived (sólo lectura) -------------------------------------------------
 
 export const addedCount = derived(addedRequirements, ($a) => $a.length);
@@ -56,6 +63,8 @@ export function resetCapture(): void {
   validationReport.set(null);
   addedRequirements.set([]);
   captureRunning.set(false);
+  captureTimings.set({});
+  captureTotalMs.set(0);
 }
 
 /** Inicia una captura: reset + marca running. */
