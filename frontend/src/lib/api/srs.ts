@@ -53,6 +53,8 @@ export interface SrsCommit {
 export interface Finding {
   id: number;
   req_id: number | null;
+  // Codigo opaque REQ-XXXX del requerimiento (null en hallazgos de conjunto).
+  req_code: string | null;
   scope: string;
   dimension: string;
   rule_id: string;

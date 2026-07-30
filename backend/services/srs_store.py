@@ -77,11 +77,17 @@ async def gen_goal_code(
 # --------------------------------------------------------------------------- #
 
 
-def finding_to_dict(f: RequirementFinding) -> dict[str, Any]:
+def finding_to_dict(
+    f: RequirementFinding, *, req_code: str | None = None
+) -> dict[str, Any]:
     return {
         "id": f.id,
         "project_id": f.project_id,
         "req_id": f.req_id,
+        # Codigo opaque REQ-XXXX del requerimiento (resuelto por el caller via
+        # _req_code_map); req_id solo es el id interno y no identifica al req
+        # para el usuario. None en hallazgos de conjunto (scope=SET).
+        "req_code": req_code,
         "scope": f.scope.value,
         "dimension": f.dimension.value,
         "rule_id": f.rule_id,
@@ -93,6 +99,39 @@ def finding_to_dict(f: RequirementFinding) -> dict[str, Any]:
         "detected_by": f.detected_by,
         "created_at": f.created_at.isoformat() if f.created_at else None,
     }
+
+
+def findings_to_dicts(
+    findings: list[RequirementFinding],
+    code_map: dict[int, str] | None = None,
+) -> list[dict[str, Any]]:
+    """Serializa una lista de hallazgos resolviendo req_id -> codigo opaque.
+
+    ``code_map`` se construye con ``_req_code_map`` (una sola consulta por
+    proyecto). Asi los hallazgos llevan ``req_code`` (REQ-XXXX) en vez de solo
+    el id interno, que no identifica al requerimiento para el usuario.
+    """
+    m = code_map or {}
+    return [
+        finding_to_dict(f, req_code=m.get(f.req_id) if f.req_id else None)
+        for f in findings
+    ]
+
+
+async def _req_code_map(
+    session: AsyncSession, project_id: int
+) -> dict[int, str]:
+    """Mapa ``requirement_items.id -> code`` del proyecto (una consulta).
+
+    Incluye todos los requerimientos (vivos y soft-deleted): los hallazgos
+    pueden referenciar cualquiera, y el codigo debe resolver siempre.
+    """
+    rows = await session.execute(
+        select(RequirementItem.id, RequirementItem.code).where(
+            RequirementItem.project_id == project_id
+        )
+    )
+    return {rid: code for rid, code in rows.all() if code}
 
 
 async def list_findings(

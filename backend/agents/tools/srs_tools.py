@@ -62,8 +62,10 @@ calidad, cobertura, trazabilidad y un preview del markdown)."""
 (severidad, dimensión, regla, mensaje, sugerencia)."""
         async with AsyncSessionLocal() as session:
             findings = await srs_store.list_findings(session, project_id)
+            # Resuelve req_id -> codigo opaque (REQ-XXXX) por cada hallazgo.
+            code_map = await srs_store._req_code_map(session, project_id)
         return {
-            "findings": [srs_store.finding_to_dict(f) for f in findings],
+            "findings": srs_store.findings_to_dicts(findings, code_map),
             "count": len(findings),
         }
 
@@ -116,9 +118,10 @@ calidad, cobertura, trazabilidad y un preview del markdown)."""
             findings = await srs_store.list_findings(
                 session, project_id, req_id=req_id
             )
+            code_map = await srs_store._req_code_map(session, project_id)
         return {
             "requirement": req_code,
-            "findings": [srs_store.finding_to_dict(f) for f in findings],
+            "findings": srs_store.findings_to_dicts(findings, code_map),
         }
 
     return [

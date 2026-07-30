@@ -103,6 +103,8 @@ class SrsReviewFlagsUpdate(BaseModel):
 class FindingOut(BaseModel):
     id: int
     req_id: int | None = None
+    # Codigo opaque REQ-XXXX del requerimiento; None en hallazgos de conjunto.
+    req_code: str | None = None
     scope: str
     dimension: str
     rule_id: str
@@ -314,9 +316,15 @@ async def get_quality(
         findings = await srs_store.list_findings(db, project_id)
         # Reconstruye el resumen desde los hallazgos persistidos.
         summary = _summarize_findings(findings)
+        # Resuelve req_id -> codigo opaque (REQ-XXXX) para que cada hallazgo
+        # identifique al requerimiento en la UI y no solo su id interno.
+        code_map = await srs_store._req_code_map(db, project_id)
     return QualityOut(
         summary=summary,
-        findings=[FindingOut(**srs_store.finding_to_dict(f)) for f in findings],
+        findings=[
+            FindingOut(**d)
+            for d in srs_store.findings_to_dicts(findings, code_map)
+        ],
     )
 
 
@@ -348,7 +356,11 @@ async def get_requirement_findings(
     async with AsyncSessionLocal() as db:
         await _load_owned_project(db, project_id, user)
         findings = await srs_store.list_findings(db, project_id, req_id=req_id)
-    return [FindingOut(**srs_store.finding_to_dict(f)) for f in findings]
+        code_map = await srs_store._req_code_map(db, project_id)
+    return [
+        FindingOut(**d)
+        for d in srs_store.findings_to_dicts(findings, code_map)
+    ]
 
 
 # ---------------------------------------------------------------------------

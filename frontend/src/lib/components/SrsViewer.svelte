@@ -310,7 +310,9 @@
                   <span class="px-1.5 py-0.5 border {sevClass(f.severity)}">{f.severity}</span>
                   <span class="text-text-faint">{f.rule_id}</span>
                   <span class="text-text-dim">· {f.dimension}</span>
-                  {#if f.req_id !== null}
+                  {#if f.req_code}
+                    <span class="text-text-dim">· {f.req_code}</span>
+                  {:else if f.req_id !== null}
                     <span class="text-text-dim">· req #{f.req_id}</span>
                   {/if}
                   <span class="ml-auto text-text-faint uppercase">{f.status}</span>
