@@ -28,6 +28,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from backend.agents.llm import build_llm, structured_llm
+from backend.agents.pipelines._quality_rules import PREVENTION_RULES
 from backend.agents.pipelines.ingestion import Chunk, StructureMap
 
 logger = logging.getLogger(__name__)
@@ -146,7 +147,8 @@ _EXTRACTOR_SYSTEM = (
     "- Do NOT infer implicit requirements here; those are a separate pass.\n"
     "- If the chunk is boilerplate (cover, TOC, references, legal) and contains "
     "no requirements, return items=[] and chunk_complete=true.\n"
-    "Return ONLY the structured object."
+    + PREVENTION_RULES
+    + "Return ONLY the structured object."
 )
 
 _IMPLICIT_SYSTEM = (
@@ -157,7 +159,8 @@ _IMPLICIT_SYSTEM = (
     "For each item set: statement, rationale (why it is implied), source_span "
     "(the span that IMPLIES it — mandatory even if indirect), section, "
     "confidence (0..1).\n"
-    "Do NOT invent requirements without a textual anchor. If none, return items=[]."
+    + PREVENTION_RULES
+    + "Do NOT invent requirements without a textual anchor. If none, return items=[]."
 )
 
 _ANNOTATOR_SYSTEM = (

@@ -47,6 +47,7 @@ from backend.agents.pipelines._resilience import (
     BatchStats,
 )
 from backend.agents.pipelines._resilience import is_transient as _is_transient
+from backend.agents.pipelines._quality_rules import PREVENTION_RULES
 from backend.agents.pipelines.extraction import RawRequirement
 from backend.models.requirement import Priority, ReqType
 
@@ -188,7 +189,8 @@ _DECOMPOSE_SYSTEM = (
     "- Aim for 2-5 sub-items. If the parent is already operational and needs "
     "no split, return parts=[] (empty list).\n"
     "- Do NOT repeat the parent verbatim as a single part — that adds nothing.\n"
-    "Return ONLY the structured object."
+    + PREVENTION_RULES
+    + "Return ONLY the structured object."
 )
 
 

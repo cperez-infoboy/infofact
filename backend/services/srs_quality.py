@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -33,7 +32,8 @@ from backend.agents.pipelines._resilience import (
     _TRANSIENT_RETRIES,
     is_transient,
 )
-from backend.models.requirement import ReqStatus, ReqType
+from backend.agents.pipelines._quality_rules import programmatic_findings_for_text
+from backend.models.requirement import ReqStatus
 from backend.models.srs import (
     FindingDimension,
     FindingScope,
@@ -45,227 +45,42 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_CONCURRENCY = 4
 _JUDGE_ATTEMPTS = 3
-_TOO_LONG_CHARS = 220  # enunciado muy largo -> probablemente >1 requerimiento
-
-# Modal de obligación (español + inglés). Su ausencia es una regla INCOSE.
-_MODAL_RE = re.compile(
-    r"\b(debe|deber[aá]|deb[ií]an|tienen?\s+que|requiere|shall|must|should|will|needs?\s+to)\b",
-    re.IGNORECASE,
-)
-
-# Combinadores que sugieren >1 requerimiento en un enunciado.
-_COMBINATOR_RE = re.compile(r"\b(and/or|y/o|o bien|either\s+or)\b|/", re.IGNORECASE)
-
-# Negación: requerimientos negativos son difíciles de verificar.
-_NEGATION_RE = re.compile(
-    r"\b(shall\s+not|must\s+not|no\s+debe|no\s+deber[aá]|nunca\s+debe)\b",
-    re.IGNORECASE,
-)
-
-# Absolutos no verificables.
-_ABSOLUTE_RE = re.compile(
-    r"(?:100\s*%|\b(?:siempre|nunca|todos?|always|never|all)\b)",
-    re.IGNORECASE,
-)
-
-# Pronombres: referencia ambigua.
-_PRONOUN_RE = re.compile(
-    r"\b(él|ella|ello|ellos|ellas|lo|la|los|las|sus|su)\b|\b(it|they|them|its|their|he|she)\b",
-    re.IGNORECASE,
-)
-
-# Términos vagos curados (bilingüe). Case-insensitive, palabra completa.
-_VAGUE_TERMS = [
-    "rápido", "rapida", "rápidos", "eficiente", "robusto", "amigable",
-    "fácil", "facil", "intuitivo", "flexible", "apropiado", "adecuada",
-    "adecuado", "óptimo", "optimo", "moderno", "escalable", "seguro",
-    "confiable", "alto rendimiento", "buena performance", "calidad",
-    "user-friendly", "fast", "efficient", "robust", "friendly", "easy",
-    "intuitive", "flexible", "appropriate", "adequate", "optimal", "modern",
-    " scalable", "reliable", "high performance", "good",
-]
-
-# NFR que exigen un target medible (número / umbral / unidad).
-_MEASURABLE_TYPES = {ReqType.PERFORMANCE, ReqType.RELIABILITY}
-_NUMBER_RE = re.compile(r"\d+(?:[.,]\d+)?\s?(?:%|ms|seg|s\b|min|gb|mb|tps|rps|veces|x\b|horas?|horas)", re.IGNORECASE)
+# Las reglas deterministas ITEM-level viven en ``_quality_rules`` (módulo
+# compartido con el pipeline de captura, shift-left de calidad). Ver ahí:
+# ``programmatic_findings_for_text``, ``detect_ears_pattern``, ``VAGUE_TERMS``.
 
 
-def _detect_ears_pattern(statement: str) -> str | None:
-    """Devuelve la plantilla EARS detectada o None (ubiquitous implícita)."""
-    s = statement.lstrip().lower()
-    if s.startswith(("when ", "cuando ", "al ")):
-        return "event_driven"
-    if s.startswith(("while ", "mientras ", "durante ")):
-        return "state_driven"
-    if s.startswith(("where ", "donde ", "en caso de ")):
-        return "optional_feature"
-    if re.search(r"\b(if|si|en\s+caso)\b.*\b(then|entonces)\b", s):
-        return "unwanted"
-    return None
+# Reglas que llevan el campo ``ears_pattern`` en el dict de hallazgo (paridad
+# con la forma histórica heterogénea de programmatic_findings).
+_RULES_WITH_EARS_PATTERN = frozenset({"incose.modal_missing", "ears.missing_condition"})
 
 
 def programmatic_findings(item) -> list[dict[str, Any]]:
-    """Pre-checks deterministas sobre un RequirementItem. Cero LLM."""
-    text = item.statement or ""
-    findings: list[dict[str, Any]] = []
-    base = {
-        "scope": FindingScope.ITEM,
-        "req_id": item.id,
-        "detected_by": "programmatic",
-    }
+    """Pre-checks deterministas sobre un RequirementItem. Cero LLM.
 
-    ears = _detect_ears_pattern(text)
-    has_modal = bool(_MODAL_RE.search(text))
-
-    if not has_modal:
-        findings.append(
-            {
-                **base,
-                "dimension": FindingDimension.INCOSE_RULE,
-                "rule_id": "incose.modal_missing",
-                "severity": FindingSeverity.MINOR,
-                "message": (
-                    "El enunciado no contiene un verbo de obligación claro "
-                    "(«debe»/«shall»). Un requerimiento debe expresar la "
-                    "obligación del sistema."
-                ),
-                "suggestion": None,
-                "ears_pattern": ears,
-            }
-        )
-
-    if _NEGATION_RE.search(text):
-        findings.append(
-            {
-                **base,
-                "dimension": FindingDimension.REQUIREMENT_SMELL,
-                "rule_id": "smell.negation",
-                "severity": FindingSeverity.MINOR,
-                "message": (
-                    "Requerimiento negativo («no debe»/«shall not»): es difícil "
-                    "de verificar de forma exhaustiva. Preferir una forma "
-                    "afirmativa que diga qué debe hacer el sistema."
-                ),
-                "suggestion": None,
-            }
-        )
-
-    if _COMBINATOR_RE.search(text):
-        findings.append(
-            {
-                **base,
-                "dimension": FindingDimension.REQUIREMENT_SMELL,
-                "rule_id": "smell.combinator",
-                "severity": FindingSeverity.MAJOR,
-                "message": (
-                    "El enunciado combina alternativas (y/o, /, or). Es probable "
-                    "que contenga más de un requerimiento; conviene separarlo."
-                ),
-                "suggestion": None,
-            }
-        )
-
-    lower = text.lower()
-    for term in _VAGUE_TERMS:
-        if re.search(rf"\b{re.escape(term)}\b", lower):
-            findings.append(
-                {
-                    **base,
-                    "dimension": FindingDimension.REQUIREMENT_SMELL,
-                    "rule_id": "smell.vague_term",
-                    "severity": FindingSeverity.MAJOR,
-                    "message": (
-                        f"Término vago «{term}»: no es verificable. Reemplazar "
-                        f"por un objetivo medible (umbral, métrica, criterio)."
-                    ),
-                    "suggestion": None,
-                }
-            )
-            break  # un hallazgo por ítem basta como señal
-
-    if _PRONOUN_RE.search(text):
-        findings.append(
-            {
-                **base,
-                "dimension": FindingDimension.REQUIREMENT_SMELL,
-                "rule_id": "smell.pronoun",
-                "severity": FindingSeverity.MINOR,
-                "message": (
-                    "Uso de pronombre: la referencia es ambigua. Reescribir "
-                    "nombrando el sujeto concreto."
-                ),
-                "suggestion": None,
-            }
-        )
-
-    if _ABSOLUTE_RE.search(text):
-        findings.append(
-            {
-                **base,
-                "dimension": FindingDimension.REQUIREMENT_SMELL,
-                "rule_id": "smell.absolute",
-                "severity": FindingSeverity.MINOR,
-                "message": (
-                    "Término absoluto (100%, siempre, nunca, todos): rara vez "
-                    "verificable. Acotar con una condición o umbral."
-                ),
-                "suggestion": None,
-            }
-        )
-
-    if len(text) > _TOO_LONG_CHARS:
-        findings.append(
-            {
-                **base,
-                "dimension": FindingDimension.INCOSE_RULE,
-                "rule_id": "incose.too_long",
-                "severity": FindingSeverity.MINOR,
-                "message": (
-                    f"Enunciado muy largo ({len(text)} caracteres): "
-                    f"probablemente agrupa varios requerimientos. Separar."
-                ),
-                "suggestion": None,
-            }
-        )
-
-    if item.type in _MEASURABLE_TYPES and not _NUMBER_RE.search(text):
-        findings.append(
-            {
-                **base,
-                "dimension": FindingDimension.AMBIGUITY,
-                "rule_id": "incose.unmeasurable_nfr",
-                "severity": FindingSeverity.MAJOR,
-                "message": (
-                    f"Requerimiento de {item.type.value} sin target medible "
-                    f"(número/umbral/unidad). Debe cuantificarse para ser "
-                    f"verificable."
-                ),
-                "suggestion": None,
-            }
-        )
-
-    # EARS: si parece condicional pero no encaja en una plantilla -> INFO.
-    looks_conditional = any(
-        w in lower for w in ("cuando ", "when ", "mientras ", "while ", "si ", "if ")
-    )
-    if looks_conditional and ears is None:
-        findings.append(
-            {
-                **base,
-                "dimension": FindingDimension.EARS_VIOLATION,
-                "rule_id": "ears.missing_condition",
-                "severity": FindingSeverity.INFO,
-                "message": (
-                    "El enunciado parece condicional pero no sigue una "
-                    "plantilla EARS (When/While/Where/If-then). Estructurarlo "
-                    "mejora la claridad y la verificabilidad."
-                ),
-                "suggestion": None,
-                "ears_pattern": None,
-            }
-        )
-
-    return findings
+    Wrapper delgado sobre ``_quality_rules.programmatic_findings_for_text``:
+    conserva el contrato histórico (dicts listos para
+    ``srs_store.replace_findings``) de modo que el comportamiento de ``/srs``
+    no cambie. La fuente única de las reglas ITEM-level vive en el módulo
+    compartido, reutilizado por el pipeline de captura (shift-left de calidad).
+    """
+    req_type = item.type.value if item.type else None
+    out: list[dict[str, Any]] = []
+    for f in programmatic_findings_for_text(item.statement or "", req_type=req_type):
+        d: dict[str, Any] = {
+            "scope": FindingScope.ITEM,
+            "req_id": item.id,
+            "dimension": _DIM_MAP[f.dimension],
+            "rule_id": f.rule_id,
+            "severity": _SEV_MAP[f.severity],
+            "message": f.message,
+            "suggestion": f.suggestion,
+            "detected_by": "programmatic",
+        }
+        if f.rule_id in _RULES_WITH_EARS_PATTERN:
+            d["ears_pattern"] = f.ears_pattern
+        out.append(d)
+    return out
 
 
 # ---------------------------------------------------------------------------

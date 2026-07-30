@@ -39,6 +39,10 @@ from backend.agents.pipelines._resilience import (
     _BATCH_PARSE_RETRIES,
     BatchStats,
 )
+from backend.agents.pipelines._quality_rules import (
+    ProgrammaticFinding,
+    programmatic_findings_for_text,
+)
 from backend.agents.pipelines.consolidation import _has_dangling_reference
 from backend.agents.pipelines.extraction import RawRequirement
 
@@ -433,6 +437,41 @@ def _dangling_verdict(item: RawRequirement) -> CritiqueVerdict:
     )
 
 
+def _apply_quality_flags(
+    verdict: CritiqueVerdict, flags: list[ProgrammaticFinding]
+) -> CritiqueVerdict:
+    """Fusiona las señales deterministas de calidad en el veredicto del crítico.
+
+    Shift-left (plan §Capa 2): los pre-checks programáticos ITEM-level
+    (combinadores, términos vagos/absolutos, etc.) se aplican de forma
+    AUTORITATIVA sobre el veredicto del crítico, sin depender de que el LLM los
+    detecte. Cero llamadas LLM extra (la crítica ya se ejecutaba por ítem).
+
+    - ``smell.combinator`` fuerza ``atomic="fix"`` (respalda el split que el
+      crítico ya puede proponer).
+    - ``smell.vague_term`` / ``smell.absolute`` / ``incose.unmeasurable_nfr``
+      fuerzan ``verifiable="flag"`` (la cuantificación queda para el humano o
+      el crítico LLM).
+    - Las reglas informativas (negación, pronombre, modal, longitud, EARS) se
+      registran en ``reasons["quality"]`` sin alterar las dimensiones.
+    Sin flags -> veredicto sin tocar (idempotente).
+    """
+    if not flags:
+        return verdict
+
+    rule_ids = {f.rule_id for f in flags}
+    atomic = "fix" if "smell.combinator" in rule_ids else verdict.atomic
+    verifiable = (
+        "flag"
+        if rule_ids & {"smell.vague_term", "smell.absolute", "incose.unmeasurable_nfr"}
+        else verdict.verifiable
+    )
+
+    reasons = dict(verdict.reasons)
+    reasons["quality"] = "; ".join(f"{f.rule_id}: {f.message}" for f in flags)
+    return verdict.model_copy(update={"atomic": atomic, "verifiable": verifiable, "reasons": reasons})
+
+
 async def critique_item(
     item: RawRequirement,
     *,
@@ -457,7 +496,9 @@ async def critique_item(
         return item, _dangling_verdict(item)
 
     current = item
+    quality_flags = programmatic_findings_for_text(current.statement)
     verdict = _initial_verdict or await _judge_item(current, neighbors)
+    verdict = _apply_quality_flags(verdict, quality_flags)
     refinements = 0
     while (not _is_clean(verdict)
            and verdict.fidelity != "reject"
@@ -465,6 +506,11 @@ async def critique_item(
            and refinements < max_iter):
         current = current.model_copy(update={"statement": verdict.suggested_rewrite})
         verdict = await _judge_item(current, neighbors)
+        # Recomputa las señales sobre el enunciado reescrito: si la
+        # reescritura corrigió el defecto, la señal desaparece (idempotente).
+        verdict = _apply_quality_flags(
+            verdict, programmatic_findings_for_text(current.statement)
+        )
         refinements += 1
 
     if verdict.fidelity == "reject":
