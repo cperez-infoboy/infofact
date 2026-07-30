@@ -48,7 +48,7 @@ from backend.agents.pipelines._resilience import (
 )
 from backend.agents.pipelines._resilience import is_transient as _is_transient
 from backend.agents.pipelines._quality_rules import PREVENTION_RULES
-from backend.agents.pipelines.extraction import RawRequirement
+from backend.agents.pipelines.extraction import DocumentRules, RawRequirement
 from backend.models.requirement import Priority, ReqType
 
 logger = logging.getLogger(__name__)
@@ -128,17 +128,33 @@ _CLASSIFY_RUBRIC = (
     "- constraint         : technology / environment / platform choices.\n"
     "- process            : deliverables, methodology, project-management demands.\n"
     "- data               : data model, persistence, integrations, data quality.\n\n"
-    "PRIORITY (MoSCoW). Map the source obligation verb to one of:\n"
-    "- MUST   : mandatory. Source says 'shall', 'must', 'debe', 'obligatorio', "
-    "'required', 'mandatory'.\n"
-    "- SHOULD : desired/important. 'should', 'deberia', 'preferred', "
-    "'deseable', 'recommended'.\n"
-    "- COULD  : optional. 'may', 'could', 'podria', 'optional', 'nice to have'.\n"
-    "- WONT   : out of scope / future. 'wont', 'future', 'out of scope', "
-    "'futuro', 'no aplica'.\n"
-    "If the document carries its own priority legend, honour that mapping. "
-    "If no priority signal is present, default MUST for explicit requirements "
-    "and SHOULD for implicit/assumption ones.\n\n"
+    "PRIORITY (MoSCoW). Apply these rules IN STRICT PRECEDENCE ORDER:\n"
+    "1. ITEM PRIORITY HINT + DOCUMENT LEGEND (highest precedence). When the "
+    "item carries an explicit priority value from the document "
+    "(priority_hint, e.g. 'Alta', 'P1', 'high') AND the document declares a "
+    "priority legend (priority_legend, surfaced in the user message as "
+    "DOCUMENT_CONVENTIONS), resolve the hint against the legend. The client's "
+    "EXPLICIT priority intent WINS OVER the obligation verb — a 'baja' item "
+    "stays COULD/WONT even if the verb is 'debe'. Common resolutions: "
+    "'alta'/'critica'/'p1'/'high'/'critical' -> MUST; "
+    "'media'/'normal'/'p2'/'medium'/'should' -> SHOULD; "
+    "'baja'/'opcional'/'p3'/'low'/'optional' -> COULD.\n"
+    "2. SCOPE MARKERS (apply before obligation verbs). When the item or its "
+    "section carries a verbatim scope marker from DOCUMENT_CONVENTIONS "
+    "(e.g. 'fuera de alcance', 'fase 2', 'future', 'no aplica'), set WONT "
+    "regardless of any obligation verb.\n"
+    "3. OBLIGATION VERB. When NO priority_hint and NO scope marker apply, "
+    "fall back to the obligation verb:\n"
+    "- MUST   : 'shall', 'must', 'debe', 'obligatorio', 'required', "
+    "'mandatory'.\n"
+    "- SHOULD : 'should', 'deberia', 'preferred', 'deseable', 'recommended'. "
+    "Default SHOULD for implicit/assumption requirements (explicit=False).\n"
+    "- COULD  : 'may', 'could', 'podria', 'optional', 'nice to have'.\n"
+    "- WONT   : 'wont', 'future', 'out of scope', 'futuro', 'no aplica'.\n"
+    "Default MUST for explicit requirements when no other signal applies.\n"
+    "Record the basis of the decision in `rationale` (e.g. "
+    "\"legend 'Alta' -> MUST\", \"scope marker 'futuro' -> WONT\", "
+    "\"verb 'debe' -> MUST\", \"default explicit -> MUST\").\n\n"
     "DECOMPOSITION:\n"
     "- Set decomposition_needed=True ONLY when the statement is high-level or "
     "vague (e.g. 'the system must be secure', 'must be usable') AND its "
@@ -149,12 +165,12 @@ _CLASSIFY_RUBRIC = (
 
 # `_CLASSIFY_SYSTEM` (historical literal) had no dedicated "Rules:" block; the
 # constant exists for symmetry with `_CRITIC_RULES` so the batch variant can
-# append shared rules later without touching the byte-identical single-item
-# composition below.
+# append shared rules later without rebuilding the single-item composition below.
 _CLASSIFY_RULES = ""
 
-# IMPORTANT: keep this composed form BYTE-IDENTICAL to the historical literal —
-# the per-item smoke (batch_size=1) validates that this path did not drift.
+# The PRIORITY rubric above was rewritten to honor document conventions
+# (legend / priority_hint > obligation verb > scope markers). Per-document
+# dynamic signals stay in the USER message, never in this static system string.
 _CLASSIFY_SYSTEM = (
     "You are a REQUIREMENTS CLASSIFIER for a software SRS. For each "
     "requirement you assign a TYPE and a PRIORITY, and decide whether it is "
@@ -210,6 +226,32 @@ _PARSE_ERROR_PREFIX = "[parse_error]"
 _RATE_LIMITED_PREFIX = "[rate_limited]"
 
 
+def _format_conventions_block(rules: DocumentRules | None) -> str:
+    """Build the DOCUMENT_CONVENTIONS USER-message block for the classifier.
+
+    Surfaces the document's priority legend (verbatim labels) and scope
+    markers so the PRIORITY precedence (legend > verb, scope -> WONT) has the
+    real client signals available. Returns an empty string when the document
+    declares neither — the historical user message is then untouched.
+    """
+    if not rules or (not rules.priority_legend and not rules.scope_markers):
+        return ""
+    parts: list[str] = ["DOCUMENT_CONVENTIONS:"]
+    if rules.priority_legend:
+        labels = ", ".join(repr(e.label) for e in rules.priority_legend)
+        parts.append(
+            f"- Priority legend (verbatim labels declared by the document): "
+            f"{labels}."
+        )
+    if rules.scope_markers:
+        markers = ", ".join(repr(m) for m in rules.scope_markers)
+        parts.append(
+            f"- Scope markers (verbatim -> set WONT when they apply to the "
+            f"item): {markers}."
+        )
+    return "\n".join(parts)
+
+
 def _parse_failure_decision(
     item_id: str, attempts: int, exc: Exception
 ) -> ClassificationDecision:
@@ -257,6 +299,7 @@ async def _classify_item(
     *,
     attempts: int = _CLASSIFY_ATTEMPTS,
     transient_retries: int = _TRANSIENT_RETRIES,
+    rules: DocumentRules | None = None,
 ) -> ClassificationDecision:
     """One LLM classification call over one item.
 
@@ -266,14 +309,24 @@ async def _classify_item(
     - Parse (truncated/malformed JSON, ValidationError): up to `attempts`
       quick retries, then a `[parse_error]` sentinel.
     One bad response must not abort the whole batch.
+
+    ``rules`` (optional) surfaces the document's priority legend and scope
+    markers in the USER message so the PRIORITY precedence (legend > verb,
+    scope -> WONT) resolves against the real client signals. The system prompt
+    is NOT touched (rules go in the user message, never in the system).
     """
     llm = structured_llm(ClassificationDecision)
-    user = (
-        f"STATEMENT: {item.statement}\n"
-        f"SOURCE_SPAN: {item.source_span}\n"
-        f"SECTION: {item.section}\n"
-        f"EXPLICIT: {item.explicit}\n"
-    )
+    lines = [
+        f"STATEMENT: {item.statement}",
+        f"SOURCE_SPAN: {item.source_span}",
+        f"SECTION: {item.section}",
+        f"EXPLICIT: {item.explicit}",
+        f"PRIORITY_HINT: {item.priority_hint}",
+    ]
+    conventions_block = _format_conventions_block(rules)
+    if conventions_block:
+        lines.append(conventions_block)
+    user = "\n".join(lines)
     msgs = [("system", _CLASSIFY_SYSTEM), ("human", user)]
     parse_fails = 0
     transient_fails = 0
@@ -307,6 +360,8 @@ async def _classify_item(
 
 async def _per_item_fallback_classify(
     items: list[RawRequirement],
+    *,
+    rules: DocumentRules | None = None,
 ) -> list[ClassificationDecision]:
     """Run `_classify_item` concurrently for each item.
 
@@ -315,13 +370,16 @@ async def _per_item_fallback_classify(
     """
     if not items:
         return []
-    return list(await asyncio.gather(*[_classify_item(it) for it in items]))
+    return list(
+        await asyncio.gather(*[_classify_item(it, rules=rules) for it in items])
+    )
 
 
 async def _classify_batch(
     items: list[RawRequirement],
     *,
     max_tokens: int = BATCH_MAX_TOKENS,
+    rules: DocumentRules | None = None,
 ) -> tuple[list[ClassificationDecision], BatchStats]:
     """Batch-mode classifier pass over M items in one LLM call.
 
@@ -338,7 +396,7 @@ async def _classify_batch(
         return [], stats
     if len(items) == 1:
         only = items[0]
-        d = await _classify_item(only)
+        d = await _classify_item(only, rules=rules)
         return [d], stats
 
     # Build the batch user message.
@@ -350,9 +408,15 @@ async def _classify_batch(
             f"SOURCE_SPAN: {it.source_span}",
             f"SECTION: {it.section}",
             f"EXPLICIT: {it.explicit}",
+            f"PRIORITY_HINT: {it.priority_hint}",
         ]
         blocks.append("\n".join(lines))
     user = "\n---\n".join(blocks)
+    conventions_block = _format_conventions_block(rules)
+    if conventions_block:
+        # Appended ONCE after the last item so every item sees the same
+        # legend/scope context while keeping per-item blocks intact.
+        user = user + "\n---\n" + conventions_block
     msgs = [("system", _CLASSIFY_BATCH_SYSTEM), ("human", user)]
 
     llm = structured_llm(ClassificationBatch)
@@ -373,7 +437,9 @@ async def _classify_batch(
                         "falling back to per-item for %d items",
                         transient_fails, len(items),
                     )
-                    fallback = await _per_item_fallback_classify(items)
+                    fallback = await _per_item_fallback_classify(
+                        items, rules=rules
+                    )
                     stats.fallback += len(fallback)
                     return fallback, stats
                 wait = min(2 ** transient_fails, 60)
@@ -390,7 +456,9 @@ async def _classify_batch(
                         "falling back to per-item for %d items",
                         parse_fails, len(items),
                     )
-                    fallback = await _per_item_fallback_classify(items)
+                    fallback = await _per_item_fallback_classify(
+                        items, rules=rules
+                    )
                     stats.fallback += len(fallback)
                     return fallback, stats
                 logger.warning(
@@ -408,7 +476,7 @@ async def _classify_batch(
             "classify batch omitted %d/%d items; routing to per-item",
             len(missing), len(items),
         )
-        omitted = await _per_item_fallback_classify(missing)
+        omitted = await _per_item_fallback_classify(missing, rules=rules)
         stats.omitted += len(missing)
         for it, d in zip(missing, omitted):
             by_id[it.id] = d
@@ -503,6 +571,7 @@ async def classify_all(
     decompose: bool = True,
     concurrency: int = DEFAULT_CONCURRENCY,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    rules: DocumentRules | None = None,
 ) -> ClassificationResult:
     """Classify every item; optionally decompose the high-level ones.
 
@@ -515,6 +584,11 @@ async def classify_all(
     Returns decisions for all items and decompositions for the subset flagged
     decomposition_needed. Sub-items inherit the parent's source_span/section at
     persistence time (service layer), not here.
+
+    ``rules`` (optional) surfaces the document's priority legend + scope
+    markers in the user message so the PRIORITY precedence (legend > verb,
+    scope -> WONT) resolves against the real client signals. Default None
+    preserves the verb-based behavior.
     """
     if not items:
         return ClassificationResult(stats={"input": 0})
@@ -531,7 +605,7 @@ async def classify_all(
 
     async def _one_batch(batch: list[RawRequirement]):
         async with sem:
-            first_decisions, bstats = await _classify_batch(batch)
+            first_decisions, bstats = await _classify_batch(batch, rules=rules)
             agg.batch_calls += bstats.batch_calls
             agg.omitted += bstats.omitted
             agg.fallback += bstats.fallback

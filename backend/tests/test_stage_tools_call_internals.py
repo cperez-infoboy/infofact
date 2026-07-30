@@ -1,12 +1,17 @@
 """Phase 2: each stage tool calls the correct internal pipeline function.
 
-Pins that splitting the atomic ``run_requirements_pipeline`` into six staged tools
-did NOT change WHICH hardened function runs at each stage -- the guardrails
-(verify_spans, dedup thresholds, critique sentinel) still live inside those
-functions and are reached verbatim. Each pipeline function is stubbed and we
-assert the tool stores its typed output on the per-project ``CaptureRun`` and
-returns a compact summary. No DB / no LLM / no graph context: the emitters are
-no-ops outside a LangGraph run (see ``_make_emitters``).
+Pins that splitting the atomic ``run_requirements_pipeline`` into seven staged
+tools did NOT change WHICH hardened function runs at each stage -- the
+guardrails (verify_spans, dedup thresholds, critique sentinel) still live
+inside those functions and are reached verbatim. Each pipeline function is
+stubbed and we assert the tool stores its typed output on the per-project
+``CaptureRun`` and returns a compact summary. No DB / no LLM / no graph
+context: the emitters are no-ops outside a LangGraph run (see
+``_make_emitters``).
+
+Stage tool indices (after the CONVENTIONS stage insertion):
+  0=ingest, 1=conventions, 2=extract, 3=consolidate, 4=critique, 5=classify,
+  6=commit.
 """
 from __future__ import annotations
 
@@ -55,6 +60,18 @@ def _stub_pipeline(monkeypatch, calls: dict) -> None:
     async def fake_enrich(s, **kw):
         calls["enrich_structure_map"] = True
 
+    async def fake_extract_conventions(smap, **kw):
+        calls["extract_conventions"] = True
+        return types.SimpleNamespace(
+            priority_legend=[], priority_field_label="",
+            scope_markers=[], glossary=[])
+
+    def fake_merge_conventions(per_doc):
+        calls["merge_conventions"] = True
+        return types.SimpleNamespace(
+            priority_legend=[], priority_field_label="",
+            scope_markers=[], glossary=[])
+
     async def fake_extract_all(chunks, **kw):
         calls["extract_all"] = True
         return [types.SimpleNamespace(id="r1"), types.SimpleNamespace(id="r2")]
@@ -81,13 +98,15 @@ def _stub_pipeline(monkeypatch, calls: dict) -> None:
                 a_id="r1", b_id="r2", reason="conflict", confidence=0.9)],
         )
 
-    async def fake_critique_all(items):
+    async def fake_critique_all(items, **kw):
         calls["critique_all"] = True
+        calls["critique_rules"] = kw.get("rules")
         return types.SimpleNamespace(
             items=list(items), rejected=[], flagged=[], stats={"kept": 2})
 
-    async def fake_classify_all(items):
+    async def fake_classify_all(items, **kw):
         calls["classify_all"] = True
+        calls["classify_rules"] = kw.get("rules")
         return types.SimpleNamespace(
             decisions={"r1": object()}, stats={"sub_items": 1})
 
@@ -95,6 +114,8 @@ def _stub_pipeline(monkeypatch, calls: dict) -> None:
     monkeypatch.setattr(mod, "discover_documents", fake_discover)
     monkeypatch.setattr(mod, "ingest_document", fake_ingest)
     monkeypatch.setattr(mod, "enrich_structure_map", fake_enrich)
+    monkeypatch.setattr(mod, "extract_conventions", fake_extract_conventions)
+    monkeypatch.setattr(mod, "merge_conventions", fake_merge_conventions)
     monkeypatch.setattr(mod, "extract_all", fake_extract_all)
     monkeypatch.setattr(mod, "gap_pass", fake_gap_pass)
     monkeypatch.setattr(mod, "implicit_pass", fake_implicit_pass)
@@ -130,11 +151,26 @@ async def test_ingest_calls_ingestion_and_stores_chunks(stage_tools, calls):
 
 
 @pytest.mark.asyncio
+async def test_conventions_calls_extract_and_merge(stage_tools, calls):
+    """Stage 1 (conventions) wires extract_conventions + merge_conventions and
+    stores DocumentRules on the holder."""
+    await stage_tools[0].ainvoke({"target_subpath": ""})
+    out = await stage_tools[1].ainvoke({})
+    run = holder.get_run(PROJECT_ID)
+    assert run.document_rules is not None
+    assert "conventions" in out["stages_done"]
+    assert out["priority_legend_entries"] == 0
+    assert out["scope_markers"] == 0
+    assert calls.get("extract_conventions") is True
+    assert calls.get("merge_conventions") is True
+
+
+@pytest.mark.asyncio
 async def test_extract_calls_extract_all_gap_implicit_and_drops_duplicit(
     stage_tools, calls
 ):
     await stage_tools[0].ainvoke({"target_subpath": ""})
-    out = await stage_tools[1].ainvoke({})
+    out = await stage_tools[2].ainvoke({})  # index 2 = extract
     run = holder.get_run(PROJECT_ID)
     assert len(run.extracted) == 3  # 2 explicit + 1 implicit kept
     assert out["raw_items"] == 3
@@ -149,8 +185,8 @@ async def test_extract_calls_extract_all_gap_implicit_and_drops_duplicit(
 @pytest.mark.asyncio
 async def test_consolidate_calls_consolidate_and_counts_conflicts(stage_tools, calls):
     await stage_tools[0].ainvoke({"target_subpath": ""})
-    await stage_tools[1].ainvoke({})
-    out = await stage_tools[2].ainvoke({})
+    await stage_tools[2].ainvoke({})  # extract (skip conventions)
+    out = await stage_tools[3].ainvoke({})  # index 3 = consolidate
     run = holder.get_run(PROJECT_ID)
     assert run.cons is not None
     assert len(run.cons.items) == 2
@@ -162,11 +198,12 @@ async def test_consolidate_calls_consolidate_and_counts_conflicts(stage_tools, c
 
 @pytest.mark.asyncio
 async def test_critique_calls_critique_all_and_reports_verdict(stage_tools, calls):
+    # Run ingest + conventions + extract + consolidate (indices 0..3).
     for idx, payload in enumerate(
         [{"target_subpath": ""}, {}, {}, {}]
     ):
         await stage_tools[idx].ainvoke(payload)
-    out = await stage_tools[4 - 1].ainvoke({})  # index 3 = critique
+    out = await stage_tools[4].ainvoke({})  # index 4 = critique
     run = holder.get_run(PROJECT_ID)
     assert run.crit is not None
     assert out["kept"] == 2
@@ -174,21 +211,26 @@ async def test_critique_calls_critique_all_and_reports_verdict(stage_tools, call
     assert out["flagged"] == 0
     assert "critique" in out["stages_done"]
     assert calls.get("critique_all") is True
+    # rules are threaded through (run.document_rules from conventions stage).
+    assert calls.get("critique_rules") is not None
 
 
 @pytest.mark.asyncio
 async def test_classify_calls_classify_all(stage_tools, calls):
+    # Run ingest + conventions + extract + consolidate + critique (0..4).
     for idx, payload in enumerate(
         [{"target_subpath": ""}, {}, {}, {}, {}]
     ):
         await stage_tools[idx].ainvoke(payload)
-    out = await stage_tools[4].ainvoke({})  # index 4 = classify
+    out = await stage_tools[5].ainvoke({})  # index 5 = classify
     run = holder.get_run(PROJECT_ID)
     assert run.cls is not None
     assert out["classified"] == 1
     assert out["sub_items"] == 1
     assert "classify" in out["stages_done"]
     assert calls.get("classify_all") is True
+    # rules are threaded through (run.document_rules from conventions stage).
+    assert calls.get("classify_rules") is not None
 
 
 @pytest.mark.asyncio

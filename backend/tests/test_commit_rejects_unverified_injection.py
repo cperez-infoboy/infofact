@@ -58,7 +58,7 @@ def _isolate_holder(monkeypatch):
 
 
 def _stub_pipeline(monkeypatch) -> None:
-    """Populate the holder through all five pre-commit stages without LLM/DB."""
+    """Populate the holder through all six pre-commit stages without LLM/DB."""
     smap = types.SimpleNamespace(
         document_id="doc1", full_text="hello world", name="doc1.pdf"
     )
@@ -70,6 +70,19 @@ def _stub_pipeline(monkeypatch) -> None:
     async def _enrich(s, **kw):
         return None
     monkeypatch.setattr(mod, "enrich_structure_map", _enrich)
+
+    async def _extract_conventions(smap, **kw):
+        return types.SimpleNamespace(
+            priority_legend=[], priority_field_label="",
+            scope_markers=[], glossary=[])
+    monkeypatch.setattr(mod, "extract_conventions", _extract_conventions)
+
+    monkeypatch.setattr(
+        mod, "merge_conventions",
+        lambda per_doc: types.SimpleNamespace(
+            priority_legend=[], priority_field_label="",
+            scope_markers=[], glossary=[]),
+    )
 
     async def _extract_all(chunks, **kw):
         return [types.SimpleNamespace(id="r1"), types.SimpleNamespace(id="r2")]
@@ -91,12 +104,12 @@ def _stub_pipeline(monkeypatch) -> None:
             items=items, duplicates=[], contradictions=[])
     monkeypatch.setattr(mod, "consolidate", _consolidate)
 
-    async def _critique_all(items):
+    async def _critique_all(items, **kw):
         return types.SimpleNamespace(
             items=list(items), rejected=[], flagged=[], stats={"kept": 2})
     monkeypatch.setattr(mod, "critique_all", _critique_all)
 
-    async def _classify_all(items):
+    async def _classify_all(items, **kw):
         return types.SimpleNamespace(decisions={}, stats={"sub_items": 0})
     monkeypatch.setattr(mod, "classify_all", _classify_all)
 
@@ -108,15 +121,22 @@ def stage_tools(monkeypatch):
 
 
 async def _run_all_pre_commit(stage_tools) -> None:
+    # 0=ingest, 1=conventions, 2=extract, 3=consolidate, 4=critique, 5=classify
     for idx, payload in enumerate(
-        [{"target_subpath": ""}, {}, {}, {}, {}]
+        [{"target_subpath": ""}, {}, {}, {}, {}, {}]
     ):
         await stage_tools[idx].ainvoke(payload)
 
 
+# Indices: 0=ingest, 1=conventions, 2=extract, 3=consolidate, 4=critique,
+# 5=classify, 6=commit.
+COMMIT_IDX = 6
+EXTRACT_IDX = 2
+
+
 @pytest.mark.asyncio
 async def test_commit_without_active_run_replies_no_capture(stage_tools):
-    out = await stage_tools[5].ainvoke({})
+    out = await stage_tools[COMMIT_IDX].ainvoke({})
     assert out["error"] == "no_capture_in_progress"
     assert "ingest_documents" in out["message"]
 
@@ -124,10 +144,12 @@ async def test_commit_without_active_run_replies_no_capture(stage_tools):
 @pytest.mark.asyncio
 async def test_commit_rejects_when_prior_stages_missing(stage_tools):
     await stage_tools[0].ainvoke({"target_subpath": ""})  # ingest only
-    out = await stage_tools[5].ainvoke({})
+    out = await stage_tools[COMMIT_IDX].ainvoke({})
     assert out["error"] == "missing_stages"
-    # Pipeline order preserved in the missing list.
-    assert out["missing"] == ["extract", "consolidate", "critique", "classify"]
+    # Pipeline order preserved in the missing list (conventions is index 1).
+    assert out["missing"] == [
+        "conventions", "extract", "consolidate", "critique", "classify",
+    ]
 
 
 @pytest.mark.asyncio
@@ -146,7 +168,7 @@ async def test_commit_persists_crit_items_and_clears_run(stage_tools, monkeypatc
     run = holder.get_run(PROJECT_ID)
     crit_items = run.crit.items
 
-    out = await stage_tools[5].ainvoke({})
+    out = await stage_tools[COMMIT_IDX].ainvoke({})
 
     assert out["persisted"] == 2
     # commit passes the holder crit items VERBATIM (identity, not a copy).
@@ -174,7 +196,7 @@ async def test_tampering_extracted_cannot_inject_items_into_persist(
     bogus = types.SimpleNamespace(id="INJECTED-HALLUCINATION")
     run.extracted.append(bogus)  # direct attribute write -- the only "attack"
 
-    await stage_tools[5].ainvoke({})
+    await stage_tools[COMMIT_IDX].ainvoke({})
 
     # crit has 2 items (from consolidate); the injected extracted item is ignored.
     assert len(captured["items"]) == 2
@@ -185,10 +207,10 @@ async def test_tampering_extracted_cannot_inject_items_into_persist(
 async def test_loop_cap_stops_a_stuck_stage(stage_tools):
     # Cap is 3: the 4th call of the same stage returns stage_loop_exceeded.
     await stage_tools[0].ainvoke({"target_subpath": ""})
-    out = await stage_tools[1].ainvoke({})
-    out2 = await stage_tools[1].ainvoke({})
-    out3 = await stage_tools[1].ainvoke({})
-    out4 = await stage_tools[1].ainvoke({})
+    out = await stage_tools[EXTRACT_IDX].ainvoke({})
+    out2 = await stage_tools[EXTRACT_IDX].ainvoke({})
+    out3 = await stage_tools[EXTRACT_IDX].ainvoke({})
+    out4 = await stage_tools[EXTRACT_IDX].ainvoke({})
     assert out4["error"] == "stage_loop_exceeded"
     assert out4["stage"] == "extract"
     assert out4["calls"] == 4

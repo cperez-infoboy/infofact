@@ -4,18 +4,19 @@ Variant of the deterministic ``requirements-capture`` subagent where the model
 REASONS the capture instead of firing one deterministic tool call.
 
 Phase 2 (this module): the atomic ``run_requirements_capture`` is split into
-SIX stage tools backed by a stateful run-holder
+SEVEN stage tools backed by a stateful run-holder
 (``capture_run_holder.CaptureRun``), so the agent reasons BETWEEN stages. It
 sees each stage counts/conflicts/verdicts and decides whether to continue or
-adjust before the next stage -- without re-running the previous one. The six
+adjust before the next stage -- without re-running the previous one. The seven
 stages (always in this order):
 
-    ingest_documents      ->  Docling parse + structure map (chunks)
-    extract_requirements  ->  guided extraction (verify_spans inside)
+    ingest_documents          ->  Docling parse + structure map (chunks)
+    discover_conventions      ->  discover priority legend / scope markers
+    extract_requirements      ->  guided extraction (verify_spans inside)
     consolidate_requirements  ->  dedup + contradictions
-    critique_requirements ->  critical review (nature / hallucination drops)
-    classify_requirements ->  type + MoSCoW + decomposition
-    commit_capture        ->  persistence (opaque REQ-XXXX, derived sub-items)
+    critique_requirements     ->  critical review (nature / hallucination drops)
+    classify_requirements     ->  type + MoSCoW + decomposition
+    commit_capture            ->  persistence (opaque REQ-XXXX, derived sub-items)
 
 Each stage calls the SAME hardened function the atomic pipeline uses; the
 guardrails live inside those functions, so splitting them into tools does NOT
@@ -35,6 +36,7 @@ which embeds free-form user steering (text after the command) as
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +46,8 @@ from backend.agents.pipelines.classification import classify_all
 from backend.agents.pipelines.consolidation import consolidate, drop_duplicit_implicit
 from backend.agents.pipelines.critique import critique_all
 from backend.agents.pipelines.extraction import (
+    extract_conventions,
+    merge_conventions,
     enrich_structure_map,
     extract_all,
     gap_pass,
@@ -58,6 +62,7 @@ from backend.agents.subagents.capture_run_holder import (
     STAGE_CLASSIFY,
     STAGE_COMMIT,
     STAGE_CONSOLIDATE,
+    STAGE_CONVENTIONS,
     STAGE_CRITIQUE,
     STAGE_EXTRACT,
     STAGE_INGEST,
@@ -82,19 +87,23 @@ REQUIREMENTS_CAPTURE_AGENT_PROMPT = """\
 Eres el subagente AGENTICO de captura de requerimientos de InfoFact (variante
 no deterministica del comando /captura). A diferencia del subagente
 determinista, que dispara una sola tool y reporta, RAZONAS la captura etapa por
-etapa: orientas los documentos, planificas una estrategia, orquestas las seis
+etapa: orientas los documentos, planificas una estrategia, orquestas las siete
 etapas del pipeline razonando entre cada una, y refinas los resultados antes de
 reportar.
 
-Las seis etapas (SIEMPRE en este orden; cada una consume la salida de la
+Las siete etapas (SIEMPRE en este orden; cada una consume la salida de la
 anterior, guardada en memoria):
 
-  1. ingest_documents        parseo Docling + mapa de estructura (chunks)
-  2. extract_requirements    extraccion guiada (verify_spans anti-alucinacion)
-  3. consolidate_requirements   deduplicacion + contradicciones
-  4. critique_requirements   revision critica (rechaza leyendas / alucinaciones)
-  5. classify_requirements   tipo + prioridad MoSCoW + descomposicion
-  6. commit_capture          persistencia (codigos opacos REQ-XXXX, sub-items)
+  1. ingest_documents          parseo Docling + mapa de estructura (chunks)
+  2. discover_conventions      descubre la leyenda de prioridad del cliente,
+                               etiquetas de campo y marcadores de alcance del
+                               documento (reglas literales verbatim)
+  3. extract_requirements      extraccion guiada (verify_spans anti-alucinacion)
+  4. consolidate_requirements  deduplicacion + contradicciones
+  5. critique_requirements     revision critica (rechaza leyendas / alucinaciones)
+  6. classify_requirements     tipo + prioridad MoSCoW (leyenda > verbo) +
+                               descomposicion
+  7. commit_capture            persistencia (codigos opacos REQ-XXXX, sub-items)
 
 commit_capture rechaza si falta alguna etapa previa: no puedes saltear etapas.
 
@@ -121,7 +130,7 @@ Flujo:
 3. VERIFICAR ENTORNO. Llama a check_capture_health antes de capturar. Si algo
    falla, reporta el hint de remediacion y NO avances hasta resolverlo.
 
-4. ORQUESTAR LAS ETAPAS. Ejecuta las seis tools en orden, razonando entre cada
+4. ORQUESTAR LAS ETAPAS. Ejecuta las siete tools en orden, razonando entre cada
    una (1-3 frases: que viste, que sigue, alguna duda). Cada una devuelve un
    resumen con conteos.
    - ingest_documents(target_subpath, on_existing): arranca la captura. Usa ""
@@ -136,6 +145,11 @@ Flujo:
        on_existing=reset sin confirmacion explicita del usuario; ante duda,
        append (no destruyas). Esta consulta se hace ANTES de parsear: no haces
        trabajo hasta que el usuario decide.
+   - discover_conventions: descubre las convenciones del documento (leyenda de
+     prioridad del cliente tipo "Alta/Media/Baja", etiqueta del campo de
+     prioridad, marcadores de alcance, glosario). Es una lectura literal
+     (verbatim) del documento, no una interpretacion. Es best-effort: si falla,
+     el pipeline sigue con los valores por defecto basados en verbos.
    - extract_requirements: extrae requerimientos del material ingerido. TODO
      item nace aca, verificado por source_span. No inventes items.
    - consolidate_requirements: detecta duplicados y contradicciones y los
@@ -263,7 +277,7 @@ def _make_stage_tools(
     project_name: str,
     project_description: str,
 ) -> list:
-    """Build the six staged-capture tools bound to one project.
+    """Build the seven staged-capture tools bound to one project.
 
     Each tool runs ONE pipeline stage, stores its typed output on the per-project
     ``CaptureRun`` (so the next stage consumes it without re-running), and emits
@@ -376,7 +390,8 @@ def _make_stage_tools(
         run.reset_pipeline_outputs()
 
         on_progress, _on_event = _make_emitters()
-        await on_progress(STAGE_INGEST, "discover")
+        await on_progress(STAGE_INGEST, "discover", {"phase": "start"})
+        t0 = time.perf_counter()
         docs = discover_documents(target)
         await on_progress(STAGE_INGEST, str(len(docs)) + " documento(s)")
         if not docs:
@@ -404,6 +419,11 @@ def _make_stage_tools(
             all_chunks.extend(chunks)
             await on_progress(STAGE_INGEST, "parseado " + d.name)
 
+        run.timings[STAGE_INGEST] = (time.perf_counter() - t0) * 1000
+        await on_progress(
+            STAGE_INGEST, "ingestión lista",
+            {"phase": "end", "elapsed_ms": round(run.timings[STAGE_INGEST])},
+        )
         run.docs = docs
         run.per_doc = per_doc
         run.doc_texts = doc_texts
@@ -416,13 +436,72 @@ def _make_stage_tools(
         }
 
     @tool
+    async def discover_conventions() -> dict:
+        """Stage 2/7: discover document conventions (priority legend, scope).
+
+        Reads each ingested document once to extract the client's own priority
+        legend (e.g. "Alta/Media/Baja"), the per-requirement priority field
+        label, scope markers (out-of-scope tags) and a glossary. Pure verbatim
+        extraction; resolution (legend->MoSCoW) happens later in classify. The
+        merged DocumentRules are stored on the holder and threaded into
+        extract, critique and classify. Best-effort: a failure here degrades to
+        empty rules -> consumers fall back to verb-based defaults, the pipeline
+        never aborts. Requires ingest_documents first.
+        """
+        run = get_run(project_id)
+        if run is None:
+            return _no_run("ingest_documents")
+        try:
+            run.bump(STAGE_CONVENTIONS)
+        except StageLoopExceeded as exc:
+            return _loop_err(exc)
+
+        on_progress, _on_event = _make_emitters()
+        await on_progress(
+            STAGE_CONVENTIONS, "convenciones del documento", {"phase": "start"}
+        )
+        t0 = time.perf_counter()
+        per_doc_rules = []
+        for chunks, smap in run.per_doc:
+            doc_rules = await extract_conventions(
+                smap,
+                project_name=run.project_name,
+                project_description=run.project_description,
+            )
+            per_doc_rules.append(doc_rules)
+        document_rules = merge_conventions(per_doc_rules)
+
+        run.timings[STAGE_CONVENTIONS] = (time.perf_counter() - t0) * 1000
+        run.document_rules = document_rules
+        run.stages_done.add(STAGE_CONVENTIONS)
+        await on_progress(
+            STAGE_CONVENTIONS, "convenciones listas",
+            {
+                "phase": "end",
+                "elapsed_ms": round(run.timings[STAGE_CONVENTIONS]),
+                "priority_legend_entries": len(document_rules.priority_legend),
+                "scope_markers": len(document_rules.scope_markers),
+                "has_priority_field_label": bool(document_rules.priority_field_label),
+            },
+        )
+        return {
+            "priority_legend_entries": len(document_rules.priority_legend),
+            "priority_field_label": document_rules.priority_field_label,
+            "scope_markers": len(document_rules.scope_markers),
+            "glossary_terms": len(document_rules.glossary),
+            "stages_done": sorted(run.stages_done),
+        }
+
+    @tool
     async def extract_requirements() -> dict:
-        """Stage 2/6: extract raw requirements from the ingested chunks.
+        """Stage 3/7: extract raw requirements from the ingested chunks.
 
         Runs the guided extractor (verify_spans inside -- the anti-hallucination
         anchor), then per-document gap pass and an implicit-pass, dropping
         duplicit implicits. Every persisted requirement is born here with a
-        verified source span. Requires ingest_documents first.
+        verified source span. Requires ingest_documents first. Threads the
+        document conventions (priority_field_label) discovered in
+        extract_conventions so the extractor surfaces a priority_hint per item.
         """
         run = get_run(project_id)
         if run is None:
@@ -433,12 +512,14 @@ def _make_stage_tools(
             return _loop_err(exc)
 
         on_progress, _on_event = _make_emitters()
-        await on_progress(STAGE_EXTRACT, "extraccion")
+        await on_progress(STAGE_EXTRACT, "extraccion", {"phase": "start"})
+        t0 = time.perf_counter()
         extracted = await extract_all(
             run.all_chunks,
             doc_texts=run.doc_texts,
             project_name=run.project_name,
             project_description=run.project_description,
+            rules=run.document_rules,
         )
         for chunks, smap in run.per_doc:
             gaps = await gap_pass(
@@ -458,9 +539,13 @@ def _make_stage_tools(
         implicits = drop_duplicit_implicit(implicits, extracted)
         extracted.extend(implicits)
 
+        run.timings[STAGE_EXTRACT] = (time.perf_counter() - t0) * 1000
         run.extracted = extracted
         run.stages_done.add(STAGE_EXTRACT)
-        await on_progress(STAGE_EXTRACT, str(len(extracted)) + " items crudos")
+        await on_progress(
+            STAGE_EXTRACT, str(len(extracted)) + " items crudos",
+            {"phase": "end", "elapsed_ms": round(run.timings[STAGE_EXTRACT])},
+        )
         return {
             "raw_items": len(extracted),
             "stages_done": sorted(run.stages_done),
@@ -468,7 +553,7 @@ def _make_stage_tools(
 
     @tool
     async def consolidate_requirements() -> dict:
-        """Stage 3/6: deduplicate and detect contradictions (propose, never auto-resolve).
+        """Stage 4/7: deduplicate and detect contradictions (propose, never auto-resolve).
 
         Runs exact + two-tier semantic dedup and contradiction detection over
         the extracted items. Emits a conflict.found event per duplicate and
@@ -484,7 +569,8 @@ def _make_stage_tools(
             return _loop_err(exc)
 
         on_progress, on_event = _make_emitters()
-        await on_progress(STAGE_CONSOLIDATE, "dedup + contradicciones")
+        await on_progress(STAGE_CONSOLIDATE, "dedup + contradicciones", {"phase": "start"})
+        t0 = time.perf_counter()
         cons = await consolidate(run.extracted)
         for dup in cons.duplicates:
             await on_event("conflict.found", {
@@ -502,8 +588,13 @@ def _make_stage_tools(
                 "confidence": pair.confidence,
             })
 
+        run.timings[STAGE_CONSOLIDATE] = (time.perf_counter() - t0) * 1000
         run.cons = cons
         run.stages_done.add(STAGE_CONSOLIDATE)
+        await on_progress(
+            STAGE_CONSOLIDATE, "consolidación lista",
+            {"phase": "end", "elapsed_ms": round(run.timings[STAGE_CONSOLIDATE])},
+        )
         return {
             "items": len(cons.items),
             "duplicates": len(cons.duplicates),
@@ -513,13 +604,15 @@ def _make_stage_tools(
 
     @tool
     async def critique_requirements() -> dict:
-        """Stage 4/6: critical review (drop non-requirements / hallucinations).
+        """Stage 5/7: critical review (drop non-requirements / hallucinations).
 
         Runs the generator-critic loop over the consolidated items, dropping
         legends/boilerplate/meta-instructions and likely hallucinations, and
-        flagging items that need human review. Emits a validation.report event
-        with the kept/rejected/flagged counts. Requires consolidate_requirements
-        first.
+        flagging items that need human review. The document conventions
+        (priority legend, scope markers, glossary) are surfaced in the prompt
+        so the critic does NOT flag the client's own signals as noise. Emits a
+        validation.report event with the kept/rejected/flagged counts. Requires
+        consolidate_requirements first.
         """
         run = get_run(project_id)
         if run is None or run.cons is None:
@@ -530,8 +623,9 @@ def _make_stage_tools(
             return _loop_err(exc)
 
         on_progress, on_event = _make_emitters()
-        await on_progress(STAGE_CRITIQUE, "revision critica")
-        crit = await critique_all(run.cons.items)
+        await on_progress(STAGE_CRITIQUE, "revision critica", {"phase": "start"})
+        t0 = time.perf_counter()
+        crit = await critique_all(run.cons.items, rules=run.document_rules)
         await on_event("validation.report", {
             "total": len(run.cons.items),
             "kept": crit.stats.get("kept", len(crit.items)),
@@ -539,8 +633,13 @@ def _make_stage_tools(
             "flagged": len(crit.flagged),
         })
 
+        run.timings[STAGE_CRITIQUE] = (time.perf_counter() - t0) * 1000
         run.crit = crit
         run.stages_done.add(STAGE_CRITIQUE)
+        await on_progress(
+            STAGE_CRITIQUE, "crítica lista",
+            {"phase": "end", "elapsed_ms": round(run.timings[STAGE_CRITIQUE])},
+        )
         return {
             "kept": crit.stats.get("kept", len(crit.items)),
             "rejected": len(crit.rejected),
@@ -550,11 +649,13 @@ def _make_stage_tools(
 
     @tool
     async def classify_requirements() -> dict:
-        """Stage 5/6: classify (type + MoSCoW + decomposition).
+        """Stage 6/7: classify (type + MoSCoW + decomposition).
 
         Runs the classifier over the critiqued items, assigning type
         (functional/non-functional/...), priority (MoSCoW) and optional
-        decomposition into sub-items. Requires critique_requirements first.
+        decomposition into sub-items. PRIORITY precedence: item priority_hint +
+        document legend wins over obligation verb; scope markers force WONT.
+        Requires critique_requirements first.
         """
         run = get_run(project_id)
         if run is None or run.crit is None:
@@ -565,11 +666,17 @@ def _make_stage_tools(
             return _loop_err(exc)
 
         on_progress, _on_event = _make_emitters()
-        await on_progress(STAGE_CLASSIFY, "clasificacion")
-        cls = await classify_all(run.crit.items)
+        await on_progress(STAGE_CLASSIFY, "clasificacion", {"phase": "start"})
+        t0 = time.perf_counter()
+        cls = await classify_all(run.crit.items, rules=run.document_rules)
 
+        run.timings[STAGE_CLASSIFY] = (time.perf_counter() - t0) * 1000
         run.cls = cls
         run.stages_done.add(STAGE_CLASSIFY)
+        await on_progress(
+            STAGE_CLASSIFY, "clasificación lista",
+            {"phase": "end", "elapsed_ms": round(run.timings[STAGE_CLASSIFY])},
+        )
         return {
             "classified": len(cls.decisions),
             "sub_items": cls.stats.get("sub_items", 0),
@@ -578,7 +685,7 @@ def _make_stage_tools(
 
     @tool
     async def commit_capture() -> dict:
-        """Stage 6/6: persist the staged requirements (the only DB writer).
+        """Stage 7/7: persist the staged requirements (the only DB writer).
 
         Writes the classified items to the store with opaque REQ-XXXX codes and
         derived sub-items. Requires every prior stage to have run; refuses
@@ -604,8 +711,9 @@ def _make_stage_tools(
                 "missing": missing,
                 "message": (
                     "Faltan etapas previas antes de commit_capture. Llama a "
-                    "cada una en orden (ingest -> extract -> consolidate -> "
-                    "critique -> classify) y vuelve a intentar."
+                    "cada una en orden (ingest -> discover_conventions -> "
+                    "extract -> consolidate -> critique -> classify) y vuelve "
+                    "a intentar."
                 ),
             }
 
@@ -613,7 +721,8 @@ def _make_stage_tools(
         from backend.database import AsyncSessionLocal
         from backend.services.requirements_service import _persist
 
-        await on_progress("persist", "guardando")
+        await on_progress("persist", "guardando", {"phase": "start"})
+        t0 = time.perf_counter()
         try:
             async with AsyncSessionLocal() as session:
                 ids = await _persist(
@@ -622,7 +731,14 @@ def _make_stage_tools(
         except Exception as exc:  # noqa: BLE001 -- surface to the model
             return {"error": "persist failed: " + str(exc)}
 
+        run.timings["persist"] = (time.perf_counter() - t0) * 1000
+        await on_progress(
+            "persist", "persistencia lista",
+            {"phase": "end", "elapsed_ms": round(run.timings["persist"])},
+        )
+
         run.committed_ids = ids
+        total_ms = round(sum(run.timings.values()))
         summary = {
             "persisted": len(ids),
             "sub_items": run.cls.stats.get("sub_items", 0) if run.cls else 0,
@@ -631,12 +747,19 @@ def _make_stage_tools(
             "contradictions": len(run.cons.contradictions) if run.cons else 0,
             "flagged_for_review": len(run.crit.flagged) if run.crit else 0,
             "rejected_hallucination": len(run.crit.rejected) if run.crit else 0,
+            "timings": dict(run.timings),
+            "total_ms": total_ms,
         }
+        await on_progress(
+            "done", str(len(ids)) + " requerimientos",
+            {"timings": dict(run.timings), "total_ms": total_ms},
+        )
         clear_run(project_id)
         return summary
 
     return [
         ingest_documents,
+        discover_conventions,
         extract_requirements,
         consolidate_requirements,
         critique_requirements,
@@ -655,14 +778,15 @@ def make_requirements_capture_agent_subagent(
 ) -> dict[str, Any]:
     """Build the agent-driven requirements-capture subagent for DeepAgents.
 
-    Six staged tools (ingest -> extract -> consolidate -> critique -> classify
-    -> commit) backed by a stateful run-holder, so the agent reasons BETWEEN
-    stages instead of firing one atomic tool. Plus orient_documents, the health
-    pre-flight, and the shared editing/grouping/vision tools. NO
-    ``backend``/sandbox: the subagent cannot execute code, so it is forced to
-    use ingest_documents (Docling) for ingestion instead of improvising manual
-    parsing. ``commit_capture`` is the only DB writer and reads only from the
-    holder (span-verified items from extract_requirements).
+    Seven staged tools (ingest -> discover_conventions -> extract -> consolidate
+    -> critique -> classify -> commit) backed by a stateful run-holder, so the
+    agent reasons BETWEEN stages instead of firing one atomic tool. Plus
+    orient_documents, the health pre-flight, and the shared
+    editing/grouping/vision tools. NO ``backend``/sandbox: the subagent cannot
+    execute code, so it is forced to use ingest_documents (Docling) for
+    ingestion instead of improvising manual parsing. ``commit_capture`` is the
+    only DB writer and reads only from the holder (span-verified items from
+    extract_requirements).
     """
     # Imported here to avoid a config import at module load time (matches the
     # deterministic factory; tests that rebind settings work without surprises).
@@ -684,7 +808,7 @@ def make_requirements_capture_agent_subagent(
         "description": (
             "Variante AGENTICA de la captura de requerimientos: razona la "
             "extraccion etapa por etapa (orienta los documentos, planifica, "
-            "orquesta las seis etapas del pipeline y refina) en lugar de "
+            "orquesta las siete etapas del pipeline y refina) en lugar de "
             "disparar una sola tool. Usalo cuando el usuario use el comando "
             "/captura_agente o pida una captura guiada con instrucciones de "
             "steering. Comparte las mismas tools de edicion/agrupamiento/vision "

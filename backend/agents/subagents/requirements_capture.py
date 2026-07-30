@@ -209,16 +209,18 @@ def _make_emitters():
     """
     from langgraph.config import get_stream_writer
 
-    async def _emit_progress(stage: str, message: str) -> None:
+    async def _emit_progress(
+        stage: str, message: str, extra: dict | None = None
+    ) -> None:
         try:
             writer = get_stream_writer()
         except Exception:  # noqa: BLE001 — no graph context (smoke / direct call)
             return
         try:
-            writer({
-                "event": "extraction.progress",
-                "data": {"stage": stage, "message": message},
-            })
+            data: dict = {"stage": stage, "message": message}
+            if extra:
+                data.update(extra)
+            writer({"event": "extraction.progress", "data": data})
         except Exception:  # noqa: BLE001 — never break the pipeline for progress
             return
 

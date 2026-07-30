@@ -65,7 +65,7 @@ async def main():
         project_id = proj.id
 
     # --- progress hook so the long LLM run is visible ---
-    async def on_progress(stage, msg):
+    async def on_progress(stage, msg, extra=None):
         print(f"  [{stage}] {msg}")
 
     print(f"running FULL pipeline on {PATH.name} (LLM real) ...")

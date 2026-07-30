@@ -14,6 +14,7 @@ from backend.agents.subagents.capture_run_holder import (
     STAGE_CLASSIFY,
     STAGE_COMMIT,
     STAGE_CONSOLIDATE,
+    STAGE_CONVENTIONS,
     STAGE_CRITIQUE,
     STAGE_EXTRACT,
     STAGE_INGEST,
@@ -79,10 +80,12 @@ def test_reset_pipeline_outputs_keeps_call_counters():
     run.bump(STAGE_EXTRACT)
     run.bump(STAGE_EXTRACT)
     run.extracted = [object()]  # type: ignore[list-item]
+    run.document_rules = object()  # type: ignore[assignment]
     run.stages_done.add(STAGE_EXTRACT)
     run.reset_pipeline_outputs()
     assert run.extracted == []
     assert run.cons is None
+    assert run.document_rules is None
     assert STAGE_EXTRACT not in run.stages_done
     # Counters survive so a re-ingest cannot dodge the cap.
     assert run.calls[STAGE_EXTRACT] == 2
@@ -93,6 +96,7 @@ def test_missing_stages_lists_all_until_every_stage_ran():
     missing = run.missing_stages_before_commit()
     assert set(missing) == {
         STAGE_INGEST,
+        STAGE_CONVENTIONS,
         STAGE_EXTRACT,
         STAGE_CONSOLIDATE,
         STAGE_CRITIQUE,
@@ -104,6 +108,7 @@ def test_missing_stages_lists_all_until_every_stage_ran():
     run.stages_done.update(
         {
             STAGE_INGEST,
+            STAGE_CONVENTIONS,
             STAGE_EXTRACT,
             STAGE_CONSOLIDATE,
             STAGE_CRITIQUE,
@@ -118,6 +123,7 @@ def test_commit_stage_is_not_required_before_commit():
     run.stages_done.update(
         {
             STAGE_INGEST,
+            STAGE_CONVENTIONS,
             STAGE_EXTRACT,
             STAGE_CONSOLIDATE,
             STAGE_CRITIQUE,

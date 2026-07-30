@@ -1,8 +1,8 @@
 """Stateful run-holder for the agent-driven staged capture (Phase 2).
 
 The deterministic capture runs ``run_requirements_pipeline`` as ONE atomic tool:
-all six stages execute back-to-back with no LLM reasoning between them. Phase 2
-splits that into six stage tools so the agent reasons BETWEEN stages (it sees
+all seven stages execute back-to-back with no LLM reasoning between them. Phase 2
+splits that into seven stage tools so the agent reasons BETWEEN stages (it sees
 intermediate counts, conflicts, verdicts and decides whether to continue or
 adjust). The holder carries the typed output of each stage so the next stage
 tool can consume it without re-running the previous one.
@@ -31,7 +31,7 @@ from pathlib import Path
 from backend.agents.pipelines.classification import ClassificationResult
 from backend.agents.pipelines.consolidation import ConsolidationResult
 from backend.agents.pipelines.critique import CritiqueResult
-from backend.agents.pipelines.extraction import RawRequirement
+from backend.agents.pipelines.extraction import DocumentRules, RawRequirement
 from backend.agents.pipelines.ingestion import StructureMap
 
 logger = logging.getLogger(__name__)
@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 # Stages a capture passes through, in order. commit_capture requires every
 # stage below (except commit itself) to have run before it persists.
 STAGE_INGEST = "ingest"
+STAGE_CONVENTIONS = "conventions"
 STAGE_EXTRACT = "extract"
 STAGE_CONSOLIDATE = "consolidate"
 STAGE_CRITIQUE = "critique"
@@ -52,6 +53,7 @@ DEFAULT_STAGE_CAP = 3
 
 _REQUIRED_BEFORE_COMMIT = (
     STAGE_INGEST,
+    STAGE_CONVENTIONS,
     STAGE_EXTRACT,
     STAGE_CONSOLIDATE,
     STAGE_CRITIQUE,
@@ -79,7 +81,7 @@ class StageLoopExceeded(Exception):
 
 @dataclass
 class CaptureRun:
-    """Mutable per-project state shared across the six stage tools.
+    """Mutable per-project state shared across the seven stage tools.
 
     Each field holds the typed output of one pipeline stage, mirroring the data
     flow of ``run_requirements_pipeline``. A stage tool writes its output here;
@@ -96,6 +98,8 @@ class CaptureRun:
     per_doc: list[tuple[list, StructureMap]] = field(default_factory=list)
     doc_texts: dict[str, str] = field(default_factory=dict)
     all_chunks: list = field(default_factory=list)
+    # CONVENTIONS output (merged per-doc DocumentRules; None until stage runs)
+    document_rules: DocumentRules | None = None
     # EXTRACT output
     extracted: list[RawRequirement] = field(default_factory=list)
     # CONSOLIDATE / CRITIQUE / CLASSIFY outputs
@@ -104,6 +108,9 @@ class CaptureRun:
     cls: ClassificationResult | None = None
     # COMMIT output
     committed_ids: list[int] = field(default_factory=list)
+    # Profiling: wall-clock (ms) per stage, accumulated across the six tools so
+    # commit_capture can relay the full breakdown on the `done` progress event.
+    timings: dict[str, float] = field(default_factory=dict)
     # Bookkeeping
     calls: dict[str, int] = field(default_factory=dict)
     stages_done: set[str] = field(default_factory=set)
@@ -132,11 +139,13 @@ class CaptureRun:
         self.per_doc = []
         self.doc_texts = {}
         self.all_chunks = []
+        self.document_rules = None
         self.extracted = []
         self.cons = None
         self.crit = None
         self.cls = None
         self.committed_ids = []
+        self.timings = {}
         self.stages_done.clear()
 
     def missing_stages_before_commit(self) -> list[str]:

@@ -8,18 +8,29 @@ execute agent-generated code (implementation/testing).
 
 Stage order (each consumes the previous stage's typed output):
 
-  1. INGEST     discover_documents -> ingest_document per doc -> chunks + smap
-                enrich_structure_map (LLM annotates sections)
-  2. EXTRACT    extract_all (multi-doc) + gap_pass (per doc) + implicit_pass
-  3. CONSOLIDATE  consolidate (exact + two-tier semantic dedup + contradictions)
-  4. CRITIQUE   critique_all (generator-critic loop, dangling pre-check)
-  5. CLASSIFY   classify_all (type + MoSCoW + optional decomposition)
-  6. PERSIST    RequirementItem rows (opaque REQ-XXXX codes, source JSON,
-                derived sub-items with parent_id)
+  1. INGEST       discover_documents -> ingest_document per doc -> chunks + smap
+                  enrich_structure_map (LLM annotates sections)
+  2. CONVENTIONS  extract_conventions per doc -> merge_conventions (priority
+                  legend, priority_field_label, scope markers, glossary). Pure
+                  fact extraction (verbatim); resolution happens in classify.
+                  Best-effort: failures degrade to verb-based defaults.
+  3. EXTRACT      extract_all (multi-doc, rules aware) + gap_pass + implicit_pass
+  4. CONSOLIDATE  consolidate (exact + two-tier semantic dedup + contradictions)
+  5. CRITIQUE     critique_all (generator-critic loop, rules aware, dangling
+                  pre-check)
+  6. CLASSIFY     classify_all (rules aware; PRIORITY: legend > scope > verb)
+  7. PERSIST      RequirementItem rows (opaque REQ-XXXX codes, source JSON,
+                  derived sub-items with parent_id)
 
-`on_progress` is an optional async callback (stage, message) the caller wires to
-SSE later (Paso 7b). It is the only outward-facing hook; everything else is a
-pure data transform feeding the next stage.
+`on_progress` is an optional async callback (stage, message, extra) the caller
+wires to SSE later (Paso 7b). It is the only outward-facing hook; everything
+else is a pure data transform feeding the next stage.
+
+Per-stage wall-clock is accumulated in `timings` (ms) and relayed on the
+`done` progress event (`{"phase": ..., "elapsed_ms": ...}` on each stage's
+start/end tick; the full `timings` dict + `total_ms` on `done`). It is purely
+observational — no optimization, no branch changes — so the caller can profile
+where time goes and aim the right acceleration lever.
 
 The function is exposed to the DeepAgent subagent as a single @tool (Paso 7b);
 it does not expose internal stage functions individually, so the LLM cannot
@@ -29,6 +40,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -48,11 +60,14 @@ from backend.agents.pipelines.consolidation import (
 )
 from backend.agents.pipelines.critique import CritiqueResult, critique_all
 from backend.agents.pipelines.extraction import (
+    DocumentRules,
     RawRequirement,
     enrich_structure_map,
     extract_all,
+    extract_conventions,
     gap_pass,
     implicit_pass,
+    merge_conventions,
 )
 from backend.agents.pipelines.ingestion import (
     StructureMap,
@@ -70,7 +85,7 @@ from backend.services._req_codes import gen_opaque_code
 
 logger = logging.getLogger(__name__)
 
-ProgressCb = Callable[[str, str], Awaitable[None]]
+ProgressCb = Callable[[str, str, dict | None], Awaitable[None]]
 EventCb = Callable[[str, dict], Awaitable[None]]
 
 
@@ -292,17 +307,20 @@ async def run_requirements_pipeline(
         project_id: DB project id (rows attach here).
         target: workspace path already resolved + traversal-safe. Caller's job.
         project_name / project_description: fed to the extractor for context.
-        on_progress: optional async (stage, message) hook for coarse stage
-            events (relayed as ``extraction.progress`` over SSE).
+        on_progress: optional async (stage, message, extra) hook for coarse
+            stage events (relayed as ``extraction.progress`` over SSE). The
+            optional ``extra`` dict carries per-stage timing (``phase``,
+            ``elapsed_ms``) and, on the ``done`` stage, the full ``timings``
+            dict + ``total_ms``.
         on_event: optional async (event_type, data) hook for fine-grained
             events: ``conflict.found`` (post-consolidate), ``validation.report``
             (post-critique) and ``requirement.added`` (per persisted row).
         session: optional session; if None a fresh AsyncSessionLocal is used.
     """
-    async def _emit(stage: str, msg: str) -> None:
+    async def _emit(stage: str, msg: str, extra: dict | None = None) -> None:
         if on_progress:
             try:
-                await on_progress(stage, msg)
+                await on_progress(stage, msg, extra)
             except Exception:
                 logger.exception("on_progress callback failed (stage=%s)", stage)
 
@@ -313,13 +331,19 @@ async def run_requirements_pipeline(
             except Exception:
                 logger.exception("on_event callback failed (type=%s)", event_type)
 
+    # Per-stage wall-clock (ms). A stage records its elapsed at its boundary and
+    # the final `done` tick carries the full dict + total so the UI can show a
+    # percentage breakdown of where time went.
+    timings: dict[str, float] = {}
+
     owns_session = session is None
     if owns_session:
         session = AsyncSessionLocal()
     assert session is not None
     try:
         # ---- 1. INGEST -----------------------------------------------------
-        await _emit("ingest", "discover")
+        await _emit("ingest", "discover", {"phase": "start"})
+        t_ingest = time.perf_counter()
         docs = discover_documents(target)
         await _emit("ingest", f"{len(docs)} documento(s)")
         if not docs:
@@ -341,14 +365,47 @@ async def run_requirements_pipeline(
             doc_texts[smap.document_id] = smap.full_text
             all_chunks.extend(chunks)
             await _emit("ingest", f"parseado {d.name}")
+        timings["ingest"] = (time.perf_counter() - t_ingest) * 1000
+        await _emit(
+            "ingest", "ingestión lista",
+            {"phase": "end", "elapsed_ms": round(timings["ingest"])},
+        )
 
-        # ---- 2. EXTRACT (multi-doc) + gap + implicit ----------------------
-        await _emit("extract", "extraccion")
+        # ---- 2. CONVENTIONS (per-doc legend + scope markers discovery) ---
+        # Best-effort: any failure degrades to empty rules -> consumers fall
+        # back to verb-based defaults. Never blocks the pipeline.
+        await _emit("conventions", "convenciones del documento", {"phase": "start"})
+        t_conv = time.perf_counter()
+        per_doc_rules: list[DocumentRules] = []
+        for chunks, smap in per_doc:
+            doc_rules = await extract_conventions(
+                smap,
+                project_name=project_name,
+                project_description=project_description,
+            )
+            per_doc_rules.append(doc_rules)
+        document_rules = merge_conventions(per_doc_rules)
+        timings["conventions"] = (time.perf_counter() - t_conv) * 1000
+        await _emit(
+            "conventions", "convenciones listas",
+            {
+                "phase": "end",
+                "elapsed_ms": round(timings["conventions"]),
+                "priority_legend_entries": len(document_rules.priority_legend),
+                "scope_markers": len(document_rules.scope_markers),
+                "has_priority_field_label": bool(document_rules.priority_field_label),
+            },
+        )
+
+        # ---- 3. EXTRACT (multi-doc) + gap + implicit ----------------------
+        await _emit("extract", "extraccion", {"phase": "start"})
+        t_extract = time.perf_counter()
         extracted = await extract_all(
             all_chunks,
             doc_texts=doc_texts,
             project_name=project_name,
             project_description=project_description,
+            rules=document_rules,
         )
         # Gap pass is per-document (signature takes one smap).
         for chunks, smap in per_doc:
@@ -368,10 +425,15 @@ async def run_requirements_pipeline(
         # explicit requirement is a reworded duplicate, not an assumption.
         implicits = drop_duplicit_implicit(implicits, extracted)
         extracted.extend(implicits)
-        await _emit("extract", f"{len(extracted)} items crudos")
+        timings["extract"] = (time.perf_counter() - t_extract) * 1000
+        await _emit(
+            "extract", f"{len(extracted)} items crudos",
+            {"phase": "end", "elapsed_ms": round(timings["extract"])},
+        )
 
-        # ---- 3. CONSOLIDATE ----------------------------------------------
-        await _emit("consolidate", "dedup + contradicciones")
+        # ---- 4. CONSOLIDATE ----------------------------------------------
+        await _emit("consolidate", "dedup + contradicciones", {"phase": "start"})
+        t_cons = time.perf_counter()
         cons: ConsolidationResult = await consolidate(extracted)
         # Conflictos detectados (soft): un evento por duplicado / contradicción.
         for dup in cons.duplicates:
@@ -389,25 +451,49 @@ async def run_requirements_pipeline(
                 "reason": pair.reason,
                 "confidence": pair.confidence,
             })
+        timings["consolidate"] = (time.perf_counter() - t_cons) * 1000
+        await _emit(
+            "consolidate", "consolidación lista",
+            {"phase": "end", "elapsed_ms": round(timings["consolidate"])},
+        )
 
-        # ---- 4. CRITIQUE --------------------------------------------------
-        await _emit("critique", "revision critica")
-        crit: CritiqueResult = await critique_all(cons.items)
+        # ---- 5. CRITIQUE --------------------------------------------------
+        await _emit("critique", "revision critica", {"phase": "start"})
+        t_crit = time.perf_counter()
+        crit: CritiqueResult = await critique_all(cons.items, rules=document_rules)
         await _emit_event("validation.report", {
             "total": len(cons.items),
             "kept": crit.stats.get("kept", len(crit.items)),
             "rejected": len(crit.rejected),
             "flagged": len(crit.flagged),
         })
+        timings["critique"] = (time.perf_counter() - t_crit) * 1000
+        await _emit(
+            "critique", "crítica lista",
+            {"phase": "end", "elapsed_ms": round(timings["critique"])},
+        )
 
-        # ---- 5. CLASSIFY --------------------------------------------------
-        await _emit("classify", "clasificacion")
-        cls: ClassificationResult = await classify_all(crit.items)
+        # ---- 6. CLASSIFY --------------------------------------------------
+        await _emit("classify", "clasificacion", {"phase": "start"})
+        t_cls = time.perf_counter()
+        cls: ClassificationResult = await classify_all(crit.items, rules=document_rules)
+        timings["classify"] = (time.perf_counter() - t_cls) * 1000
+        await _emit(
+            "classify", "clasificación lista",
+            {"phase": "end", "elapsed_ms": round(timings["classify"])},
+        )
 
-        # ---- 6. PERSIST ---------------------------------------------------
-        await _emit("persist", "guardando")
+        # ---- 7. PERSIST ---------------------------------------------------
+        await _emit("persist", "guardando", {"phase": "start"})
+        t_persist = time.perf_counter()
         ids = await _persist(session, project_id, crit.items, cls, on_event)
+        timings["persist"] = (time.perf_counter() - t_persist) * 1000
+        await _emit(
+            "persist", "persistencia lista",
+            {"phase": "end", "elapsed_ms": round(timings["persist"])},
+        )
 
+        total_ms = round(sum(timings.values()))
         stats = {
             "documents": [str(d) for d in docs],
             "raw_extracted": len(extracted),
@@ -418,8 +504,13 @@ async def run_requirements_pipeline(
             "critique": crit.stats,
             "classification": cls.stats,
             "sub_items": cls.stats.get("sub_items", 0),
+            "timings": timings,
+            "total_ms": total_ms,
         }
-        await _emit("done", f"{len(ids)} requerimientos")
+        await _emit(
+            "done", f"{len(ids)} requerimientos",
+            {"timings": timings, "total_ms": total_ms},
+        )
         return CaptureReport(
             documents=[str(d) for d in docs],
             item_ids=ids,

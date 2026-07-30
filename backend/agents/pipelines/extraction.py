@@ -71,6 +71,13 @@ class RawRequirement(BaseModel):
     rationale: str = ""           # set by the implicit pass
     span_verified: bool = False   # set by verify_spans
     status: str = "draft"         # draft | unverified | validated | ...
+    # Per-requirement priority value copied VERBATIM from the source (e.g.
+    # "Alta", "P1", "high") when the document carries an explicit priority
+    # convention. Empty string when no priority marker is present. The
+    # classifier (classification.py) resolves this hint against the run-level
+    # DocumentRules.priority_legend to assign MoSCoW. Never inferred from the
+    # obligation verb (debe/shall) — that path runs in classify when hint=="".
+    priority_hint: str = ""
 
 
 class ChunkExtraction(BaseModel):
@@ -114,6 +121,58 @@ class StructureMapAnnotation(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Document conventions (Component 1 of the CONVENTIONS stage).
+#
+# Pure factual schema — copies signals VERBATIM from the document with their
+# source_span. No MoSCoW resolution here (that happens per-item in classify, so
+# the basis lands in `rationale`). Anti-hallucination: any entry without a
+# source_span is dropped by the prompt itself; the structured schema enforces
+# the verbatim contract on the LLM.
+# ---------------------------------------------------------------------------
+
+class LegendEntry(BaseModel):
+    """One priority label declared by the document (VERBATIM, unresolved)."""
+    label: str = Field(
+        description="Priority label copied VERBATIM from the document "
+                    "(e.g. 'Alta', 'P1', 'high'). Do NOT resolve to MoSCoW.",
+    )
+    source_span: str = Field(
+        description="VERBATIM quote where this label appears (legend, header, "
+                    "or its definition). Must appear in the document exactly.",
+    )
+
+
+class DocumentRules(BaseModel):
+    """Run-level conventions extracted from the document corpus.
+
+    All fields are raw factual signals — the resolution to MoSCoW, scope, etc.
+    happens per-item in classification.py with these rules as context. Empty
+    defaults mean the document does not declare that convention.
+    """
+    priority_legend: list[LegendEntry] = Field(
+        default_factory=list,
+        description="Priority labels declared by the document (e.g. a legend "
+                    "'Alta = critical, Media = ...'). Empty if none.",
+    )
+    priority_field_label: str | None = Field(
+        default=None,
+        description="Name of the per-requirement labeled field that carries "
+                    "an explicit priority (e.g. 'Prioridad del requerimiento'). "
+                    "None when no such field exists.",
+    )
+    scope_markers: list[str] = Field(
+        default_factory=list,
+        description="Verbatim markers of out-of-scope / future items "
+                    "(e.g. 'fuera de alcance', 'fase 2'). Empty if none.",
+    )
+    glossary: dict[str, str] = Field(
+        default_factory=dict,
+        description="Terms defined in the document mapped to their definition. "
+                    "Activates the previously-dead smap.glossary channel.",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Prompts
 # ---------------------------------------------------------------------------
 
@@ -147,6 +206,17 @@ _EXTRACTOR_SYSTEM = (
     "- Do NOT infer implicit requirements here; those are a separate pass.\n"
     "- If the chunk is boilerplate (cover, TOC, references, legal) and contains "
     "no requirements, return items=[] and chunk_complete=true.\n"
+    "- PRIORITY HINT: if the document carries an explicit priority convention "
+    "(a labeled field per requirement, e.g. 'Prioridad del requerimiento: "
+    "Alta', or an inline marker like 'P1'), copy that value VERBATIM into "
+    "priority_hint. The convention name, when known, is provided in the "
+    "user message as PRIORITY_FIELD_LABEL. Copy the value only — do NOT "
+    "translate, normalize, or resolve it to MoSCoW. The obligation verbs "
+    "('debe', 'shall', 'should') do NOT count as priority hints. Leave "
+    "priority_hint empty when no explicit priority marker is attached to "
+    "the requirement.\n"
+    "- If the chunk is boilerplate (cover, TOC, references, legal) and contains "
+    "no requirements, return items=[] and chunk_complete=true.\n"
     + PREVENTION_RULES
     + "Return ONLY the structured object."
 )
@@ -170,6 +240,38 @@ _ANNOTATOR_SYSTEM = (
     "is_boilerplate (cover, TOC, glossary, references, legal). Also extract any "
     "glossary: terms explicitly defined in the document mapped to their "
     "definition. Return ONLY the structured object."
+)
+
+_CONVENTIONS_SYSTEM = (
+    "You discover the CLIENT'S OWN document conventions (the rules the client "
+    "embedded in the document itself). You read the document text and copy each "
+    "signal VERBATIM with its source_span. Do NOT interpret, normalize, or "
+    "resolve anything to MoSCoW — the downstream classifier does that with "
+    "your raw output as context.\n"
+    "Rules:\n"
+    "- LANGUAGE: copy every label, marker, and glossary term VERBATIM in the "
+    "SAME LANGUAGE as the source. Do NOT translate, summarize, or normalize. "
+    "A Spanish document yields Spanish labels; an English document yields "
+    "English labels.\n"
+    "- PRIORITY LEGEND: any legend, key, or definition that declares priority "
+    "labels (e.g. 'Alta = mandatory', 'P1 = critical', 'high = must'). Copy "
+    "each distinct label as one LegendEntry with its source_span. If the "
+    "document has no priority legend, return an empty list.\n"
+    "- PRIORITY FIELD LABEL: the NAME of the per-requirement labeled field "
+    "that carries an explicit priority, when one exists (e.g. 'Prioridad del "
+    "requerimiento', 'Priority', 'Criticité'). Copy the field name VERBATIM. "
+    "Set to null when requirements do not carry a per-item priority field.\n"
+    "- SCOPE MARKERS: verbatim phrases that mark items as out-of-scope or "
+    "future (e.g. 'fuera de alcance', 'fase 2', 'out of scope'). Copy each "
+    "distinct marker once. Empty list when none.\n"
+    "- GLOSSARY: terms explicitly defined in the document (e.g. in a "
+    "'Definiciones' / 'Glossary' section) mapped to their definition. Copy "
+    "the term and definition VERBATIM. Empty dict when the document has no "
+    "glossary.\n"
+    "- Anti-hallucination: every label, marker, and glossary entry MUST be "
+    "copied from the document text. Do NOT invent conventions the document "
+    "does not state. When unsure, return the empty value — never guess.\n"
+    "Return ONLY the structured object."
 )
 
 
@@ -227,14 +329,26 @@ async def extract_chunk(
     *,
     project_name: str,
     project_description: str,
+    rules: DocumentRules | None = None,
 ) -> ChunkExtraction:
-    """Extract explicit requirements from one chunk."""
+    """Extract explicit requirements from one chunk.
+
+    ``rules`` (optional) carries run-level conventions. When
+    ``rules.priority_field_label`` is set, it is surfaced in the user message
+    so the extractor knows which labeled field to read for ``priority_hint``.
+    Default None preserves the historical behavior.
+    """
     llm = _structured_llm(ChunkExtraction)
-    user = (
-        f"{_project_header(project_name, project_description)}\n"
-        f"SECTION: {chunk.section_path or '(unknown)'}\n\n"
-        f"CHUNK:\n{chunk.text}"
-    )
+    lines = [
+        f"{_project_header(project_name, project_description)}",
+        f"SECTION: {chunk.section_path or '(unknown)'}",
+    ]
+    if rules and rules.priority_field_label:
+        lines.append(
+            f"PRIORITY_FIELD_LABEL: {rules.priority_field_label}"
+        )
+    lines.append(f"CHUNK:\n{chunk.text}")
+    user = "\n".join(lines)
     result = await llm.ainvoke([("system", _EXTRACTOR_SYSTEM), ("human", user)])
     for it in result.items:
         it.document_id = chunk.document_id
@@ -250,12 +364,17 @@ async def extract_all(
     project_name: str,
     project_description: str,
     concurrency: int = 4,
+    rules: DocumentRules | None = None,
 ) -> list[RawRequirement]:
     """Extract across all chunks (multi-document safe), then verify spans.
 
     doc_texts maps document_id -> full parsed text (for span verification); one
     entry per source document. Concurrency is bounded to respect provider rate
     limits. Failed chunks are logged and skipped, never crash the batch.
+
+    ``rules`` (optional) is threaded into ``extract_chunk`` so the extractor
+    can populate ``RawRequirement.priority_hint`` from the document's labeled
+    priority field. Default None preserves the historical verb-only behavior.
     """
     sem = asyncio.Semaphore(max(1, concurrency))
 
@@ -266,6 +385,7 @@ async def extract_all(
                     c,
                     project_name=project_name,
                     project_description=project_description,
+                    rules=rules,
                 )
                 return res.items
             except Exception:
@@ -404,3 +524,98 @@ async def enrich_structure_map(
             node.req_likelihood = a.req_likelihood
             node.is_boilerplate = a.is_boilerplate
     smap.glossary.update(ann.glossary)
+
+
+# Maximum characters of smap.full_text fed to extract_conventions. The markdown
+# export is usually well under the LLM context window, but we cap defensively
+# to keep the conventions call bounded on huge documents. The head is kept
+# verbatim — definitional sections (legends, glossaries, scope statements)
+# typically live near the top of an SRS / RFP, so a head truncation preserves
+# the most informative part.
+_CONVENTIONS_TEXT_BUDGET = 24_000
+
+
+def _truncate_for_conventions(text: str) -> str:
+    """Head-biased truncation of the document markdown for the conventions call.
+
+    Definitional sections (priority legend, glossary, scope) usually sit near
+    the front of a client document, so truncating the tail is the safe side.
+    The budget is a character count (approx 6-8k tokens) well inside any
+    modern LLM context window.
+    """
+    if len(text) <= _CONVENTIONS_TEXT_BUDGET:
+        return text
+    return text[:_CONVENTIONS_TEXT_BUDGET]
+
+
+async def extract_conventions(
+    smap: StructureMap,
+    *,
+    project_name: str,
+    project_description: str,
+) -> DocumentRules:
+    """One LLM call per document that discovers the client's own conventions.
+
+    Reads ``smap.full_text`` (the markdown export that ``build_structure_map``
+    already produces) and asks the LLM to copy verbatim any priority legend,
+    per-requirement priority field label, scope markers, and glossary entries
+    the document declares. Returns a :class:`DocumentRules`.
+
+    Graceful degradation: any failure (LLM error, parse error, missing text)
+    returns an empty ``DocumentRules()``. This stage NEVER breaks the pipeline
+    — when no conventions are discovered, downstream consumers fall back to
+    the verb-based behavior (current day-1 path).
+    """
+    if not smap.full_text or not smap.full_text.strip():
+        return DocumentRules()
+
+    llm = _structured_llm(DocumentRules)
+    body = _truncate_for_conventions(smap.full_text)
+    user = (
+        f"{_project_header(project_name, project_description)}\n"
+        f"DOCUMENT TEXT (markdown export):\n{body}"
+    )
+    try:
+        rules = await llm.ainvoke(
+            [("system", _CONVENTIONS_SYSTEM), ("human", user)]
+        )
+    except Exception:
+        logger.exception(
+            "extract_conventions failed for %s; returning empty rules "
+            "(pipeline continues with verb-based defaults)",
+            smap.document_id,
+        )
+        return DocumentRules()
+    # Cache the per-doc rules on the smap so the orchestrator can read them
+    # without re-running the stage. Mutation in place, mirroring
+    # enrich_structure_map's contract.
+    smap.conventions = rules
+    return rules
+
+
+def merge_conventions(per_doc: list[DocumentRules]) -> DocumentRules:
+    """Deterministic merge of per-document rules into one run-level object.
+
+    Concatenates list/dict fields (legend, scope markers, glossary) and picks
+    the first non-None ``priority_field_label``. Pure data merge — no
+    deduplication, no inference. Order follows the input list (document order
+    at the caller) so the merged rules stay traceable to their source doc.
+    """
+    if not per_doc:
+        return DocumentRules()
+    merged_legend: list[LegendEntry] = []
+    merged_scope: list[str] = []
+    merged_glossary: dict[str, str] = {}
+    priority_field_label: str | None = None
+    for rules in per_doc:
+        merged_legend.extend(rules.priority_legend)
+        merged_scope.extend(rules.scope_markers)
+        merged_glossary.update(rules.glossary)
+        if priority_field_label is None and rules.priority_field_label:
+            priority_field_label = rules.priority_field_label
+    return DocumentRules(
+        priority_legend=merged_legend,
+        priority_field_label=priority_field_label,
+        scope_markers=merged_scope,
+        glossary=merged_glossary,
+    )

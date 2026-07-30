@@ -25,8 +25,16 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from backend.config import settings
+
+if TYPE_CHECKING:
+    # Forward-only import: DocumentRules lives in extraction.py, which itself
+    # imports from ingestion.py. The `from __future__ import annotations` at
+    # the top keeps the dataclass field annotation lazy, so this circular dep
+    # never resolves at runtime.
+    from backend.agents.pipelines.extraction import DocumentRules
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +122,12 @@ class StructureMap:
     glossary: dict[str, str] = field(default_factory=dict)   # LLM-filled later
     full_text: str = ""                # markdown export — input for verify_spans
     page_count: int = 0
+    # Per-document conventions discovered by extract_conventions (extraction.py).
+    # None until that stage runs; the merged run-level rules live in the
+    # orchestrator. The annotation is a forward ref (module uses
+    # `from __future__ import annotations`) so the import stays under
+    # TYPE_CHECKING and avoids a circular import at runtime.
+    conventions: "DocumentRules | None" = None  # type: ignore[name-defined]
 
 
 # ---------------------------------------------------------------------------
