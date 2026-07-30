@@ -19,6 +19,8 @@
   } from '$lib/api/srs';
   import { renderMarkdown } from '$lib/utils/markdown';
   import { srsRunning, srsStage, srsReady } from '$lib/stores/srs';
+  import RequirementForm from '$lib/components/RequirementForm.svelte';
+  import { getRequirement, type RequirementDetail } from '$lib/api/requirements';
 
   let {
     projectId,
@@ -43,6 +45,25 @@
   // trae el resumen; la lista completa vive en GET /quality (por proyecto).
   let findings = $state<Finding[] | null>(null);
   let findingsLoading = $state(false);
+  // Peek de un requerimiento desde un hallazgo de la pestana Calidad:
+  // fetchea el detalle localmente (sin tocar el store compartido
+  // selectedId) y lo muestra en un panel dentro del propio tab, sin
+  // salir de Calidad. Editar/guardar usa detail.id (no el store).
+  let peekedReq = $state<RequirementDetail | null>(null);
+  let peekLoading = $state(false);
+  let peekError = $state<string | null>(null);
+
+  async function peekRequirement(reqId: number): Promise<void> {
+    peekLoading = true;
+    peekError = null;
+    try {
+      peekedReq = await getRequirement(reqId);
+    } catch (e) {
+      peekError = (e as Error).message;
+    } finally {
+      peekLoading = false;
+    }
+  }
 
   let html = $derived(active?.markdown ? renderMarkdown(active.markdown) : '');
   let coverage = $derived((active?.coverage ?? {}) as Record<string, any>);
@@ -283,6 +304,31 @@
         {#if active.generated_by} · por {active.generated_by}{/if}
       </footer>
     {:else if tab === 'quality'}
+      {#if peekedReq}
+        <!-- Peek del requerimiento desde un hallazgo: detalle en el propio
+             tab de Calidad, sin navegar al explorer ni tocar el store. -->
+        <div
+          class="sticky top-0 z-10 flex items-center gap-2 border-b border-border bg-surface-2 px-3 py-1.5 text-xs"
+        >
+          <button
+            type="button"
+            class="font-mono text-text-dim hover:text-text"
+            onclick={() => (peekedReq = null)}
+            title="Volver a la lista de hallazgos"
+          >← hallazgos</button>
+          <span class="font-mono text-text">{peekedReq.code}</span>
+          {#if peekLoading}<span class="text-text-faint">cargando…</span>{/if}
+        </div>
+        {#if peekError}
+          <div class="m-3 p-2 border border-danger/40 bg-danger/5 text-danger text-xs font-mono">
+            ! {peekError}
+          </div>
+        {:else}
+          {#key peekedReq.id}
+            <div class="h-full"><RequirementForm detail={peekedReq} /></div>
+          {/key}
+        {/if}
+      {:else}
       <div class="p-4 max-w-4xl mx-auto space-y-4">
         <!-- Resumen -->
         <div class="flex flex-wrap gap-2 text-xs font-mono">
@@ -310,10 +356,15 @@
                   <span class="px-1.5 py-0.5 border {sevClass(f.severity)}">{f.severity}</span>
                   <span class="text-text-faint">{f.rule_id}</span>
                   <span class="text-text-dim">· {f.dimension}</span>
-                  {#if f.req_code}
-                    <span class="text-text-dim">· {f.req_code}</span>
-                  {:else if f.req_id !== null}
-                    <span class="text-text-dim">· req #{f.req_id}</span>
+                  {#if f.req_id !== null}
+                    <button
+                      type="button"
+                      class="text-text-dim hover:text-accent underline-offset-2 hover:underline"
+                      onclick={() => {
+                        if (f.req_id !== null) peekRequirement(f.req_id);
+                      }}
+                      title="Ver detalle del requerimiento"
+                    >· {f.req_code ?? '#' + f.req_id}</button>
                   {/if}
                   <span class="ml-auto text-text-faint uppercase">{f.status}</span>
                 </div>
@@ -326,6 +377,7 @@
           </ul>
         {/if}
       </div>
+      {/if}
     {:else if tab === 'coverage'}
       <div class="p-4 max-w-4xl mx-auto space-y-4">
         <!-- Totales -->
