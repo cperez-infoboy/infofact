@@ -2,7 +2,7 @@
   // Visor del SRS versionado (SrsDocument). Reemplaza la proyección on-the-fly:
   // cada /srs genera una versión CANDIDATE persistida, con análisis de calidad,
   // cobertura ISO 25010, goals (GORE) y matriz de trazabilidad. Se renderiza
-  // como overlay (botón SRS en +page.svelte), igual que antes.
+  // como view tab del FileViewer (botón SRS en +page.svelte -> openView('srs')).
   //
   // Pestañas: Documento (markdown snapshot) · Calidad (hallazgos) · Cobertura
   // (ISO 25010 + 29148) · Trazabilidad (goal <-> req <-> fuente). El progreso

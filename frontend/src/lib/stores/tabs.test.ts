@@ -145,6 +145,18 @@ describe('tabs store', () => {
     expect(active).toBe('requirements');
   });
 
+  it('openView crea el tab singleton de SRS y lo activa', async () => {
+    await openView('srs');
+    let list: any[] = [];
+    openTabs.subscribe((v) => (list = v))();
+    expect(list.filter((t) => t.kind === 'srs')).toHaveLength(1);
+    expect(list.find((t) => t.kind === 'srs')?.id).toBe('srs');
+    expect(list.find((t) => t.kind === 'srs')?.name).toBe('SRS');
+    let active = '';
+    activeTabId.subscribe((v) => (active = v ?? ''))();
+    expect(active).toBe('srs');
+  });
+
   it('openView no duplica: si el tab existe, solo lo activa', async () => {
     await openView('grouping');
     // Movemos el foco a un archivo para que la vista deje de ser la activa.

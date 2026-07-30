@@ -16,6 +16,7 @@
   import { currentProjectId } from '$lib/stores/project';
   import RequirementsExplorer from '$lib/components/RequirementsExplorer.svelte';
   import GroupingPlanPanel from '$lib/components/GroupingPlanPanel.svelte';
+  import SrsViewer from '$lib/components/SrsViewer.svelte';
 
   let { } = $props();
 
@@ -100,6 +101,8 @@
       <RequirementsExplorer projectId={$currentProjectId} />
     {:else if activeTab?.kind === 'grouping'}
       <GroupingPlanPanel projectId={$currentProjectId} />
+    {:else if activeTab?.kind === 'srs'}
+      <SrsViewer projectId={$currentProjectId} />
     {:else}
       <div
         class="h-full flex items-center justify-center text-text-dim text-sm font-mono"

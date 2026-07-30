@@ -9,7 +9,7 @@ import { currentProjectId } from '$lib/stores/project';
 
 export const MAX_TABS = 15;
 
-export type TabKind = 'file' | 'requirements' | 'grouping';
+export type TabKind = 'file' | 'requirements' | 'grouping' | 'srs';
 
 export interface FileTab {
   id: string; // === path
@@ -25,7 +25,7 @@ export interface FileTab {
 
 export interface ViewTab {
   id: string; // === kind (singleton: un solo tab por kind)
-  kind: 'requirements' | 'grouping';
+  kind: 'requirements' | 'grouping' | 'srs';
   name: string;
   lastActivated: number;
 }
@@ -36,9 +36,10 @@ export const openTabs = writable<Tab[]>([]);
 export const activeTabId = writable<string | null>(null);
 export const tabsError = writable<string | null>(null);
 
-const VIEW_NAMES: Record<'requirements' | 'grouping', string> = {
+const VIEW_NAMES: Record<'requirements' | 'grouping' | 'srs', string> = {
   requirements: 'Requerimientos',
-  grouping: 'Agrupamiento'
+  grouping: 'Agrupamiento',
+  srs: 'SRS'
 };
 
 function basename(p: string): string {
@@ -90,7 +91,9 @@ export async function openTab(path: string): Promise<boolean> {
 /** Abre una "vista" (no archivo): requerimientos o agrupamiento.
  *  Singleton por kind: si ya existe, solo la activa. No necesita proyecto
  *  para abrirse (el componente carga sus datos con el projectId que recibe). */
-export async function openView(kind: 'requirements' | 'grouping'): Promise<void> {
+export async function openView(
+  kind: 'requirements' | 'grouping' | 'srs'
+): Promise<void> {
   let existing: Tab | undefined;
   openTabs.subscribe((list) => {
     existing = list.find((t) => t.id === kind);
