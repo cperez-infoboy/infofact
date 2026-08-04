@@ -517,7 +517,7 @@ def make_requirements_tools(project_id: int) -> list:
     async def capture_status() -> dict:
         """Count existing requirements + grouping plans for THIS project.
 
-        Call this BEFORE run_requirements_capture. If requirements > 0, tell the
+        Call this BEFORE a capture. If requirements > 0, tell the
         user how many exist and the last code, then ask whether to reset
         everything or append. Never reset without explicit user confirmation.
         """
@@ -554,10 +554,12 @@ def make_requirements_tools(project_id: int) -> list:
 
     @tool
     async def reset_capture() -> dict:
-        """Delete ALL requirements + grouping plans for THIS project (hard).
+        """Delete ALL capture-derived data for THIS project (hard).
 
         Destructive and irreversible: removes every requirement, relation,
-        revision and grouping plan/group so the next capture starts fresh.
+        revision, grouping plan/group, quality finding, GORE goal + link,
+        and SRS document version so the next capture starts truly fresh
+        with no stale findings or orphan SRS versions.
         ONLY call this after the user explicitly confirmed they want
         to reset — never on your own initiative. When unsure, do NOT reset.
         """

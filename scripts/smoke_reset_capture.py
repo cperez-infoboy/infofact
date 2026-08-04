@@ -2,9 +2,10 @@
 
 Validates the reset path in isolation (no agent, no LLM, no pipeline):
 - Seeds requirements + a relation + a grouping plan with a group.
+- Seeds SRS quality findings, GORE goals + links, and an SRS document version.
 - Calls reset_project_capture.
 - Asserts every related table is empty for the project (items, relations,
-  revisions, plans, groups).
+  revisions, plans, groups, findings, goals, goal_links, srs_documents).
 - Asserts the reset is SCOPED: a second project's data survives untouched.
 - Asserts the store is empty after reset, and that add_requirement then
   produces a fresh opaque code.
@@ -23,6 +24,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import backend.models.project        # register tables on Base.metadata
 import backend.models.requirement
+import backend.models.srs
 from backend.models.base import Base
 from backend.models.project import Project
 from backend.models.requirement import (
@@ -33,6 +35,21 @@ from backend.models.requirement import (
     RequirementItem,
     RequirementRelation,
     RequirementRevision,
+)
+from backend.models.srs import (
+    FindingDimension,
+    FindingScope,
+    FindingSeverity,
+    FindingStatus,
+    Goal,
+    GoalKind,
+    GoalLink,
+    GoalStatus,
+    LinkRelation,
+    LinkStatus,
+    RequirementFinding,
+    SrsDocument,
+    SrsStatus,
 )
 from backend.services import requirement_store as store
 from backend.services._req_codes import OPAQUE_CODE_RE, gen_opaque_code
@@ -55,7 +72,10 @@ def check(label: str, ok: bool, detail: str = "") -> None:
 async def _seed_project(Session, name: str, slug: str) -> tuple[int, dict[str, int]]:
     """Create a project with 3 requirements + 1 relation + 1 grouping plan/group.
 
-    Returns (project_id, {"REQ-001": id, ...}).
+    Also seeds 2 quality findings, 1 goal + 1 goal-link, and 1 SRS document
+    version so the reset can prove it wipes ALL capture-derived data.
+
+    Returns (project_id, {"REQ-XXXX": id, ...}).
     """
     async with Session() as session:
         proj = Project(
@@ -99,6 +119,58 @@ async def _seed_project(Session, name: str, slug: str) -> tuple[int, dict[str, i
             confidence=0.91,
             decision=GroupDecision.PENDING,
         ))
+
+        # 2 quality findings on the keeper requirement.
+        session.add(RequirementFinding(
+            project_id=pid, req_id=keeper_id,
+            scope=FindingScope.ITEM,
+            dimension=FindingDimension.AMBIGUITY,
+            rule_id="smoke.ambiguity_1",
+            severity=FindingSeverity.BLOCKER,
+            message="termino ambiguo",
+            status=FindingStatus.OPEN,
+            detected_by="smoke",
+        ))
+        session.add(RequirementFinding(
+            project_id=pid, req_id=keeper_id,
+            scope=FindingScope.ITEM,
+            dimension=FindingDimension.INCOSE_RULE,
+            rule_id="smoke.incose_1",
+            severity=FindingSeverity.MAJOR,
+            message="violacion INCOSE",
+            status=FindingStatus.OPEN,
+            detected_by="smoke",
+        ))
+
+        # 1 GORE goal + 1 goal-link to the keeper.
+        goal = Goal(
+            project_id=pid, code="GOAL-SMK1",
+            statement="Autenticacion segura",
+            kind=GoalKind.FUNCTIONAL_GOAL,
+            status=GoalStatus.PROPOSED,
+            created_by="smoke",
+        )
+        session.add(goal)
+        await session.flush()
+        session.add(GoalLink(
+            goal_id=goal.id, req_id=keeper_id,
+            relation=LinkRelation.REALIZES,
+            status=LinkStatus.PROPOSED,
+            detected_by="smoke",
+        ))
+
+        # 1 SRS document version (CANDIDATE).
+        session.add(SrsDocument(
+            project_id=pid, version=1,
+            status=SrsStatus.CANDIDATE,
+            structure=[], narrative={}, markdown="# SRS smoke",
+            quality_summary={}, coverage={}, traceability={},
+            review_flags={},
+            requirement_codes=[c for c, _ in ordered],
+            requirement_count=len(ordered),
+            generated_by="smoke",
+        ))
+
         await session.commit()
         return pid, {code: rid for code, rid in ordered}
 
@@ -120,7 +192,8 @@ async def main() -> None:
     pid2, _ = await _seed_project(Session, "ResetB", "reset-b")
 
     print("\n== SEED ==")
-    print(f"  project {pid} (ResetA): 3 reqs, 1 relation, 1 plan/1 group")
+    print(f"  project {pid} (ResetA): 3 reqs, 1 relation, 1 plan/1 group,")
+    print(f"    2 findings, 1 goal+link, 1 SRS version")
     print(f"  project {pid2} (ResetB): same (must survive reset of ResetA)")
 
     print("\n== RESET ResetA ==")
@@ -129,20 +202,32 @@ async def main() -> None:
     print(f"  result = {result}")
     check(
         "reset devuelve counts correctos",
-        result == {"deleted_requirements": 3, "deleted_plans": 1},
+        result == {
+            "deleted_requirements": 3,
+            "deleted_plans": 1,
+            "deleted_findings": 2,
+            "deleted_goals": 1,
+            "deleted_srs_versions": 1,
+        },
         str(result),
     )
 
     print("\n== ASSERT vacio para ResetA ==")
     async with Session() as session:
         check("RequirementItem=0", await _count(session, RequirementItem, project_id=pid) == 0)
+        check("RequirementFinding=0", await _count(session, RequirementFinding, project_id=pid) == 0)
+        check("Goal=0", await _count(session, Goal, project_id=pid) == 0)
+        check("SrsDocument=0", await _count(session, SrsDocument, project_id=pid) == 0)
+        check("GroupingPlan=0", await _count(session, GroupingPlan, project_id=pid) == 0)
+        # GoalLink carries no project_id column, so the global count equals
+        # what ResetB (the un-reset project) still owns: 1 link.
+        check("GoalLink: solo ResetB (1)", await _count(session, GoalLink) == 1)
         # Relation/Revision/Group carry no project_id column, so the global
         # count equals what ResetB (the un-reset project) still owns: 1
         # relation, 3 revisions (one per seeded requirement), 1 group. ResetA
         # contributed zero survivors -- that is what these checks validate.
         check("Relation: solo ResetB (1)", await _count(session, RequirementRelation) == 1)
         check("Revision: solo ResetB (3)", await _count(session, RequirementRevision) == 3)
-        check("GroupingPlan=0", await _count(session, GroupingPlan, project_id=pid) == 0)
         check("Group: solo ResetB (1)", await _count(session, GroupingGroup) == 1)
 
     print("\n== ASSERT scoped: ResetB intacto ==")
@@ -151,6 +236,12 @@ async def main() -> None:
         check("ResetB conserva sus 3 requerimientos", n == 3, f"got {n}")
         np = await _count(session, GroupingPlan, project_id=pid2)
         check("ResetB conserva su plan", np == 1, f"got {np}")
+        nf = await _count(session, RequirementFinding, project_id=pid2)
+        check("ResetB conserva sus 2 findings", nf == 2, f"got {nf}")
+        ng = await _count(session, Goal, project_id=pid2)
+        check("ResetB conserva su goal", ng == 1, f"got {ng}")
+        ns = await _count(session, SrsDocument, project_id=pid2)
+        check("ResetB conserva su SRS", ns == 1, f"got {ns}")
 
     print("\n== ASSERT store vacio -> proximo codigo opaco fresco ==")
     async with Session() as session:

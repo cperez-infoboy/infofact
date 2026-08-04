@@ -1,80 +1,31 @@
-"""Orchestrates the requirements-capture pipeline end-to-end (plan §1, §9.6).
+"""Persistence + reset helpers for the agent-driven requirements capture.
 
-Host-side only: Docling (parser), embeddings (sentence-transformers), the Z.ai
-LLM calls, and SQLite all run in the FastAPI process. Documents are read from
-the workspace path (a host-side bind mount), never via the DockerSandbox. This
-matches Decision 1 of CLAUDE.md — the sandbox is reserved for phases that
-execute agent-generated code (implementation/testing).
+Host-side only: the Z.ai LLM calls and SQLite run in the FastAPI process.
+Documents are read from the workspace path (a host-side bind mount), never via
+the DockerSandbox (Decision 1 of CLAUDE.md). The capture itself is driven
+stage-by-stage by the ``requirements-capture-agent`` subagent; this module owns
+only the DB-touching pieces it reuses:
 
-Stage order (each consumes the previous stage's typed output):
+  - ``_persist``              write RequirementItem rows (opaque REQ-XXXX codes,
+                              derived sub-items, requirement.added events)
+  - ``reset_project_capture`` wipe every requirement + grouping row (start over)
 
-  1. INGEST       discover_documents -> ingest_document per doc -> chunks + smap
-                  enrich_structure_map (LLM annotates sections)
-  2. CONVENTIONS  extract_conventions per doc -> merge_conventions (priority
-                  legend, priority_field_label, scope markers, glossary). Pure
-                  fact extraction (verbatim); resolution happens in classify.
-                  Best-effort: failures degrade to verb-based defaults.
-  3. EXTRACT      extract_all (multi-doc, rules aware) + gap_pass + implicit_pass
-  4. CONSOLIDATE  consolidate (exact + two-tier semantic dedup + contradictions)
-  5. CRITIQUE     critique_all (generator-critic loop, rules aware, dangling
-                  pre-check)
-  6. CLASSIFY     classify_all (rules aware; PRIORITY: legend > scope > verb)
-  7. PERSIST      RequirementItem rows (opaque REQ-XXXX codes, source JSON,
-                  derived sub-items with parent_id)
-
-`on_progress` is an optional async callback (stage, message, extra) the caller
-wires to SSE later (Paso 7b). It is the only outward-facing hook; everything
-else is a pure data transform feeding the next stage.
-
-Per-stage wall-clock is accumulated in `timings` (ms) and relayed on the
-`done` progress event (`{"phase": ..., "elapsed_ms": ...}` on each stage's
-start/end tick; the full `timings` dict + `total_ms` on `done`). It is purely
-observational — no optimization, no branch changes — so the caller can profile
-where time goes and aim the right acceleration lever.
-
-The function is exposed to the DeepAgent subagent as a single @tool (Paso 7b);
-it does not expose internal stage functions individually, so the LLM cannot
-skip a stage.
+The end-to-end orchestration that used to live here
+(``run_requirements_pipeline``) was removed when the deterministic capture was
+consolidated into the single agent-driven path.
 """
 from __future__ import annotations
 
-import asyncio
 import logging
-import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
-from pathlib import Path
 
-from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.agents.pipelines.classification import (
     ClassificationDecision,
     ClassificationResult,
-    classify_all,
 )
-from backend.agents.pipelines.consolidation import (
-    ConsolidationResult,
-    consolidate,
-    drop_duplicit_implicit,
-)
-from backend.agents.pipelines.critique import CritiqueResult, critique_all
-from backend.agents.pipelines.extraction import (
-    DocumentRules,
-    RawRequirement,
-    enrich_structure_map,
-    extract_all,
-    extract_conventions,
-    gap_pass,
-    implicit_pass,
-    merge_conventions,
-)
-from backend.agents.pipelines.ingestion import (
-    StructureMap,
-    discover_documents,
-    ingest_document,
-)
-from backend.database import AsyncSessionLocal
+from backend.agents.pipelines.extraction import RawRequirement
 from backend.models.requirement import (
     Priority,
     ReqStatus,
@@ -85,20 +36,7 @@ from backend.services._req_codes import gen_opaque_code
 
 logger = logging.getLogger(__name__)
 
-ProgressCb = Callable[[str, str, dict | None], Awaitable[None]]
 EventCb = Callable[[str, dict], Awaitable[None]]
-
-
-@dataclass
-class CaptureReport:
-    """End-to-end result of a /captura run."""
-    documents: list[str] = field(default_factory=list)
-    item_ids: list[int] = field(default_factory=list)
-    stats: dict = field(default_factory=dict)
-    duplicates: list = field(default_factory=list)     # soft (proposed merges)
-    contradictions: list = field(default_factory=list)  # soft (proposed conflicts)
-    flagged: list[str] = field(default_factory=list)    # critic residual flags
-    rejected: list[str] = field(default_factory=list)    # critic hallucination drops
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +133,7 @@ async def _persist(
             source=_source_from_raw(it),
             explicit=it.explicit,
             derived=False,
+            explicit_priority=bool((it.priority_hint or "").strip()),
             confidence=it.confidence,
             span_verified=it.span_verified,
             acceptance_criteria=[],
@@ -235,6 +174,7 @@ async def _persist(
                 source=inherited,
                 explicit=False,
                 derived=True,
+                explicit_priority=bool((it.priority_hint or "").strip()),
                 parent_id=parent_id,
                 confidence=it.confidence,
                 span_verified=it.span_verified,
@@ -265,261 +205,48 @@ async def _persist(
 async def reset_project_capture(
     session: AsyncSession, project_id: int
 ) -> dict:
-    """Wipe every requirement + grouping row for a project (start over).
+    """Wipe ALL capture-derived data for a project (start over).
 
-    Deletes grouping plans FIRST (their groups reference requirement_items via
-    keeper_id), then requirements (relations, revisions, items) — dependency
-    order, so it is correct whether or not SQLite enforces the CASCADE pragma.
+    Deletes in dependency order so it is correct whether or not SQLite enforces
+    the CASCADE pragma:
 
-    Single transaction: the store helpers flush but do not commit, so this
-    commit is atomic. After it the old rows are gone, so the next capture
-    allocates fresh opaque codes with nothing reserved.
+    1. Goal-links (FK to goals + requirement_items)
+    2. Goals
+    3. SRS findings (FK to requirement_items)
+    4. SRS document versions
+    5. Grouping plans (FK keeper_id -> requirement_items)
+    6. Requirements (relations, revisions, items)
+
+    After this the project is truly clean: the next capture allocates fresh
+    opaque codes, the quality tab shows no stale findings, and no orphan SRS
+    versions reference recycled requirement IDs.
 
     Destructive and irreversible — callers (the reset_capture agent tool) must
     gate this behind explicit user confirmation.
     """
     from backend.services.requirement_store import delete_all_requirements
     from backend.services.grouping_store import delete_all_plans
+    from backend.services.srs_store import (
+        delete_all_findings,
+        delete_all_goals,
+        delete_all_srs,
+    )
 
+    goals = await delete_all_goals(session, project_id)
+    findings = await delete_all_findings(session, project_id)
+    srs = await delete_all_srs(session, project_id)
     plans = await delete_all_plans(session, project_id)
     reqs = await delete_all_requirements(session, project_id)
     await session.commit()
     logger.info(
-        "reset_project_capture(project_id=%s): deleted %d requirement(s), %d plan(s)",
-        project_id, reqs, plans,
+        "reset_project_capture(project_id=%s): deleted %d requirement(s), "
+        "%d plan(s), %d finding(s), %d goal(s), %d SRS version(s)",
+        project_id, reqs, plans, findings, goals, srs,
     )
-    return {"deleted_requirements": reqs, "deleted_plans": plans}
-
-
-async def run_requirements_pipeline(
-    project_id: int,
-    target: Path,
-    *,
-    project_name: str = "",
-    project_description: str = "",
-    on_progress: ProgressCb | None = None,
-    on_event: EventCb | None = None,
-    session: AsyncSession | None = None,
-) -> CaptureReport:
-    """Run the full capture pipeline over the documents under `target`.
-
-    Args:
-        project_id: DB project id (rows attach here).
-        target: workspace path already resolved + traversal-safe. Caller's job.
-        project_name / project_description: fed to the extractor for context.
-        on_progress: optional async (stage, message, extra) hook for coarse
-            stage events (relayed as ``extraction.progress`` over SSE). The
-            optional ``extra`` dict carries per-stage timing (``phase``,
-            ``elapsed_ms``) and, on the ``done`` stage, the full ``timings``
-            dict + ``total_ms``.
-        on_event: optional async (event_type, data) hook for fine-grained
-            events: ``conflict.found`` (post-consolidate), ``validation.report``
-            (post-critique) and ``requirement.added`` (per persisted row).
-        session: optional session; if None a fresh AsyncSessionLocal is used.
-    """
-    async def _emit(stage: str, msg: str, extra: dict | None = None) -> None:
-        if on_progress:
-            try:
-                await on_progress(stage, msg, extra)
-            except Exception:
-                logger.exception("on_progress callback failed (stage=%s)", stage)
-
-    async def _emit_event(event_type: str, data: dict) -> None:
-        if on_event:
-            try:
-                await on_event(event_type, data)
-            except Exception:
-                logger.exception("on_event callback failed (type=%s)", event_type)
-
-    # Per-stage wall-clock (ms). A stage records its elapsed at its boundary and
-    # the final `done` tick carries the full dict + total so the UI can show a
-    # percentage breakdown of where time went.
-    timings: dict[str, float] = {}
-
-    owns_session = session is None
-    if owns_session:
-        session = AsyncSessionLocal()
-    assert session is not None
-    try:
-        # ---- 1. INGEST -----------------------------------------------------
-        await _emit("ingest", "discover", {"phase": "start"})
-        t_ingest = time.perf_counter()
-        docs = discover_documents(target)
-        await _emit("ingest", f"{len(docs)} documento(s)")
-        if not docs:
-            return CaptureReport(stats={"error": "no_documents", "input": 0})
-
-        per_doc: list[tuple[list, StructureMap]] = []
-        doc_texts: dict[str, str] = {}
-        all_chunks = []
-        for d in docs:
-            # ingest_document is sync (Docling) — run off the event loop.
-            chunks, smap = await asyncio.to_thread(ingest_document, d)
-            # enrich_structure_map mutates smap in place (returns None).
-            await enrich_structure_map(
-                smap,
-                project_name=project_name,
-                project_description=project_description,
-            )
-            per_doc.append((chunks, smap))
-            doc_texts[smap.document_id] = smap.full_text
-            all_chunks.extend(chunks)
-            await _emit("ingest", f"parseado {d.name}")
-        timings["ingest"] = (time.perf_counter() - t_ingest) * 1000
-        await _emit(
-            "ingest", "ingestión lista",
-            {"phase": "end", "elapsed_ms": round(timings["ingest"])},
-        )
-
-        # ---- 2. CONVENTIONS (per-doc legend + scope markers discovery) ---
-        # Best-effort: any failure degrades to empty rules -> consumers fall
-        # back to verb-based defaults. Never blocks the pipeline.
-        await _emit("conventions", "convenciones del documento", {"phase": "start"})
-        t_conv = time.perf_counter()
-        per_doc_rules: list[DocumentRules] = []
-        for chunks, smap in per_doc:
-            doc_rules = await extract_conventions(
-                smap,
-                project_name=project_name,
-                project_description=project_description,
-            )
-            per_doc_rules.append(doc_rules)
-        document_rules = merge_conventions(per_doc_rules)
-        timings["conventions"] = (time.perf_counter() - t_conv) * 1000
-        await _emit(
-            "conventions", "convenciones listas",
-            {
-                "phase": "end",
-                "elapsed_ms": round(timings["conventions"]),
-                "priority_legend_entries": len(document_rules.priority_legend),
-                "scope_markers": len(document_rules.scope_markers),
-                "has_priority_field_label": bool(document_rules.priority_field_label),
-            },
-        )
-
-        # ---- 3. EXTRACT (multi-doc) + gap + implicit ----------------------
-        await _emit("extract", "extraccion", {"phase": "start"})
-        t_extract = time.perf_counter()
-        extracted = await extract_all(
-            all_chunks,
-            doc_texts=doc_texts,
-            project_name=project_name,
-            project_description=project_description,
-            rules=document_rules,
-        )
-        # Gap pass is per-document (signature takes one smap).
-        for chunks, smap in per_doc:
-            gaps = await gap_pass(
-                chunks, smap, extracted,
-                project_name=project_name,
-                project_description=project_description,
-            )
-            extracted.extend(gaps)
-        implicits = await implicit_pass(
-            all_chunks,
-            doc_texts=doc_texts,
-            project_name=project_name,
-            project_description=project_description,
-        )
-        # Drop false implicits: an item whose source_span already backs an
-        # explicit requirement is a reworded duplicate, not an assumption.
-        implicits = drop_duplicit_implicit(implicits, extracted)
-        extracted.extend(implicits)
-        timings["extract"] = (time.perf_counter() - t_extract) * 1000
-        await _emit(
-            "extract", f"{len(extracted)} items crudos",
-            {"phase": "end", "elapsed_ms": round(timings["extract"])},
-        )
-
-        # ---- 4. CONSOLIDATE ----------------------------------------------
-        await _emit("consolidate", "dedup + contradicciones", {"phase": "start"})
-        t_cons = time.perf_counter()
-        cons: ConsolidationResult = await consolidate(extracted)
-        # Conflictos detectados (soft): un evento por duplicado / contradicción.
-        for dup in cons.duplicates:
-            await _emit_event("conflict.found", {
-                "kind": "duplicate",
-                "kept_id": dup.kept_id,
-                "member_ids": dup.member_ids,
-                "kept_statement": dup.kept_statement,
-            })
-        for pair in cons.contradictions:
-            await _emit_event("conflict.found", {
-                "kind": "contradiction",
-                "a_id": pair.a_id,
-                "b_id": pair.b_id,
-                "reason": pair.reason,
-                "confidence": pair.confidence,
-            })
-        timings["consolidate"] = (time.perf_counter() - t_cons) * 1000
-        await _emit(
-            "consolidate", "consolidación lista",
-            {"phase": "end", "elapsed_ms": round(timings["consolidate"])},
-        )
-
-        # ---- 5. CRITIQUE --------------------------------------------------
-        await _emit("critique", "revision critica", {"phase": "start"})
-        t_crit = time.perf_counter()
-        crit: CritiqueResult = await critique_all(cons.items, rules=document_rules)
-        await _emit_event("validation.report", {
-            "total": len(cons.items),
-            "kept": crit.stats.get("kept", len(crit.items)),
-            "rejected": len(crit.rejected),
-            "flagged": len(crit.flagged),
-        })
-        timings["critique"] = (time.perf_counter() - t_crit) * 1000
-        await _emit(
-            "critique", "crítica lista",
-            {"phase": "end", "elapsed_ms": round(timings["critique"])},
-        )
-
-        # ---- 6. CLASSIFY --------------------------------------------------
-        await _emit("classify", "clasificacion", {"phase": "start"})
-        t_cls = time.perf_counter()
-        cls: ClassificationResult = await classify_all(crit.items, rules=document_rules)
-        timings["classify"] = (time.perf_counter() - t_cls) * 1000
-        await _emit(
-            "classify", "clasificación lista",
-            {"phase": "end", "elapsed_ms": round(timings["classify"])},
-        )
-
-        # ---- 7. PERSIST ---------------------------------------------------
-        await _emit("persist", "guardando", {"phase": "start"})
-        t_persist = time.perf_counter()
-        ids = await _persist(session, project_id, crit.items, cls, on_event)
-        timings["persist"] = (time.perf_counter() - t_persist) * 1000
-        await _emit(
-            "persist", "persistencia lista",
-            {"phase": "end", "elapsed_ms": round(timings["persist"])},
-        )
-
-        total_ms = round(sum(timings.values()))
-        stats = {
-            "documents": [str(d) for d in docs],
-            "raw_extracted": len(extracted),
-            "after_consolidate": cons.stats.get("after_semantic", len(cons.items)),
-            "after_critique": crit.stats.get("kept", len(crit.items)),
-            "persisted": len(ids),
-            "consolidation": cons.stats,
-            "critique": crit.stats,
-            "classification": cls.stats,
-            "sub_items": cls.stats.get("sub_items", 0),
-            "timings": timings,
-            "total_ms": total_ms,
-        }
-        await _emit(
-            "done", f"{len(ids)} requerimientos",
-            {"timings": timings, "total_ms": total_ms},
-        )
-        return CaptureReport(
-            documents=[str(d) for d in docs],
-            item_ids=ids,
-            stats=stats,
-            duplicates=cons.duplicates,
-            contradictions=cons.contradictions,
-            flagged=crit.flagged,
-            rejected=crit.rejected,
-        )
-    finally:
-        if owns_session:
-            await session.close()
+    return {
+        "deleted_requirements": reqs,
+        "deleted_plans": plans,
+        "deleted_findings": findings,
+        "deleted_goals": goals,
+        "deleted_srs_versions": srs,
+    }

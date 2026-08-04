@@ -280,6 +280,83 @@ async def replace_findings(
     return rows
 
 
+async def delete_all_findings(
+    session: AsyncSession, project_id: int
+) -> int:
+    """Hard-delete every quality finding for a project.
+
+    Wipes ``requirement_findings`` so the SRS quality tab does not show stale
+    findings pointing to requirement IDs that were recycled after a capture
+    reset. Does NOT commit; the caller owns the transaction. Returns the count.
+    """
+    count = await session.scalar(
+        select(func.count()).select_from(RequirementFinding).where(
+            RequirementFinding.project_id == project_id
+        )
+    )
+    total = int(count or 0)
+    if total:
+        await session.execute(
+            delete(RequirementFinding).where(
+                RequirementFinding.project_id == project_id
+            )
+        )
+        await session.flush()
+    return total
+
+
+async def delete_all_goals(
+    session: AsyncSession, project_id: int
+) -> int:
+    """Hard-delete every GORE goal + goal-link for a project.
+
+    Goal-links reference both goals and requirement_items, so they must be
+    wiped alongside goals to avoid orphans after a capture reset. Does NOT
+    commit; the caller owns the transaction. Returns the goal count.
+    """
+    goal_ids = select(Goal.id).where(Goal.project_id == project_id)
+    await session.execute(
+        delete(GoalLink).where(GoalLink.goal_id.in_(goal_ids))
+    )
+    count = await session.scalar(
+        select(func.count()).select_from(Goal).where(
+            Goal.project_id == project_id
+        )
+    )
+    total = int(count or 0)
+    if total:
+        await session.execute(
+            delete(Goal).where(Goal.project_id == project_id)
+        )
+        await session.flush()
+    return total
+
+
+async def delete_all_srs(
+    session: AsyncSession, project_id: int
+) -> int:
+    """Hard-delete every SRS document version for a project.
+
+    Wipes ``srs_documents`` so stale versions with frozen requirement codes
+    and traceability matrices do not survive a capture reset. Does NOT commit;
+    the caller owns the transaction. Returns the version count.
+    """
+    count = await session.scalar(
+        select(func.count()).select_from(SrsDocument).where(
+            SrsDocument.project_id == project_id
+        )
+    )
+    total = int(count or 0)
+    if total:
+        await session.execute(
+            delete(SrsDocument).where(
+                SrsDocument.project_id == project_id
+            )
+        )
+        await session.flush()
+    return total
+
+
 async def set_finding_status(
     session: AsyncSession,
     finding_id: int,
