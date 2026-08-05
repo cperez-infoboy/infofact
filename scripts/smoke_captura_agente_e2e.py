@@ -58,12 +58,33 @@ def _install_stubs() -> dict:
 
     mod._resolve_target = lambda ws, sub: Path("/tmp/ws/docs")
     mod.discover_documents = lambda t: [Path("rfp.pdf")]
-    mod.ingest_document = lambda d: (["c1", "c2", "c3"], smap)
+    async def _parse_cached(d, *, session=None, parser_hint="auto"):
+        return (["c1", "c2", "c3"], smap)
+    mod.parse_document_cached = _parse_cached
+    # Fase C: parser_hint_map consulta la DB por hints por-documento; stub {}
+    # para que ingest_documents no toque la DB real en el smoke.
+    async def _hint_map(project_id, workspace_root):
+        return {}
+    mod.parser_hint_map = _hint_map
 
     async def _enrich(s, **kw):
         return None
 
     mod.enrich_structure_map = _enrich
+
+    async def _extract_conventions(smap, **kw):
+        return types.SimpleNamespace(
+            priority_legend=[], priority_field_label=None,
+            scope_markers=[], glossary={})
+
+    mod.extract_conventions = _extract_conventions
+
+    def _merge_conventions(per_doc):
+        return types.SimpleNamespace(
+            priority_legend=[], priority_field_label=None,
+            scope_markers=[], glossary={})
+
+    mod.merge_conventions = _merge_conventions
 
     async def _extract_all(chunks, **kw):
         return [types.SimpleNamespace(id=f"r{i}") for i in range(4)]
@@ -91,7 +112,7 @@ def _install_stubs() -> dict:
 
     mod.consolidate = _consolidate
 
-    async def _critique_all(items):
+    async def _critique_all(items, **kw):
         return types.SimpleNamespace(
             items=list(items), rejected=[], flagged=[],
             stats={"kept": len(items)},
@@ -99,7 +120,7 @@ def _install_stubs() -> dict:
 
     mod.critique_all = _critique_all
 
-    async def _classify_all(items):
+    async def _classify_all(items, **kw):
         return types.SimpleNamespace(decisions={}, stats={"sub_items": 2})
 
     mod.classify_all = _classify_all
@@ -131,19 +152,22 @@ async def main() -> None:
     check("ingest stores chunks", run.all_chunks == ["c1", "c2", "c3"], out_ingest)
     check("ingest reports total_chunks", out_ingest.get("total_chunks") == 3, out_ingest)
 
-    out_ext = await tools[1].ainvoke({})
+    out_conv = await tools[1].ainvoke({})  # discover_conventions
+    check("conventions stores rules", holder.get_run(PROJECT_ID).document_rules is not None, out_conv)
+
+    out_ext = await tools[2].ainvoke({})
     check("extract stores raw items", len(holder.get_run(PROJECT_ID).extracted) == 4, out_ext)
 
-    out_cons = await tools[2].ainvoke({})
+    out_cons = await tools[3].ainvoke({})
     check("consolidate proposes 1 duplicate", out_cons.get("duplicates") == 1, out_cons)
 
-    out_crit = await tools[3].ainvoke({})
+    out_crit = await tools[4].ainvoke({})
     check("critique reports kept=count", out_crit.get("kept") == 4, out_crit)
 
-    out_cls = await tools[4].ainvoke({})
+    out_cls = await tools[5].ainvoke({})
     check("classify reports sub_items", out_cls.get("sub_items") == 2, out_cls)
 
-    out_commit = await tools[5].ainvoke({})
+    out_commit = await tools[6].ainvoke({})
     check("commit persisted count", out_commit.get("persisted") == 4, out_commit)
     check("commit persisted crit items", len(captured.get("items", [])) == 4, captured)
     check("commit cleared active run", holder.get_run(PROJECT_ID) is None)
@@ -151,10 +175,10 @@ async def main() -> None:
     # Commit gate: a fresh partial run (ingest only) must be rejected.
     holder.clear_run(PROJECT_ID)
     await tools[0].ainvoke({"target_subpath": ""})
-    out_gate = await tools[5].ainvoke({})
+    out_gate = await tools[6].ainvoke({})
     check("commit gate rejects missing stages", out_gate.get("error") == "missing_stages", out_gate)
     check("gate lists missing in pipeline order",
-          out_gate.get("missing") == ["extract", "consolidate", "critique", "classify"], out_gate)
+          out_gate.get("missing") == ["conventions", "extract", "consolidate", "critique", "classify"], out_gate)
 
     # Up-front existing-data guard (now in ingest_documents): existing reqs +
     # on_existing="ask" -> pending_confirmation BEFORE parsing (no holder).

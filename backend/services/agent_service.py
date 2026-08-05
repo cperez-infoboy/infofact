@@ -28,9 +28,6 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from backend.agents.llm import build_llm
 from backend.agents.sandboxes.docker_sandbox import DockerSandbox
 from backend.agents.tools import fetch_url, web_search
-from backend.agents.subagents.requirements_capture import (
-    make_requirements_capture_subagent,
-)
 from backend.agents.subagents.requirements_capture_agent import (
     make_requirements_capture_agent_subagent,
 )
@@ -44,7 +41,7 @@ PHASE_PROMPTS: dict[str, str] = {
         "Eres el orquestador de la fase de requerimientos de InfoFact. "
         "Trabajas en el workspace del proyecto y DELEGAS el trabajo pesado a "
         "subagentes especializados mediante la tool `task`:\n"
-        "- `/captura_agente`: extrae y cura requerimientos desde documentos "
+        "- `/captura`: extrae y cura requerimientos desde documentos "
         "(subagente `requirements-capture-agent`). Los requerimientos se "
         "persisten como filas tipadas (RequirementItem), NO como Markdown.\n"
         "- `/srs`: sintetiza el SRS de alta calidad a partir de los "
@@ -54,7 +51,12 @@ PHASE_PROMPTS: dict[str, str] = {
         "Tienes herramientas de LECTURA para inspeccionar requerimientos, el "
         "SRS, su calidad, cobertura, goals y trazabilidad sin delegar. "
         "Responde en español neutro. No escribas el SRS a mano: el subagente "
-        "`srs-agent` lo genera y persiste a partir de los requerimientos."
+        "`srs-agent` lo genera y persiste a partir de los requerimientos. "
+        "Tienes tools de LECTURA sobre los documentos fuente del proyecto "
+        "(`list_documents`, `search_documents`, `get_document_section`, "
+        "`get_document_passage`): usalas para verificar un requerimiento "
+        "contra su fuente, localizar un tema o citar un pasaje literal. No "
+        "reemplazan la delegacion de la captura al subagente."
     ),
 }
 
@@ -133,21 +135,13 @@ def build_agent(
         if project_description:
             header += f" Descripción: {project_description}"
         system_prompt = header + "\n\n" + system_prompt
-    # Requirements phase gets the capture subagent: a thin orchestrator that
-    # owns the deterministic pipeline + the editing tools. project_id is closed
-    # over so the model cannot address another project's rows. Built per request
-    # alongside the agent (same lifecycle as the sandbox).
+    # Requirements phase gets the agent-driven capture subagent: a staged
+    # orchestrator that reasons the capture stage by stage and owns the editing
+    # tools. project_id is closed over so the model cannot address another
+    # project's rows. Built per request alongside the agent (same lifecycle as
+    # the sandbox).
     subagents: list[Any] = []
     if phase == "requirements" and project_id is not None:
-        subagents.append(
-            make_requirements_capture_subagent(
-                project_id=project_id,
-                profile=profile,
-                project_slug=project_slug,
-                project_name=project_name or "",
-                project_description=project_description or "",
-            )
-        )
         subagents.append(
             make_requirements_capture_agent_subagent(
                 project_id=project_id,
@@ -179,6 +173,8 @@ def build_agent(
         orchestrator_tools.extend(make_requirements_read_tools(project_id))
         from backend.agents.tools.srs_tools import make_srs_read_tools
         orchestrator_tools.extend(make_srs_read_tools(project_id))
+        from backend.agents.tools.documents_tools import make_document_read_tools
+        orchestrator_tools.extend(make_document_read_tools(project_id))
 
     return create_deep_agent(
         model=_build_model(),

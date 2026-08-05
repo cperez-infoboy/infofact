@@ -1,11 +1,10 @@
-"""Stateful run-holder for the agent-driven staged capture (Phase 2).
+"""Stateful run-holder for the agent-driven staged capture.
 
-The deterministic capture runs ``run_requirements_pipeline`` as ONE atomic tool:
-all seven stages execute back-to-back with no LLM reasoning between them. Phase 2
-splits that into seven stage tools so the agent reasons BETWEEN stages (it sees
-intermediate counts, conflicts, verdicts and decides whether to continue or
-adjust). The holder carries the typed output of each stage so the next stage
-tool can consume it without re-running the previous one.
+The capture is split into seven stage tools so the agent reasons BETWEEN stages
+(it sees intermediate counts, conflicts, verdicts and decides whether to
+continue or adjust) instead of running them back-to-back with no LLM reasoning
+between them. The holder carries the typed output of each stage so the next
+stage tool can consume it without re-running the previous one.
 
 The holder is in-process, keyed by ``project_id`` (one active capture per
 project). It is created by ``ingest_documents`` only AFTER the up-front
@@ -84,7 +83,7 @@ class CaptureRun:
     """Mutable per-project state shared across the seven stage tools.
 
     Each field holds the typed output of one pipeline stage, mirroring the data
-    flow of ``run_requirements_pipeline``. A stage tool writes its output here;
+    flow of the capture pipeline. A stage tool writes its output here;
     the next stage reads it. ``commit_capture`` is the only writer to the DB and
     it reads ``crit`` + ``cls`` (both populated by prior stages).
     """

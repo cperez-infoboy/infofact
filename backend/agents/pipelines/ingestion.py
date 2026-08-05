@@ -526,25 +526,32 @@ def build_structure_map(doc, *, document_id: str) -> StructureMap:
 # Entry point
 # ---------------------------------------------------------------------------
 
-def ingest_document(path: Path) -> tuple[list[Chunk], StructureMap]:
-    """Full ingestion of one document: element-aware chunks + structural map.
+def _parse_plaintext(path: Path):
+    """Rama plaintext como ``ParsedDoc`` (para el router, Fase C)."""
+    from backend.agents.parsers.base import ParsedDoc
 
-    Plaintext skips Docling; everything else goes through the layout parser.
-    When vision is configured, images (standalone or embedded) are also
-    described semantically and appended as ``image_description`` chunks.
+    document_id = str(path)
+    chunks = _chunk_plaintext(path, document_id)
+    smap = StructureMap(
+        document_id=document_id,
+        sections=[SectionNode(id=path.name, title=path.name, level=1,
+                              page=None)],
+        full_text=chunks[0].text if chunks else "",
+    )
+    return ParsedDoc(chunks=chunks, smap=smap, parser_used="plaintext")
+
+
+def _parse_docling(path: Path):
+    """Rama Docling como ``ParsedDoc`` (para el router, Fase C).
+
+    Reproduce exactamente la logica previa de ``ingest_document`` (convert +
+    chunk + vision + structure map); el router la elige para born-digital y como
+    fallback de GLM-OCR.
     """
+    from backend.agents.parsers.base import ParsedDoc
+
     document_id = str(path)
     suffix = path.suffix.lower()
-    if suffix in PLAINTEXT_EXTENSIONS:
-        chunks = _chunk_plaintext(path, document_id)
-        smap = StructureMap(
-            document_id=document_id,
-            sections=[SectionNode(id=path.name, title=path.name, level=1,
-                                  page=None)],
-            full_text=chunks[0].text if chunks else "",
-        )
-        return chunks, smap
-
     doc = convert_document(path)
     chunks = chunk_document(doc, document_id=document_id)
     if _vision_enabled():
@@ -553,4 +560,18 @@ def ingest_document(path: Path) -> tuple[list[Chunk], StructureMap]:
         else:
             chunks.extend(_describe_embedded_pictures(doc, document_id))
     smap = build_structure_map(doc, document_id=document_id)
-    return chunks, smap
+    return ParsedDoc(chunks=chunks, smap=smap, parser_used="docling")
+
+
+def ingest_document(path: Path, *, parser_hint: str = "auto") -> tuple[list[Chunk], StructureMap]:
+    """Full ingestion of one document: element-aware chunks + structural map.
+
+    Delega al router de parsers (Fase C): Docling por defecto, GLM-OCR para PDFs
+    escaneados / tablas rotadas (si esta habilitado). ``parser_hint``
+    (``auto`` | ``docling`` | ``glm-ocr``) pisa la heuristica. Mantiene la firma
+    2-tuple para ``smoke_ingestion.py`` y compatibilidad con call sites previos.
+    """
+    from backend.agents.parsers.router import parse_document
+
+    parsed = parse_document(path, parser_hint)
+    return parsed.chunks, parsed.smap

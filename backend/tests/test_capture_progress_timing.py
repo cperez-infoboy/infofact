@@ -38,7 +38,7 @@ def _capturing_writer(sink: list) -> "object":
 
 def test_emit_progress_merges_extra_into_data():
     """El ``extra`` (phase/elapsed_ms/timings) se fusiona en ``data``."""
-    from backend.agents.subagents.requirements_capture import _make_emitters
+    from backend.agents.subagents.requirements_capture_agent import _make_emitters
 
     sink: list = []
     with patch(
@@ -65,7 +65,7 @@ def test_emit_progress_merges_extra_into_data():
 
 def test_emit_progress_without_extra_is_backward_compatible():
     """La llamada de 2 argumentos (sin ``extra``) no añade claves al ``data``."""
-    from backend.agents.subagents.requirements_capture import _make_emitters
+    from backend.agents.subagents.requirements_capture_agent import _make_emitters
 
     sink: list = []
     with patch(
@@ -85,7 +85,7 @@ def test_emit_progress_without_extra_is_backward_compatible():
 
 def test_emit_progress_silent_outside_graph_context():
     """Sin contexto de grafo, el emisor no rompe ni escribe nada."""
-    from backend.agents.subagents.requirements_capture import _make_emitters
+    from backend.agents.subagents.requirements_capture_agent import _make_emitters
 
     # Forzamos el mismo comportamiento que get_stream_writer fuera de contexto:
     # levanta -> el emisor lo atrapa y retorna None silenciosamente.
@@ -105,7 +105,7 @@ def test_emit_progress_silent_outside_graph_context():
 
 def test_done_event_carries_full_timings_dict():
     """La etapa ``done`` emite el dict ``timings`` completo + ``total_ms``."""
-    from backend.agents.subagents.requirements_capture import _make_emitters
+    from backend.agents.subagents.requirements_capture_agent import _make_emitters
 
     sink: list = []
     timings = {

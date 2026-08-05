@@ -36,6 +36,8 @@ export interface ProgressEvent {
   elapsed_ms?: number;
   timings?: Record<string, number>;
   total_ms?: number;
+  current?: number;
+  total?: number;
 }
 
 /** Fine event: one per duplicate or contradiction (conflict.found). */
@@ -244,9 +246,6 @@ export async function streamMessage(
 }
 
 function dispatchEvent(ev: ParsedEvent, handlers: StreamHandlers): void {
-  // DEBUG: ver todos los eventos SSE que llegan del backend.
-  // Quitar tras diagnosticar el flujo del subagente.
-  console.log('[sse] event', ev.event, ev.data);
   let payload: Record<string, unknown> = {};
   try {
     payload = JSON.parse(ev.data);
@@ -286,6 +285,10 @@ function dispatchEvent(ev: ParsedEvent, handlers: StreamHandlers): void {
             : undefined,
         total_ms:
           typeof payload.total_ms === 'number' ? payload.total_ms : undefined,
+        current:
+          typeof payload.current === 'number' ? payload.current : undefined,
+        total:
+          typeof payload.total === 'number' ? payload.total : undefined,
       });
       break;
     case 'conflict.found':

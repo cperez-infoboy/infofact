@@ -27,6 +27,8 @@ async def lifespan(app: FastAPI):
     # `migrate_projects_slug` agrega la columna `slug` a `projects` si falta y
     # la backfilla desde `name` usando slugify + sufijos -2/-3 para colisiones.
     await migrate_projects_slug()
+    await migrate_project_documents_parser_hint()
+    await migrate_requirement_explicit_priority()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
@@ -132,6 +134,81 @@ async def migrate_projects_slug() -> None:
             )
 
 
+async def migrate_project_documents_parser_hint() -> None:
+    """Agrega ``project_documents.parser_hint`` si falta (default ``'auto'``).
+
+    Idempotente: si la columna ya existe, no hace nada. Corre antes de
+    ``create_all`` para que este encuentre el esquema actualizado. SQLite
+    backfilldea las filas existentes con el DEFAULT de la columna.
+    """
+    from sqlalchemy import inspect, text
+
+    log = logging.getLogger(__name__)
+
+    async with engine.begin() as conn:
+        def _columns(sync_conn):
+            inspector = inspect(sync_conn)
+            if "project_documents" not in inspector.get_table_names():
+                return None
+            return {c["name"] for c in inspector.get_columns("project_documents")}
+
+        columns = await conn.run_sync(_columns)
+        if columns is None:
+            return
+        if "parser_hint" in columns:
+            log.info(
+                "migrate_project_documents_parser_hint: columna ya presente, skipping"
+            )
+            return
+        log.info(
+            "migrate_project_documents_parser_hint: agregando columna parser_hint"
+        )
+        await conn.execute(
+            text(
+                "ALTER TABLE project_documents "
+                "ADD COLUMN parser_hint VARCHAR(16) DEFAULT 'auto'"
+            )
+        )
+
+
+async def migrate_requirement_explicit_priority() -> None:
+    """Add ``requirement_items.explicit_priority`` if missing (default false).
+
+    Idempotent: no-op when the column exists. Runs before ``create_all``.
+    Existing rows backfill to false — their priority origin (explicit vs
+    verb-inferred) was not tracked historically, so they are treated as
+    inferred until a fresh capture repopulates the flag.
+    """
+    from sqlalchemy import inspect, text
+
+    log = logging.getLogger(__name__)
+
+    async with engine.begin() as conn:
+        def _columns(sync_conn):
+            inspector = inspect(sync_conn)
+            if "requirement_items" not in inspector.get_table_names():
+                return None
+            return {c["name"] for c in inspector.get_columns("requirement_items")}
+
+        columns = await conn.run_sync(_columns)
+        if columns is None:
+            return
+        if "explicit_priority" in columns:
+            log.info(
+                "migrate_requirement_explicit_priority: column already present, skipping"
+            )
+            return
+        log.info(
+            "migrate_requirement_explicit_priority: adding column explicit_priority"
+        )
+        await conn.execute(
+            text(
+                "ALTER TABLE requirement_items "
+                "ADD COLUMN explicit_priority BOOLEAN DEFAULT 0"
+            )
+        )
+
+
 app = FastAPI(title="InfoFact", lifespan=lifespan)
 
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
@@ -150,6 +227,9 @@ from backend.routers import srs as srs_router
 app.include_router(srs_router.router, prefix="/api", tags=["srs"])
 # Explorar / editar archivos del workspace del usuario.
 app.include_router(workspaces.router, prefix="/api/workspaces", tags=["workspaces"])
+# Documentos fuente del proyecto: upload binario + scan + CRUD (Fase A ingesta).
+from backend.routers import documents as documents_router
+app.include_router(documents_router.router, prefix="/api/documents", tags=["documents"])
 
 
 @app.get("/health")

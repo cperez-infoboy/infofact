@@ -128,9 +128,9 @@ def _sanitize_error(exc: Exception) -> str:
     return f"{name}: {msg}" if msg else name
 
 
-# Comando /captura: estrategiaA del plan §9.3 — el router reescribe el slash
-# command como directiva fuerte al subagente requirements-capture. Sin arg =
-# proyecto completo; con arg = subpath relativo al workspace.
+# Comando /captura: el router reescribe el slash command como directiva al
+# subagente agentico requirements-capture-agent. Sin arg = proyecto completo;
+# con arg = steering del usuario (subpath, foco).
 _CAPTURA_PREFIX = "/captura"
 _AGRUPAR_PREFIX = "/agrupar"
 # /captura_agente MUST be matched before /captura: "/captura_agente"
@@ -179,26 +179,6 @@ def _is_capture_command(content: str) -> bool:
     )
 
 
-def _extract_decision_and_subpath(rest: str) -> tuple[str, str | None]:
-    """Separa la decision reset/append del subpath en el argumento de /captura.
-
-    Quita el marcador de decision del texto para no tratarlo como un path (p.
-    ej. "/captura resetear" -> subpath="", decision="reset").
-    """
-    low = rest.lower()
-    for marker in _RESET_MARKERS:
-        idx = low.find(marker)
-        if idx >= 0:
-            sub = (rest[:idx] + rest[idx + len(marker) :]).strip().lstrip("/").strip()
-            return sub, "reset"
-    for marker in _APPEND_MARKERS:
-        idx = low.find(marker)
-        if idx >= 0:
-            sub = (rest[:idx] + rest[idx + len(marker) :]).strip().lstrip("/").strip()
-            return sub, "append"
-    return rest.strip().lstrip("/").strip(), None
-
-
 async def _capture_gate_message(project_id: int, content: str) -> str | None:
     """Guardia router-level (inviolable) para captura sobre datos existentes.
 
@@ -211,7 +191,7 @@ async def _capture_gate_message(project_id: int, content: str) -> str | None:
         return None
     if _user_existing_decision(content) is not None:
         return None
-    from backend.agents.subagents.requirements_capture import _count_existing
+    from backend.agents.subagents.requirements_capture_agent import _count_existing
 
     existing = await _count_existing(project_id)
     n = existing.get("requirements", 0)
@@ -226,8 +206,8 @@ async def _capture_gate_message(project_id: int, content: str) -> str | None:
         "requerimientos y agrupamientos y empezar de cero (irreversible).\n"
         "- Reenvia el comando con **agregar a los existentes** para conservarlos "
         "y sumar los nuevos.\n\n"
-        "Ejemplo: `/captura_agente resetear` o "
-        "`/captura_agente agregar a los existentes`. Puedes repetir tus "
+        "Ejemplo: `/captura resetear` o "
+        "`/captura agregar a los existentes`. Puedes repetir tus "
         "instrucciones de captura junto con la decision."
     )
 
@@ -299,7 +279,7 @@ def _srs_directive(user_instructions: str) -> str:
         "cobertura de goals) -> commit_srs (persiste un SrsDocument CANDIDATE). "
         "La cobertura DEBE ir después de goals (depende de ellos). Si no hay "
         "requerimientos vivos, el subagente lo informará: el usuario debe "
-        "capturar primero con /captura_agente. Cuando termine, reporta al "
+        "capturar primero con /captura. Cuando termine, reporta al "
         "usuario: versión generada, requerimientos incluidos, hallazgos por "
         "severidad, gaps de cobertura y goals inferidos."
     )
@@ -331,8 +311,9 @@ def _rewrite_command(content: str) -> str:
     if stripped.startswith(_AGRUPAR_PREFIX):
         # /agrupar no toma argumentos: review_grouping lee todo el store vivo.
         return (
-            "[DIRECTIVE] Delega al subagente `requirements-capture` para revisar "
-            "el agrupamiento de duplicados del store de requerimientos. Invoca la "
+            "[DIRECTIVE] Delega al subagente `requirements-capture-agent` para "
+            "revisar el agrupamiento de duplicados del store de requerimientos. "
+            "Invoca la "
             "tool `review_grouping` para generar un plan de agrupamiento editable "
             "(lo escribe bajo .infofact/grouping-plans/ y lo devuelve para mostrar "
             "al usuario). NO apliques el plan todavía: muéstralo y espera a que el "
@@ -360,29 +341,14 @@ def _rewrite_command(content: str) -> str:
 
     if not stripped.startswith(_CAPTURA_PREFIX):
         return content
-    # Acepta "/captura docs/x" (formato del plan §9.4) y "/captura/docs/x"
-    # (sin espacio); normaliza barra inicial. El subpath es siempre relativo
-    # al workspace, nunca absoluto. Si el texto trae una decision sobre los
-    # datos existentes (reset/append), se propaga como on_existing; si no,
-    # on_existing="ask" (solo frena si hay datos, pero la guardia router-level
-    # ya impidio llegar aca con datos previos sin decision explicita).
-    rest = stripped[len(_CAPTURA_PREFIX):].strip().lstrip("/")
-    subpath, decision = _extract_decision_and_subpath(rest)
-    if subpath:
-        target_clause = f' target_subpath="{subpath}"'
-    else:
-        target_clause = ' target_subpath="" (proyecto completo)'
-    on_existing = decision or "ask"
-    return (
-        "[DIRECTIVE] Delega al subagente `requirements-capture` para ejecutar la "
-        "captura y validación de requerimientos del proyecto. Invoca la tool "
-        f"`run_requirements_capture` con{target_clause} y "
-        f'on_existing="{on_existing}". Cuando termine, reporta al usuario: '
-        "documentos procesados, total extraído, duplicados propuestos, "
-        "contradicciones detectadas, items marcados para revisión y items "
-        "rechazados por alucinación. Luego ofrece ayudar a editar, fusionar o "
-        "aprobar los requerimientos."
+    # /captura rutea al mismo subagente agentico que /captura_agente. El texto
+    # tras el comando es steering libre del usuario (subpath, foco, decision
+    # reset/append); _captura_agente_directive propaga la decision explicita y
+    # embebe el resto como INSTRUCCIONES DEL USUARIO.
+    _user_instructions = (
+        stripped[len(_CAPTURA_PREFIX):].strip().lstrip("/").strip()
     )
+    return _captura_agente_directive(_user_instructions)
 
 
 @router.post("/sessions/{session_id}/messages")

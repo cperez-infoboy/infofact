@@ -94,6 +94,12 @@ class DockerSandbox(BaseSandbox):
         """
         normalized = os.path.normpath(path)
         if os.path.isabs(normalized):
+            # Allow /tmp as ephemeral container storage for scripts and temp
+            # files. It does not cross the inter-project boundary that
+            # _safe_path protects; the agent already has shell access via
+            # execute(), so this does not expand the attack surface.
+            if normalized == "/tmp" or normalized.startswith("/tmp/"):
+                return normalized
             if normalized == self.workspace_root:
                 return "."
             if normalized.startswith(self.workspace_root + "/"):

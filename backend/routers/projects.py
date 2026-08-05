@@ -448,6 +448,29 @@ async def get_session_detail(
                 session_id,
             )
 
+    # Restaurar el contenido original del usuario: el checkpointer guarda el
+    # mensaje reescrito por _rewrite_command (directiva), no el texto original
+    # (e.g. /captura). Superponemos el contenido de ChatMessage posicionalmente:
+    # cada HumanMessage en el checkpointer viene de un POST que persistió en
+    # ChatMessage antes del stream, así que el match posicional es 1:1.
+    if items:
+        async with AsyncSessionLocal() as db:
+            user_rows = (
+                await db.execute(
+                    select(ChatMessage)
+                    .where(
+                        ChatMessage.session_id == session_id,
+                        ChatMessage.role == "user",
+                    )
+                    .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+                )
+            ).scalars().all()
+        user_idx = 0
+        for item in items:
+            if item.get("role") == "user" and user_idx < len(user_rows):
+                item["content"] = user_rows[user_idx].content
+                user_idx += 1
+
     # Fallback: thread inexistente (sesión nueva sin turnos del agente) o
     # fallo de reconstrucción. Conserva compatibilidad con sesiones que solo
     # tienen prompts de usuario persistidos.

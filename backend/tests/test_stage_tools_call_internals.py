@@ -1,10 +1,9 @@
-"""Phase 2: each stage tool calls the correct internal pipeline function.
+"""Each stage tool calls the correct internal pipeline function.
 
-Pins that splitting the atomic ``run_requirements_pipeline`` into seven staged
-tools did NOT change WHICH hardened function runs at each stage -- the
-guardrails (verify_spans, dedup thresholds, critique sentinel) still live
-inside those functions and are reached verbatim. Each pipeline function is
-stubbed and we assert the tool stores its typed output on the per-project
+Pins that the seven staged tools call the same hardened function per stage --
+the guardrails (verify_spans, dedup thresholds, critique sentinel) live inside
+those functions and are reached verbatim. Each pipeline function is stubbed
+and we assert the tool stores its typed output on the per-project
 ``CaptureRun`` and returns a compact summary. No DB / no LLM / no graph
 context: the emitters are no-ops outside a LangGraph run (see
 ``_make_emitters``).
@@ -53,8 +52,9 @@ def _stub_pipeline(monkeypatch, calls: dict) -> None:
         calls["discover"] = True
         return [Path("doc1.pdf")]
 
-    def fake_ingest(doc):
+    async def fake_ingest(doc, *, session=None, parser_hint="auto"):
         calls["ingest_document"] = True
+        calls["ingest_parser_hint"] = parser_hint
         return [["chunk-1", "chunk-2"], smap]
 
     async def fake_enrich(s, **kw):
@@ -112,7 +112,7 @@ def _stub_pipeline(monkeypatch, calls: dict) -> None:
 
     monkeypatch.setattr(mod, "_resolve_target", fake_resolve)
     monkeypatch.setattr(mod, "discover_documents", fake_discover)
-    monkeypatch.setattr(mod, "ingest_document", fake_ingest)
+    monkeypatch.setattr(mod, "parse_document_cached", fake_ingest)
     monkeypatch.setattr(mod, "enrich_structure_map", fake_enrich)
     monkeypatch.setattr(mod, "extract_conventions", fake_extract_conventions)
     monkeypatch.setattr(mod, "merge_conventions", fake_merge_conventions)
@@ -128,6 +128,11 @@ def _stub_pipeline(monkeypatch, calls: dict) -> None:
     async def fake_count(project_id):
         return {"requirements": 0, "grouping_plans": 0, "last_code": None}
     monkeypatch.setattr(mod, "_count_existing", fake_count)
+    # Fase C: parser_hint_map consulta la DB por hints por-documento; stub a {}
+    # para que ingest_documents no toque la DB real en los tests.
+    async def fake_hint_map(project_id, workspace_root):
+        return {}
+    monkeypatch.setattr(mod, "parser_hint_map", fake_hint_map)
 
 
 @pytest.fixture

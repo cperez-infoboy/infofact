@@ -130,6 +130,22 @@
       {/if}
     </div>
 
+    <!-- Termómetro de progreso por ítem (cuando la etapa reporta current/total) -->
+    {#if $captureRunning && $captureStage?.current != null && $captureStage?.total != null && $captureStage.total > 0}
+      {@const pct = Math.round(($captureStage.current / $captureStage.total) * 100)}
+      <div class="flex items-center gap-2">
+        <div class="relative flex-1 h-2 rounded-sm bg-surface-2 overflow-hidden">
+          <div
+            class="absolute inset-y-0 left-0 bg-accent transition-all duration-300"
+            style="width: {pct}%"
+          ></div>
+        </div>
+        <span class="font-mono text-text-faint text-[10px] shrink-0 w-16 text-right">
+          {$captureStage.current}/{$captureStage.total}
+        </span>
+      </div>
+    {/if}
+
     <!-- Contadores en vivo -->
     <div class="flex flex-wrap gap-x-4 gap-y-1 font-mono">
       <span class="text-text">

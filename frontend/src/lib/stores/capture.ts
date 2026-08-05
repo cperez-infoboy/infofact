@@ -28,7 +28,7 @@ export const validationReport = writable<ValidationReport | null>(null);
 /** Requerimientos persistidos, en orden de llegada. */
 export const addedRequirements = writable<RequirementAdded[]>([]);
 
-/** True mientras corre la tool run_requirements_capture. */
+/** True mientras corre la captura (etapas ingest..commit). */
 export const captureRunning = writable<boolean>(false);
 
 /** Wall-clock (ms) por etapa. Se llena con los eventos phase:"end" y se

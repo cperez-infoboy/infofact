@@ -138,6 +138,11 @@ class RequirementItem(Base):
     source: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     explicit: Mapped[bool] = mapped_column(Boolean, default=True)
     derived: Mapped[bool] = mapped_column(Boolean, default=False)
+    # True when the MoSCoW priority came from an EXPLICIT client declaration in
+    # the document (non-empty priority_hint), not from obligation-verb inference.
+    # Grouping uses it so an explicitly-prioritized item wins as keeper over an
+    # inferred duplicate (even if the inferred MoSCoW is "higher").
+    explicit_priority: Mapped[bool] = mapped_column(Boolean, default=False)
     # Decomposition parent: operational sub-requirements keep parent_id.
     parent_id: Mapped[int | None] = mapped_column(
         ForeignKey("requirement_items.id", ondelete="SET NULL"), nullable=True

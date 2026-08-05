@@ -45,6 +45,8 @@ from backend.agents.pipelines._resilience import (
     BATCH_MAX_TOKENS,
     _BATCH_PARSE_RETRIES,
     BatchStats,
+    DEFAULT_CONCURRENCY,
+    transient_backoff_seconds,
 )
 from backend.agents.pipelines._resilience import is_transient as _is_transient
 from backend.agents.pipelines._quality_rules import PREVENTION_RULES
@@ -52,8 +54,6 @@ from backend.agents.pipelines.extraction import DocumentRules, RawRequirement
 from backend.models.requirement import Priority, ReqType
 
 logger = logging.getLogger(__name__)
-
-DEFAULT_CONCURRENCY = 4
 
 _CLASSIFY_ATTEMPTS = 3        # parse-failure retries before the sentinel fallback
 
@@ -229,14 +229,27 @@ _RATE_LIMITED_PREFIX = "[rate_limited]"
 def _format_conventions_block(rules: DocumentRules | None) -> str:
     """Build the DOCUMENT_CONVENTIONS USER-message block for the classifier.
 
-    Surfaces the document's priority legend (verbatim labels) and scope
-    markers so the PRIORITY precedence (legend > verb, scope -> WONT) has the
-    real client signals available. Returns an empty string when the document
-    declares neither — the historical user message is then untouched.
+    Surfaces the document's per-requirement priority field label, priority
+    legend (verbatim labels), and scope markers so the PRIORITY precedence
+    (explicit field value > legend > obligation verb, scope -> WONT) resolves
+    against the real client signals. Returns an empty string when the document
+    declares none of these — the historical user message is then untouched.
     """
-    if not rules or (not rules.priority_legend and not rules.scope_markers):
+    if not rules or (
+        not rules.priority_legend
+        and not rules.scope_markers
+        and not rules.priority_field_label
+    ):
         return ""
     parts: list[str] = ["DOCUMENT_CONVENTIONS:"]
+    if rules.priority_field_label:
+        parts.append(
+            f"- Priority field label: {rules.priority_field_label!r}. When the "
+            f"item's statement or source_span carries this field with a value "
+            f"(e.g. Alta/Media/Baja, High/Medium/Low, P1/P2/P3), set MoSCoW "
+            f"from THAT value (high -> Must, medium -> Should, low -> "
+            f"Could/Wont). This takes PRECEDENCE over obligation-verb inference."
+        )
     if rules.priority_legend:
         labels = ", ".join(repr(e.label) for e in rules.priority_legend)
         parts.append(
@@ -341,7 +354,7 @@ async def _classify_item(
                 transient_fails += 1
                 if transient_fails >= transient_retries:
                     return _rate_limit_decision(item.id, transient_fails, exc)
-                wait = min(2 ** transient_fails, 60)  # exp backoff, cap 60s
+                wait = transient_backoff_seconds(transient_fails)
                 logger.warning(
                     "classify transient %s for %s; backoff %.1fs (%d/%d)",
                     type(exc).__name__, item.id, wait,
@@ -442,7 +455,7 @@ async def _classify_batch(
                     )
                     stats.fallback += len(fallback)
                     return fallback, stats
-                wait = min(2 ** transient_fails, 60)
+                wait = transient_backoff_seconds(transient_fails)
                 logger.warning(
                     "classify batch transient %s; backoff %.1fs (%d/%d)",
                     type(exc).__name__, wait, transient_fails, _TRANSIENT_RETRIES,
@@ -532,7 +545,7 @@ async def _decompose_item(item: RawRequirement) -> list[DecomposedItem]:
                         item.id, transient_fails, type(exc).__name__,
                     )
                     return []
-                wait = min(2 ** transient_fails, 60)
+                wait = transient_backoff_seconds(transient_fails)
                 logger.warning(
                     "decompose transient %s for %s; backoff %.1fs (%d/%d)",
                     type(exc).__name__, item.id, wait,

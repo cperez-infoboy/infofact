@@ -17,10 +17,13 @@ export class ApiError extends Error {
 
 export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const { headers, ...rest } = init ?? {};
+  // FormData: no forzamos Content-Type para que el browser fije el boundary
+  // multipart automáticamente. Cualquier otro body viaja como JSON.
+  const isForm = init?.body instanceof FormData;
   const res = await fetch(BASE + path, {
     credentials: 'include',
     headers: {
-      'Content-Type': 'application/json',
+      ...(isForm ? {} : { 'Content-Type': 'application/json' }),
       ...(headers as Record<string, string> | undefined)
     },
     ...rest

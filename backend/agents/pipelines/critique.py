@@ -26,7 +26,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Awaitable, Callable, Literal
 
 from pydantic import BaseModel, Field
 
@@ -38,6 +38,8 @@ from backend.agents.pipelines._resilience import (
     BATCH_MAX_TOKENS,
     _BATCH_PARSE_RETRIES,
     BatchStats,
+    DEFAULT_CONCURRENCY,
+    transient_backoff_seconds,
 )
 from backend.agents.pipelines._quality_rules import (
     ProgrammaticFinding,
@@ -49,7 +51,6 @@ from backend.agents.pipelines.extraction import DocumentRules, RawRequirement
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_ITER = 1       # max refinement rounds (total judges = 1 + refinements)
-DEFAULT_CONCURRENCY = 4    # lowered from 8: Z.ai 429 spike under e2e load
 _JUDGE_ATTEMPTS = 3        # parse-failure retries before the sentinel fallback
 
 
@@ -296,7 +297,7 @@ async def _judge_item(
                 transient_fails += 1
                 if transient_fails >= transient_retries:
                     return _rate_limit_verdict(item.id, transient_fails, exc)
-                wait = min(2 ** transient_fails, 60)  # exp backoff, cap 60s
+                wait = transient_backoff_seconds(transient_fails)
                 logger.warning(
                     "critic transient %s for %s; backoff %.1fs (%d/%d)",
                     type(exc).__name__, item.id, wait,
@@ -420,7 +421,7 @@ async def _judge_batch(
                     )
                     stats.fallback += len(fallback)
                     return fallback, stats
-                wait = min(2 ** transient_fails, 60)
+                wait = transient_backoff_seconds(transient_fails)
                 logger.warning(
                     "critic batch transient %s; backoff %.1fs (%d/%d)",
                     type(exc).__name__, wait, transient_fails, _TRANSIENT_RETRIES,
@@ -611,6 +612,7 @@ async def critique_all(
     concurrency: int = DEFAULT_CONCURRENCY,
     batch_size: int = DEFAULT_BATCH_SIZE,
     rules: DocumentRules | None = None,
+    on_progress: Callable[[int, int], Awaitable[None]] | None = None,
 ) -> CritiqueResult:
     """Run the critic over all items concurrently. Returns survivors + verdicts.
 
@@ -642,43 +644,68 @@ async def critique_all(
 
     async def _one_batch(batch: list[RawRequirement]):
         nonlocal done
-        async with sem:
-            # Pre-filter dangling programmatically (no LLM).
-            dangling = [
-                it for it in batch if _has_dangling_reference(it.statement)
-            ]
-            to_judge = [
-                it for it in batch if not _has_dangling_reference(it.statement)
-            ]
-            results: list[tuple[RawRequirement, RawRequirement | None, CritiqueVerdict]] = []
-            # Dangling: straight to critique_item (returns _dangling_verdict).
-            for it in dangling:
-                kept, v = await critique_item(
-                    it, max_iter=max_iter, rules=rules
-                )
-                done += 1
-                if done % 50 == 0 or done == total:
-                    logger.info("critique progress: %d/%d", done, total)
-                results.append((it, kept, v))
-            # Batch path for the rest.
-            if to_judge:
-                first_verdicts, bstats = await _judge_batch(
+        # Pre-filter dangling programmatically (no LLM).
+        dangling = [
+            it for it in batch if _has_dangling_reference(it.statement)
+        ]
+        to_judge = [
+            it for it in batch if not _has_dangling_reference(it.statement)
+        ]
+        results: list[tuple[RawRequirement, RawRequirement | None, CritiqueVerdict]] = []
+
+        # Phase 1: ONE batch LLM call. The semaphore slot is held ONLY for the
+        # batch call (not the per-item refinement below), so the `concurrency`
+        # slots stay free for other batches' batch calls instead of blocking
+        # behind up to `batch_size` sequential refinement calls each.
+        first_verdicts: list[CritiqueVerdict] = []
+        if to_judge:
+            async with sem:
+                fv, bstats = await _judge_batch(
                     to_judge, neighbors_by_id, rules=rules,
                 )
-                agg.batch_calls += bstats.batch_calls
-                agg.omitted += bstats.omitted
-                agg.fallback += bstats.fallback
-                for it, v in zip(to_judge, first_verdicts):
-                    nbrs = (neighbors_by_id or {}).get(it.id)
-                    kept, final_v = await critique_item(
-                        it, neighbors=nbrs, max_iter=max_iter,
-                        _initial_verdict=v, rules=rules,
-                    )
-                    done += 1
-                    if done % 50 == 0 or done == total:
-                        logger.info("critique progress: %d/%d", done, total)
-                    results.append((it, kept, final_v))
-            return results
+            agg.batch_calls += bstats.batch_calls
+            agg.omitted += bstats.omitted
+            agg.fallback += bstats.fallback
+            first_verdicts = fv
+
+        # Phase 2: per-item refinement. Each critique_item acquires the
+        # semaphore individually, so refinement runs concurrently across items
+        # (clean verdicts do 0 LLM calls; non-clean do up to max_iter). Peak
+        # concurrency stays bounded by `sem` — it is now a shared LLM-call
+        # budget across all batches' batch calls AND refinements (the correct
+        # model for a single upstream rate limit).
+        async def _refine(it: RawRequirement, v: CritiqueVerdict):
+            nbrs = (neighbors_by_id or {}).get(it.id)
+            async with sem:
+                return await critique_item(
+                    it, neighbors=nbrs, max_iter=max_iter,
+                    _initial_verdict=v, rules=rules,
+                )
+
+        if to_judge:
+            refined = await asyncio.gather(
+                *[_refine(it, v) for it, v in zip(to_judge, first_verdicts)]
+            )
+            for it, (kept, final_v) in zip(to_judge, refined):
+                done += 1
+                if done % 10 == 0 or done == total:
+                    logger.info("critique progress: %d/%d", done, total)
+                    if on_progress:
+                        await on_progress(done, total)
+                results.append((it, kept, final_v))
+
+        # Dangling: no LLM (critique_item short-circuits to _dangling_verdict),
+        # so no semaphore needed.
+        for it in dangling:
+            kept, v = await critique_item(it, max_iter=max_iter, rules=rules)
+            done += 1
+            if done % 10 == 0 or done == total:
+                logger.info("critique progress: %d/%d", done, total)
+                if on_progress:
+                    await on_progress(done, total)
+            results.append((it, kept, v))
+
+        return results
 
     batch_results = await asyncio.gather(*[_one_batch(b) for b in batches])
 

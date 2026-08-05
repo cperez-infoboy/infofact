@@ -7,14 +7,13 @@ short-circuit with a confirmation, regardless of what the agent would do with
 ``on_existing="append"`` on its own and never asked.
 
 Also covers the decision-keyword detection (conservative: ambiguous steering
-does NOT count as a decision) and the subpath/decision splitting used by the
-deterministic ``/captura`` directive.
+does NOT count as a decision).
 """
 from __future__ import annotations
 
 import pytest
 
-from backend.agents.subagents import requirements_capture as rc
+import backend.agents.subagents.requirements_capture_agent as rc
 from backend.routers import chat
 
 
@@ -63,26 +62,6 @@ def test_user_existing_decision_ambiguous_is_none():
     assert chat._user_existing_decision("") is None
 
 
-# --- _extract_decision_and_subpath --------------------------------------
-
-def test_extract_decision_strips_reset_keyword():
-    sub, decision = chat._extract_decision_and_subpath("resetear")
-    assert sub == ""
-    assert decision == "reset"
-
-
-def test_extract_decision_preserves_real_subpath():
-    sub, decision = chat._extract_decision_and_subpath("docs/x")
-    assert sub == "docs/x"
-    assert decision is None
-
-
-def test_extract_decision_decision_plus_subpath():
-    sub, decision = chat._extract_decision_and_subpath("docs/x resetear")
-    assert sub == "docs/x"
-    assert decision == "reset"
-
-
 # --- _capture_gate_message ----------------------------------------------
 
 @pytest.mark.asyncio
@@ -106,7 +85,7 @@ async def test_capture_gate_blocks_when_existing_and_no_decision(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_capture_gate_blocks_deterministic_captura_too(monkeypatch):
+async def test_capture_gate_blocks_captura_too(monkeypatch):
     _patch_count(
         monkeypatch,
         {"requirements": 10, "grouping_plans": 0, "last_code": "REQ-ABCD"},

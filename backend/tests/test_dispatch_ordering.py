@@ -1,9 +1,10 @@
-"""Tests for /captura_agente dispatch ordering (Phase 1).
+"""Tests for /captura dispatch (consolidated agent-driven capture).
 
 Pins the startswith gotcha fix: /captura_agente must route to the agent-driven
 subagent, NOT fall into the /captura branch (which would parse "_agente ..." as
-a target_subpath). Also covers the dash variant, user-instruction embedding, and
-that the deterministic /captura path stays untouched.
+steering). Also covers the dash variant, user-instruction embedding, and that
+/captura now delegates to the SAME agent-driven subagent as /captura_agente
+(the deterministic capture path was removed).
 """
 from __future__ import annotations
 
@@ -30,17 +31,21 @@ def test_captura_agente_without_text_has_no_instructions_block():
     assert "INSTRUCCIONES DEL USUARIO" not in out
 
 
-def test_captura_without_agente_stays_deterministic():
+def test_captura_routes_to_agent_subagent():
+    # /captura delegates to the SAME agent-driven subagent as /captura_agente
+    # (the deterministic capture path is gone).
     out = _rewrite_command("/captura")
-    assert "requirements-capture-agent" not in out
-    assert "run_requirements_capture" in out
-    assert "target_subpath" in out
+    assert "requirements-capture-agent" in out
+    assert "ingest_documents" in out
+    assert "run_requirements_capture" not in out
 
 
-def test_captura_subpath_is_preserved():
+def test_captura_steering_is_embedded():
+    # Text after /captura is free user steering (not a structured subpath); it
+    # reaches the subagent as INSTRUCCIONES DEL USUARIO.
     out = _rewrite_command("/captura docs/x")
-    assert 'target_subpath="docs/x"' in out
-    assert "requirements-capture-agent" not in out
+    assert "requirements-capture-agent" in out
+    assert 'INSTRUCCIONES DEL USUARIO: "docs/x"' in out
 
 
 def test_plain_text_passes_through_unchanged():
@@ -48,13 +53,13 @@ def test_plain_text_passes_through_unchanged():
     assert _rewrite_command(msg) == msg
 
 
-# --- Fix C: directive content for /captura_agente (bug #2) ---------------
+# --- Directive content for /captura_agente (bug #2) ----------------------
+
 
 def test_captura_agente_directive_drops_stale_run_requirements_capture():
     out = _rewrite_command("/captura_agente")
-    # run_requirements_capture is the deterministic tool; the agent-driven
-    # subagent uses ingest_documents instead. The stale reference confused the
-    # agent and contributed to bug #2.
+    # run_requirements_capture is gone (deterministic capture removed); the
+    # agent-driven subagent uses ingest_documents instead.
     assert "run_requirements_capture" not in out
 
 
@@ -86,8 +91,9 @@ def test_captura_agente_directive_propagates_append_decision():
     assert 'on_existing="append"' in out
 
 
-def test_captura_deterministic_propagates_reset_decision():
+def test_captura_propagates_reset_decision():
+    # /captura propagates an explicit reset decision the same way as
+    # /captura_agente (both build the agent-driven directive).
     out = _rewrite_command("/captura resetear")
+    assert "[DECISION]" in out
     assert 'on_existing="reset"' in out
-    # The decision keyword must not leak into the subpath.
-    assert 'target_subpath="resetear"' not in out

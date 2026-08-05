@@ -23,12 +23,11 @@ import {
 
 // --- Captura: qué tools abren/cierran el banner vivo --------------------
 // startCapture() resetea el estado del pipeline (wipes conflictos/reportes),
-// así que dispara UNA vez por captura: al abrirla (run_requirements_capture
-// del subagente determinista, o ingest_documents del agentico por etapas) y
-// al cerrarla (commit_capture). Las tools de etapa intermedias sólo emiten
-// fine events que se acumulan; no reinician el banner.
-const CAPTURE_START_TOOLS = new Set(['run_requirements_capture', 'ingest_documents']);
-const CAPTURE_END_TOOLS = new Set(['run_requirements_capture', 'commit_capture']);
+// así que dispara UNA vez por captura: al abrirla (ingest_documents) y al
+// cerrarla (commit_capture). Las tools de etapa intermedias sólo emiten fine
+// events que se acumulan; no reinician el banner.
+const CAPTURE_START_TOOLS = new Set(['ingest_documents']);
+const CAPTURE_END_TOOLS = new Set(['commit_capture']);
 
 // --- Tipos de mensaje (union discriminada por `kind`) -----------------------
 // Timeline lineal: cada segmento de texto del agente y cada tool call son
@@ -209,9 +208,6 @@ export async function sendMessage(sessionId: number, content: string): Promise<b
         appendToken(currentAssistantId, delta);
       },
       onToolStart: (name, input) => {
-        // DEBUG: diagnosticar por qué CaptureStatus banner no aparece.
-        // Quitar tras confirmar el flujo de tool_start del subagente.
-        console.log('[chat] onToolStart', { name, input });
         // Cerrar el segmento de texto actual (drop si quedó vacío).
         if (currentAssistantId !== null) {
           closeAssistantMessage(currentAssistantId, true);
@@ -221,12 +217,10 @@ export async function sendMessage(sessionId: number, content: string): Promise<b
         pendingTools.push({ id: toolId, name });
         // Si arranca la captura, resetear el estado vivo del pipeline.
         if (CAPTURE_START_TOOLS.has(name)) {
-          console.log('[chat] startCapture() fired', name);
           startCapture();
         }
       },
       onToolEnd: (name, output) => {
-        console.log('[chat] onToolEnd', { name, outputPreview: typeof output === 'string' ? output.slice(0, 200) : output });
         // FIFO match por nombre: primer pending con mismo name.
         const idx = pendingTools.findIndex((p) => p.name === name);
         if (idx >= 0) {

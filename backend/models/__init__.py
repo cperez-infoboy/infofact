@@ -2,7 +2,10 @@
 from backend.models.base import Base
 from backend.models.chat_message import ChatMessage
 from backend.models.chat_session import ChatSession
+from backend.models.document_embedding import DocumentEmbedding
+from backend.models.document_parse import DocumentParse
 from backend.models.project import Project
+from backend.models.project_document import ProjectDocument
 from backend.models.requirement import (
     ChangedBy,
     GroupDecision,
@@ -39,6 +42,9 @@ __all__ = [
     "Base",
     "User",
     "Project",
+    "ProjectDocument",
+    "DocumentParse",
+    "DocumentEmbedding",
     "ChatSession",
     "ChatMessage",
     "RequirementItem",

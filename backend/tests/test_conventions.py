@@ -344,6 +344,17 @@ def test_classify_format_conventions_block_includes_both_when_both_present():
     assert "Scope markers" in block
 
 
+def test_classify_format_conventions_block_includes_priority_field_label():
+    """Classification surfaces priority_field_label so the classifier honors the
+    document's per-requirement priority field (e.g. 'Prioridad del requerimiento:
+    Alta') for MoSCoW, taking precedence over obligation-verb inference."""
+    rules = exc.DocumentRules(priority_field_label="Prioridad del requerimiento")
+    block = cls._format_conventions_block(rules)
+    assert block.startswith("DOCUMENT_CONVENTIONS:")
+    assert "Prioridad del requerimiento" in block
+    assert "Priority field label" in block
+
+
 @pytest.mark.asyncio
 async def test_classify_item_threads_priority_hint_and_conventions(monkeypatch):
     """The single-item user message must include PRIORITY_HINT from the item
@@ -503,8 +514,8 @@ from backend.agents.pipelines import critique as crt  # noqa: E402
 
 
 def test_critique_format_conventions_block_includes_priority_field_label():
-    """Critique surfaces priority_field_label (which classify does NOT) so the
-    critic recognizes the labeled field as a known signal."""
+    """Critique surfaces priority_field_label so the critic recognizes the
+    labeled field as a known signal (classification surfaces it too)."""
     rules = exc.DocumentRules(priority_field_label="Prioridad del requerimiento")
     block = crt._format_conventions_block(rules)
     assert "DOCUMENT_CONVENTIONS" in block

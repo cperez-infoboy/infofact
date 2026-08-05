@@ -4,7 +4,7 @@ Runs the requirements-capture subagent in-process against the test1 workspace
 and reproduces the chat.py event_stream chunk parser to verify:
   - /captura → directive rewrite (_rewrite_command)
   - subagent delegation (DeepAgents subagent dispatch via namespaces)
-  - run_requirements_capture tool invocation (tool_start / tool_end)
+  - ingest_documents tool invocation (tool_start / tool_end)
   - extraction.progress custom events (get_stream_writer → astream custom mode)
   - token deltas from the main agent (AIMessageChunk text → SSE token)
   - RequirementItem persistence (DB count before / after)
@@ -233,7 +233,7 @@ async def main() -> int:
     print("VERDICT:")
     # Subagent namespace in DeepAgents is typically the subagent name slug.
     delegated = any(ns != "(root)" for ns in namespaces)
-    capture_called = "run_requirements_capture" in tool_starts
+    capture_called = "ingest_documents" in tool_starts
     progress_ok = any(p["event"] == "extraction.progress" for p in progress_events)
     n_added = event_tally.get("requirement.added", 0)
     n_conflict = event_tally.get("conflict.found", 0)
@@ -247,7 +247,7 @@ async def main() -> int:
     v_persist = "PASS" if persisted else "FAIL"
     v_tokens = "PASS" if token_count > 0 else "FAIL"
     print(f"  subagent delegation   : {v_delegated}  (namespaces={sorted(namespaces)})")
-    print(f"  run_requirements_capture : {v_capture}")
+    print(f"  ingest_documents         : {v_capture}")
     print(f"  extraction.progress  : {v_progress}  ({event_tally.get('extraction.progress', 0)} events)")
     print(f"  requirement.added    : {v_added}  ({n_added} events)")
     print(f"  conflict.found       : INFO  ({n_conflict} events)")

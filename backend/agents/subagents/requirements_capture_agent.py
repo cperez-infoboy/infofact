@@ -1,10 +1,8 @@
 """The agent-driven requirements-capture subagent (requirements-capture-agent).
 
-Variant of the deterministic ``requirements-capture`` subagent where the model
-REASONS the capture instead of firing one deterministic tool call.
+The model REASONS the capture stage by stage instead of firing one tool call.
 
-Phase 2 (this module): the atomic ``run_requirements_capture`` is split into
-SEVEN stage tools backed by a stateful run-holder
+The capture is split into SEVEN stage tools backed by a stateful run-holder
 (``capture_run_holder.CaptureRun``), so the agent reasons BETWEEN stages. It
 sees each stage counts/conflicts/verdicts and decides whether to continue or
 adjust before the next stage -- without re-running the previous one. The seven
@@ -18,24 +16,24 @@ stages (always in this order):
     classify_requirements     ->  type + MoSCoW + decomposition
     commit_capture            ->  persistence (opaque REQ-XXXX, derived sub-items)
 
-Each stage calls the SAME hardened function the atomic pipeline uses; the
-guardrails live inside those functions, so splitting them into tools does NOT
-let the agent bypass them. ``commit_capture`` is the ONLY writer to the DB and
-reads ONLY from the holder (populated by ``extract_requirements`` ->
-verify_spans) -- no tool can inject items, so every persisted requirement is
-span-verified.
+Each stage calls the SAME hardened pipeline function; the guardrails live
+inside those functions, so splitting them into tools does NOT let the agent
+bypass them. ``commit_capture`` is the ONLY writer to the DB and reads ONLY
+from the holder (populated by ``extract_requirements`` -> verify_spans) -- no
+tool can inject items, so every persisted requirement is span-verified.
 
 This subagent has NO ``backend``/sandbox: it cannot execute code, so it cannot
 improvise PDF parsing with python. Registered in ``agent_service.build_agent``
-alongside the deterministic subagent when ``phase == "requirements"``.
+when ``phase == "requirements"``.
 
-Dispatched by the ``/captura_agente`` command (see ``chat.py::_rewrite_command``),
+Dispatched by the ``/captura`` command (see ``chat.py::_rewrite_command``),
 which embeds free-form user steering (text after the command) as
 ``INSTRUCCIONES DEL USUARIO`` in the directive.
 """
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -52,12 +50,11 @@ from backend.agents.pipelines.extraction import (
     extract_all,
     gap_pass,
     implicit_pass,
+    filter_boilerplate_chunks,
 )
-from backend.agents.pipelines.ingestion import discover_documents, ingest_document
-# Reuses the deterministic subagent tool factories + path resolver + emitters +
-# existing-data guard. These are the single implementations; reaching for them
-# here keeps both variants on the same hardened surface (the guardrails live
-# inside the tools/functions, not the prompt).
+from backend.agents.pipelines.ingestion import discover_documents
+from backend.agents.pipelines.parse_cache import parse_document_cached
+from backend.services.document_service import parser_hint_map
 from backend.agents.subagents.capture_run_holder import (
     STAGE_CLASSIFY,
     STAGE_COMMIT,
@@ -71,25 +68,16 @@ from backend.agents.subagents.capture_run_holder import (
     get_or_create_run,
     get_run,
 )
-from backend.agents.subagents.requirements_capture import (
-    _count_existing,
-    _existing_gate,
-    _make_check_health_tool,
-    _make_emitters,
-    _resolve_target,
-)
 from backend.agents.tools.grouping_tools import make_grouping_tools
 from backend.agents.tools.requirements_tools import make_requirements_tools
 from backend.agents.tools.vision_tools import make_vision_tools
 
 
 REQUIREMENTS_CAPTURE_AGENT_PROMPT = """\
-Eres el subagente AGENTICO de captura de requerimientos de InfoFact (variante
-no deterministica del comando /captura). A diferencia del subagente
-determinista, que dispara una sola tool y reporta, RAZONAS la captura etapa por
-etapa: orientas los documentos, planificas una estrategia, orquestas las siete
-etapas del pipeline razonando entre cada una, y refinas los resultados antes de
-reportar.
+Eres el subagente de captura de requerimientos de InfoFact (comando /captura).
+RAZONAS la captura etapa por etapa: orientas los documentos, planificas una
+estrategia, orquestas las siete etapas del pipeline razonando entre cada una, y
+refinas los resultados antes de reportar.
 
 Las siete etapas (SIEMPRE en este orden; cada una consume la salida de la
 anterior, guardada en memoria):
@@ -174,8 +162,8 @@ Flujo:
    revision y items rechazados por posible alucinacion. Ofrece ayudar a
    editar, fusionar o aprobar.
 
-Reglas estrictas (las mismas del subagente determinista; los guardrails viven
-dentro de las tools y no los puedes saltear):
+Reglas estrictas (los guardrails viven dentro de las tools y no los puedes
+saltear):
 
 - NUNCA inventes requerimientos. Todo item viene del pipeline (con su
   source_span). commit_capture lee SOLO del holder, poblado por
@@ -194,6 +182,162 @@ dentro de las tools y no los puedes saltear):
 - Habla en espanol neutro. Se conciso y tecnico. Narra tu razonamiento en 1-3
   frases entre llamadas a tools.
 """
+
+
+def _resolve_target(host_workspace: Path, subpath: str) -> Path:
+    """Resolve a subpath under the project workspace, refusing traversal.
+
+    The pipeline runs host-side and reads from the bind-mounted workspace on
+    disk; this guard keeps the target inside the project's own directory so a
+    crafted relative path cannot reach another project or the host filesystem.
+    """
+    root = host_workspace.resolve()
+    target = (root / subpath).resolve() if subpath else root
+    if target != root and not str(target).startswith(str(root) + os.sep):
+        raise ValueError(
+            f"target '{subpath}' escapes the project workspace"
+        )
+    if not target.exists():
+        raise ValueError(f"target '{target}' does not exist")
+    return target
+
+
+def _existing_gate(existing_count: int, on_existing: str) -> str:
+    """Decide what the capture does given existing rows.
+
+    Pure policy (no I/O) so it is unit-tested in isolation. Returns one of:
+      - "block":   requirements exist and the caller has not decided yet -> the
+                   tool must return pending_confirmation and NOT run.
+      - "reset":   wipe existing rows first, then run.
+      - "proceed": run without wiping (nothing exists, or the user chose append).
+
+    on_existing must be "ask" (default), "reset" or "append"; anything else
+    raises ValueError so the tool surfaces a clear error instead of silently
+    defaulting.
+    """
+    if on_existing not in {"ask", "reset", "append"}:
+        raise ValueError(
+            "on_existing must be 'ask', 'reset' or 'append', got "
+            f"{on_existing!r}"
+        )
+    if on_existing == "append":
+        return "proceed"
+    if on_existing == "reset":
+        return "reset" if existing_count > 0 else "proceed"
+    # on_existing == "ask"
+    return "block" if existing_count > 0 else "proceed"
+
+
+async def _count_existing(project_id: int) -> dict:
+    """Count existing requirement + grouping rows for one project (preflight).
+
+    Used by the capture guard to decide whether a capture would append over
+    existing data. Counts ALL rows (including soft-deleted) so the guard fires
+    whenever the project has been captured before, even if every row was later
+    rejected -- matches capture_status accounting.
+    """
+    from sqlalchemy import func, select
+
+    from backend.database import AsyncSessionLocal
+    from backend.models.requirement import GroupingPlan, RequirementItem
+
+    async with AsyncSessionLocal() as session:
+        req_count = await session.scalar(
+            select(func.count())
+            .select_from(RequirementItem)
+            .where(RequirementItem.project_id == project_id)
+        )
+        plan_count = await session.scalar(
+            select(func.count())
+            .select_from(GroupingPlan)
+            .where(GroupingPlan.project_id == project_id)
+        )
+        last_code = await session.scalar(
+            select(RequirementItem.code)
+            .where(RequirementItem.project_id == project_id)
+            .order_by(RequirementItem.id.desc())
+            .limit(1)
+        )
+        return {
+            "requirements": int(req_count or 0),
+            "grouping_plans": int(plan_count or 0),
+            "last_code": last_code,
+        }
+
+
+def _make_emitters():
+    """Build (on_progress, on_event) callbacks that stream to the SSE relay.
+
+    Uses LangGraph's custom stream channel (``get_stream_writer``) so events
+    reach the SSE relay without changing the tool signature. ``get_stream_writer``
+    only resolves inside a LangGraph execution context; outside one (smoke tests,
+    direct invocation) it raises — we catch and stay silent so the tool still runs.
+
+    ``on_progress`` carries coarse stage events (``extraction.progress``);
+    ``on_event`` carries fine-grained events (``conflict.found``,
+    ``validation.report``, ``requirement.added``) for live UI updates.
+    """
+    from langgraph.config import get_stream_writer
+
+    async def _emit_progress(
+        stage: str, message: str, extra: dict | None = None
+    ) -> None:
+        try:
+            writer = get_stream_writer()
+        except Exception:  # noqa: BLE001 — no graph context (smoke / direct call)
+            return
+        try:
+            data: dict = {"stage": stage, "message": message}
+            if extra:
+                data.update(extra)
+            writer({"event": "extraction.progress", "data": data})
+        except Exception:  # noqa: BLE001 — never break the pipeline for progress
+            return
+
+    async def _emit_event(event_type: str, data: dict) -> None:
+        try:
+            writer = get_stream_writer()
+        except Exception:  # noqa: BLE001 — no graph context (smoke / direct call)
+            return
+        try:
+            writer({"event": event_type, "data": data})
+        except Exception:  # noqa: BLE001 — never break the pipeline for an event
+            return
+
+    return _emit_progress, _emit_event
+
+
+def _make_check_health_tool():
+    """Build the check_capture_health tool.
+
+    Wraps ``check_capture_environment`` (pure probes) and streams a coarse
+    progress event so the UI shows 'verificando entorno' before the long capture
+    run. No project closure is needed — the probes read global settings.
+    """
+    from backend.agents.pipelines.preflight import check_capture_environment
+
+    @tool
+    async def check_capture_health() -> dict:
+        """Verify the capture environment BEFORE running the pipeline.
+
+        Probes dependency imports (docling, opencv, tiktoken,
+        sentence-transformers), LLM endpoint reachability, and workspace
+        writability. Fast (<2s). Call this FIRST, before the capture stages, so
+        a broken dependency fails here with a remediation hint instead of
+        crashing mid-capture.
+        """
+        on_progress, _on_event = _make_emitters()
+        await on_progress("preflight", "Verificando entorno de captura...")
+        report = check_capture_environment()
+        if not report.ok:
+            failing = ", ".join(p.name for p in report.failures())
+            await on_progress(
+                "preflight_failed",
+                f"Entorno con problemas: {failing}",
+            )
+        return report.as_dict()
+
+    return check_capture_health
 
 
 def _human_size(num_bytes: int) -> str:
@@ -320,7 +464,7 @@ def _make_stage_tools(
                 requirement exists, returns pending_confirmation (with the
                 counts and last code) INSTEAD of starting -- surface those to
                 the user, then call again with the choice BEFORE any parsing,
-                so no work is wasted. Mirrors run_requirements_capture.
+                so no work is wasted. Mirrors the existing-data guard.
                 - "reset": delete ALL existing requirements + grouping plans
                   first (hard, irreversible), then parse. Use ONLY after the
                   user explicitly chose to start over.
@@ -404,11 +548,19 @@ def _make_stage_tools(
                 ),
             }
 
+        # parser_hint por documento (Fase C): el usuario puede forzar glm-ocr en
+        # /upload o /scan para PDFs rotados born-digital que la heurística auto
+        # no pesca. {abs_path: hint} solo para los docs con hint explícito; los
+        # demás caen a "auto" (el router decide).
+        hint_map = await parser_hint_map(project_id, host_workspace.resolve())
+
         per_doc: list = []
         doc_texts: dict[str, str] = {}
         all_chunks: list = []
-        for d in docs:
-            chunks, smap = await asyncio.to_thread(ingest_document, d)
+        for idx, d in enumerate(docs):
+            chunks, smap = await parse_document_cached(
+                d, parser_hint=hint_map.get(str(d.resolve()), "auto")
+            )
             await enrich_structure_map(
                 smap,
                 project_name=run.project_name,
@@ -417,7 +569,10 @@ def _make_stage_tools(
             per_doc.append((chunks, smap))
             doc_texts[smap.document_id] = smap.full_text
             all_chunks.extend(chunks)
-            await on_progress(STAGE_INGEST, "parseado " + d.name)
+            await on_progress(
+                STAGE_INGEST, "parseado " + d.name,
+                {"current": idx + 1, "total": len(docs)},
+            )
 
         run.timings[STAGE_INGEST] = (time.perf_counter() - t0) * 1000
         await on_progress(
@@ -514,27 +669,53 @@ def _make_stage_tools(
         on_progress, _on_event = _make_emitters()
         await on_progress(STAGE_EXTRACT, "extraccion", {"phase": "start"})
         t0 = time.perf_counter()
+
+        async def _extract_progress(done: int, total: int):
+            await on_progress(
+                STAGE_EXTRACT, f"{done}/{total} fragmentos",
+                {"current": done, "total": total},
+            )
+
         extracted = await extract_all(
             run.all_chunks,
             doc_texts=run.doc_texts,
             project_name=run.project_name,
             project_description=run.project_description,
             rules=run.document_rules,
+            on_progress=_extract_progress,
         )
-        for chunks, smap in run.per_doc:
-            gaps = await gap_pass(
+        gap_results = await asyncio.gather(*[
+            gap_pass(
                 chunks,
                 smap,
                 extracted,
                 project_name=run.project_name,
                 project_description=run.project_description,
             )
+            for chunks, smap in run.per_doc
+        ])
+        for gaps in gap_results:
             extracted.extend(gaps)
+        implicit_chunks = filter_boilerplate_chunks(
+            run.all_chunks, [smap for _, smap in run.per_doc]
+        )
+        await on_progress(
+            STAGE_EXTRACT, "requerimientos implícitos",
+            {},
+        )
+
+        async def _implicit_progress(done: int, total: int):
+            await on_progress(
+                STAGE_EXTRACT, f"implícitos {done}/{total}",
+                {"current": done, "total": total},
+            )
+
         implicits = await implicit_pass(
-            run.all_chunks,
+            implicit_chunks,
             doc_texts=run.doc_texts,
             project_name=run.project_name,
             project_description=run.project_description,
+            on_progress=_implicit_progress,
         )
         implicits = drop_duplicit_implicit(implicits, extracted)
         extracted.extend(implicits)
@@ -625,7 +806,17 @@ def _make_stage_tools(
         on_progress, on_event = _make_emitters()
         await on_progress(STAGE_CRITIQUE, "revision critica", {"phase": "start"})
         t0 = time.perf_counter()
-        crit = await critique_all(run.cons.items, rules=run.document_rules)
+
+        async def _crit_progress(done: int, total: int):
+            await on_progress(
+                STAGE_CRITIQUE, f"{done}/{total} requerimientos",
+                {"current": done, "total": total},
+            )
+
+        crit = await critique_all(
+            run.cons.items, rules=run.document_rules,
+            on_progress=_crit_progress,
+        )
         await on_event("validation.report", {
             "total": len(run.cons.items),
             "kept": crit.stats.get("kept", len(crit.items)),
@@ -788,8 +979,8 @@ def make_requirements_capture_agent_subagent(
     only DB writer and reads only from the holder (span-verified items from
     extract_requirements).
     """
-    # Imported here to avoid a config import at module load time (matches the
-    # deterministic factory; tests that rebind settings work without surprises).
+    # Imported here to avoid a config import at module load time (tests that
+    # rebind settings work without surprises).
     from backend.config import settings
 
     host_workspace = settings.workspaces_root / profile / project_slug
@@ -806,14 +997,13 @@ def make_requirements_capture_agent_subagent(
     return {
         "name": "requirements-capture-agent",
         "description": (
-            "Variante AGENTICA de la captura de requerimientos: razona la "
-            "extraccion etapa por etapa (orienta los documentos, planifica, "
-            "orquesta las siete etapas del pipeline y refina) en lugar de "
-            "disparar una sola tool. Usalo cuando el usuario use el comando "
-            "/captura_agente o pida una captura guiada con instrucciones de "
-            "steering. Comparte las mismas tools de edicion/agrupamiento/vision "
-            "y los mismos guardrails que el subagente requirements-capture; la "
-            "diferencia es que razona y decide entre etapas."
+            "Captura de requerimientos de InfoFact: razona la extraccion etapa "
+            "por etapa (orienta los documentos, planifica, orquesta las siete "
+            "etapas del pipeline y refina) en lugar de disparar una sola tool. "
+            "Usalo cuando el usuario use el comando /captura o pida una captura "
+            "guiada con instrucciones de steering. Tambien cubre la edicion, el "
+            "agrupamiento de duplicados y la vision de documentos del store. Los "
+            "guardrails viven dentro de las tools, no en el prompt."
         ),
         "system_prompt": REQUIREMENTS_CAPTURE_AGENT_PROMPT,
         "tools": [

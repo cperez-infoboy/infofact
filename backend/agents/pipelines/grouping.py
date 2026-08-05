@@ -31,7 +31,6 @@ from backend.agents.pipelines.consolidation import (
     _cluster_duplicates,
     _duplicate_candidates,
     _judge_duplicates,
-    _representative,
     embed_texts,
     exact_dedup,
 )
@@ -39,6 +38,33 @@ from backend.agents.pipelines.extraction import RawRequirement
 from backend.services.requirement_store import list_requirements
 
 logger = logging.getLogger(__name__)
+
+
+# MoSCoW ranking for keeper selection (lower wins): must > should > could > wont.
+_PRIORITY_RANK = {"must": 0, "should": 1, "could": 2, "wont": 3}
+
+
+def _keeper_key(it) -> tuple:
+    """Sort key for the grouping keeper (lower tuple wins).
+
+    The client's EXPLICIT priority takes precedence: an item whose MoSCoW came
+    from the document (``explicit_priority=True``) wins over a verb-inferred
+    one, even when the inferred MoSCoW is "higher". Among the same
+    explicit-ness, higher MoSCoW rank wins; extraction confidence is the last
+    tiebreaker (the historical behavior).
+    """
+    prio_rank = _PRIORITY_RANK.get(
+        it.priority.value if it.priority else "", 9
+    )
+    return (not bool(it.explicit_priority), prio_rank, -(it.confidence or 0.0))
+
+
+def _cluster_keeper(cluster, meta):
+    """Pick a cluster's survivor via ``_keeper_key`` (explicit > MoSCoW > confidence)."""
+    return min(
+        (rep for _idx, rep in cluster),
+        key=lambda r: _keeper_key(meta[r.id]),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -124,13 +150,16 @@ async def build_grouping_plan(
         return GroupingPlan.empty(project=project)
 
     shims = [_to_raw(it) for it in items]
+    # code -> RequirementItem, so keeper selection can read priority + explicit_priority.
+    meta = {it.code: it for it in items}
 
-    # (A) verbatim buckets; pick the highest-confidence item per bucket as rep.
+    # (A) verbatim buckets; pick the keeper per bucket by EXPLICIT priority >
+    # MoSCoW rank > confidence (was: confidence only).
     buckets = exact_dedup(shims)
     rep_of: dict[str, list[RawRequirement]] = {}
     reps: list[RawRequirement] = []
     for bucket in buckets:
-        rep = max(bucket, key=lambda r: r.confidence)
+        rep = min(bucket, key=lambda r: _keeper_key(meta[r.id]))
         rep_of[rep.id] = bucket
         reps.append(rep)
 
@@ -152,7 +181,7 @@ async def build_grouping_plan(
     for cluster in clusters:
         if len(cluster) <= 1:
             continue
-        keeper = _representative(cluster)
+        keeper = _cluster_keeper(cluster, meta)
         clustered_rep_ids.add(keeper.id)
         members: list[str] = []
         for _idx, rep in cluster:

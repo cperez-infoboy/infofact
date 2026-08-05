@@ -137,3 +137,35 @@ async def write_file(profile: str, project_slug: str, path: str, content: str) -
     result = uploads[0]
     if result.error is not None:
         raise RuntimeError(f"write failed: {result.error}")
+
+
+async def write_bytes(
+    profile: str, project_slug: str, path: str, data: bytes
+) -> None:
+    """Escribe ``data`` (bytes crudos) en ``path`` del workspace del proyecto.
+
+    Como ``write_file`` pero para binarios (PDFs, imágenes, .docx): misma vía
+    (``DockerSandbox.upload_files`` via stdin cat), que crea dirs padres y
+    sobrescribe si existe.
+    """
+    sandbox = await _sandbox(profile, project_slug)
+    safe = sandbox._safe_path(path)
+    uploads = sandbox.upload_files([(safe, data)])
+    if not uploads:
+        raise RuntimeError("upload returned no result")
+    result = uploads[0]
+    if result.error is not None:
+        raise RuntimeError(f"write failed: {result.error}")
+
+
+async def delete_file(profile: str, project_slug: str, path: str) -> None:
+    """Borra ``path`` del workspace del proyecto (best-effort, idempotente).
+
+    Usa ``rm -f`` via ``DockerSandbox.execute``; el ``-f`` hace que un archivo
+    inexistente no se reporte como error.
+    """
+    sandbox = await _sandbox(profile, project_slug)
+    safe = sandbox._safe_path(path)
+    result = sandbox.execute(f"rm -f -- {shlex.quote(safe)}", timeout=10)
+    if result.exit_code != 0:
+        raise RuntimeError(f"delete failed: {result.output.strip()}")

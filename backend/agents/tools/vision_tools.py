@@ -5,7 +5,7 @@ calls ``analyze_image`` when it wants a closer look at a specific diagram or
 mockup (e.g. to resolve a doubt while editing requirements).
 
 Bound to one project's workspace, like the requirements editing tools. Returns
-an empty list when vision is unavailable so ``make_requirements_capture_subagent``
+an empty list when vision is unavailable so ``make_requirements_capture_agent_subagent``
 registration becomes a no-op and the pipeline keeps running Docling-only.
 """
 from __future__ import annotations
@@ -34,7 +34,7 @@ def make_vision_tools(profile: str, project_slug: str) -> list:
     def _resolve(image_path: str) -> Path:
         """Resolve a workspace-relative image path, refusing traversal.
 
-        Mirrors ``_resolve_target`` in requirements_capture.py: the vision call
+        Mirrors ``_resolve_target`` in requirements_capture_agent.py: the vision call
         reads host-side bytes, so a crafted path must not escape the project.
         """
         root = host_workspace.resolve()

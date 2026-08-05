@@ -16,15 +16,44 @@ here would silently change retry behaviour under load.
 from __future__ import annotations
 
 import os
+import random
 from dataclasses import dataclass
 
 from openai import APIConnectionError, APIStatusError, APITimeoutError
 
-# Transient (429/5xx/timeout) retries with exponential backoff (cap 60s).
+# Transient (429/5xx/timeout) retries with exponential backoff (cap _BACKOFF_CAP).
 # Parse-failure attempts are defined per stage (critique: _JUDGE_ATTEMPTS,
 # classification: _CLASSIFY_ATTEMPTS) because the right depth depends on
 # how expensive each call is and how the sentinel downstream is consumed.
 _TRANSIENT_RETRIES = 8
+
+# ---------------------------------------------------------------------------
+# Concurrency + backoff (plan: aceleración del pipeline de captura)
+# ---------------------------------------------------------------------------
+# Env-tunable so concurrency can be calibrated against the real Z.ai rate
+# limit without code changes. Default 4 (historically lowered from 8 after a
+# Z.ai 429 spike under e2e load; batch mode has since cut total calls, so
+# tuning up is now safer — change one variable at a time via the env var).
+DEFAULT_CONCURRENCY = int(os.environ.get("INFOFACT_CONCURRENCY", "4"))
+
+# Hard cap (seconds) on a single transient-retry backoff. Env-tunable
+# (INFOFACT_BACKOFF_CAP). Default 30 (Phase 2: halved from 60 now that jitter
+# spreads the retry collisions; revert to 60 via the env var if Z.ai's
+# rate-limit window proves longer than ~30s and shorter caps re-collide).
+_BACKOFF_CAP = int(os.environ.get("INFOFACT_BACKOFF_CAP", "30"))
+
+
+def transient_backoff_seconds(fails: int) -> float:
+    """Jittered exponential backoff for transient LLM errors (429/5xx/timeout).
+
+    Pure exponential backoff makes concurrent retries collide (thundering
+    herd): N requests 429'd at the same instant sleep the exact same duration
+    and retry together, causing another 429. The ``random.uniform(0.5, 1.5)``
+    jitter spreads each retry over half-to-1.5x of the base wait so only a
+    fraction collide on each cycle.
+    """
+    return min(2 ** fails, _BACKOFF_CAP) * random.uniform(0.5, 1.5)
+
 
 # ---------------------------------------------------------------------------
 # Batch defaults (plan §13.B)

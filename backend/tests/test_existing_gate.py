@@ -1,14 +1,14 @@
-"""Tests for the run_requirements_capture existing-data guard policy.
+"""Tests for the capture existing-data guard policy.
 
 The guard prevents a capture from silently appending over an existing capture.
 The decision policy is a pure function (_existing_gate) so it is tested in
-isolation; the tool wraps it with a DB count + the reset call.
+isolation; the capture tool wraps it with a DB count + the reset call.
 """
 from __future__ import annotations
 
 import pytest
 
-from backend.agents.subagents.requirements_capture import _existing_gate
+from backend.agents.subagents.requirements_capture_agent import _existing_gate
 
 
 def test_empty_store_proceeds_on_ask() -> None:

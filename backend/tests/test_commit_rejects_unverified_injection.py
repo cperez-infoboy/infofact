@@ -65,7 +65,9 @@ def _stub_pipeline(monkeypatch) -> None:
 
     monkeypatch.setattr(mod, "_resolve_target", lambda ws, sub: Path("/tmp/ws/docs"))
     monkeypatch.setattr(mod, "discover_documents", lambda t: [Path("doc1.pdf")])
-    monkeypatch.setattr(mod, "ingest_document", lambda d: (["c1", "c2"], smap))
+    async def _parse_cached(d, *, session=None, parser_hint="auto"):
+        return (["c1", "c2"], smap)
+    monkeypatch.setattr(mod, "parse_document_cached", _parse_cached)
 
     async def _enrich(s, **kw):
         return None
@@ -112,6 +114,11 @@ def _stub_pipeline(monkeypatch) -> None:
     async def _classify_all(items, **kw):
         return types.SimpleNamespace(decisions={}, stats={"sub_items": 0})
     monkeypatch.setattr(mod, "classify_all", _classify_all)
+
+    # Fase C: parser_hint_map consulta la DB; stub a {} para no tocarla.
+    async def _hint_map(project_id, workspace_root):
+        return {}
+    monkeypatch.setattr(mod, "parser_hint_map", _hint_map)
 
 
 @pytest.fixture

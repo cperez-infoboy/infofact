@@ -67,4 +67,7 @@ services:
       DATABASE_URL: sqlite+aiosqlite:////app/data/infofact.db
       CHECKPOINTER_DB: /app/data/checkpoints.db
       REGISTRY_FILE: /app/data/container_registry.json
+      # Concurrencia del pipeline de extracción/crítica/clasificación.
+      # 4 (default) → 8 duplica throughput. Si hay rate_limit excesivo, bajar.
+      INFOFACT_CONCURRENCY: "8"
     restart: unless-stopped

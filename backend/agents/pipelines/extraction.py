@@ -23,12 +23,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Literal
+from typing import Awaitable, Callable, Literal
 
 from pydantic import BaseModel, Field
 
 from backend.agents.llm import build_llm, structured_llm
 from backend.agents.pipelines._quality_rules import PREVENTION_RULES
+from backend.agents.pipelines._resilience import DEFAULT_CONCURRENCY
 from backend.agents.pipelines.ingestion import Chunk, StructureMap
 
 logger = logging.getLogger(__name__)
@@ -363,8 +364,9 @@ async def extract_all(
     doc_texts: dict[str, str],
     project_name: str,
     project_description: str,
-    concurrency: int = 4,
+    concurrency: int = DEFAULT_CONCURRENCY,
     rules: DocumentRules | None = None,
+    on_progress: Callable[[int, int], Awaitable[None]] | None = None,
 ) -> list[RawRequirement]:
     """Extract across all chunks (multi-document safe), then verify spans.
 
@@ -377,8 +379,11 @@ async def extract_all(
     priority field. Default None preserves the historical verb-only behavior.
     """
     sem = asyncio.Semaphore(max(1, concurrency))
+    total = len(chunks)
+    done = 0
 
     async def _one(c: Chunk) -> list[RawRequirement]:
+        nonlocal done
         async with sem:
             try:
                 res = await extract_chunk(
@@ -393,6 +398,10 @@ async def extract_all(
                     "extract_chunk failed: %s idx %d", c.document_id, c.index,
                 )
                 return []
+            finally:
+                done += 1
+                if on_progress and (done % 5 == 0 or done == total):
+                    await on_progress(done, total)
 
     batches = await asyncio.gather(*(_one(c) for c in chunks))
     flat: list[RawRequirement] = [it for sub in batches for it in sub]
@@ -411,7 +420,7 @@ async def gap_pass(
     *,
     project_name: str,
     project_description: str,
-    concurrency: int = 4,
+    concurrency: int = DEFAULT_CONCURRENCY,
 ) -> list[RawRequirement]:
     """Re-extract chunks under high/medium-likelihood sections that yielded 0 items.
 
@@ -445,25 +454,90 @@ async def gap_pass(
     )
 
 
+def filter_boilerplate_chunks(
+    chunks: list[Chunk], smaps: list[StructureMap]
+) -> list[Chunk]:
+    """Drop chunks under sections the annotator flagged boilerplate or with no
+    requirement likelihood (cover, TOC, glossary, references, legal).
+
+    Used to skip the IMPLICIT pass over sections that cannot carry implicit
+    requirements, cutting LLM calls. A chunk is dropped when its
+    ``section_path`` breadcrumb contains the title of a boilerplate / none
+    section of its OWN document. Returns the input unchanged when no section is
+    flagged, so documents without annotations behave exactly as before.
+    """
+    bad_titles: dict[str, set[str]] = {}
+    for smap in smaps:
+        # Defensive: a smap without the sections annotation (a test mock, or a
+        # document whose enrich_structure_map pass did not run) contributes no
+        # bad titles — all its chunks pass through unchanged.
+        sections = getattr(smap, "sections", None) or []
+        doc_id = getattr(smap, "document_id", None)
+        bad = {
+            s.title for s in sections
+            if getattr(s, "is_boilerplate", False)
+            or getattr(s, "req_likelihood", None) == "none"
+        }
+        if bad and doc_id is not None:
+            bad_titles.setdefault(doc_id, set()).update(bad)
+    if not bad_titles:
+        return list(chunks)
+    out: list[Chunk] = []
+    for c in chunks:
+        bad_for_doc = bad_titles.get(c.document_id)
+        if not bad_for_doc:
+            out.append(c)
+            continue
+        path = c.section_path or ""
+        if not any(title and title in path for title in bad_for_doc):
+            out.append(c)
+    return out
+
+
 async def implicit_pass(
     chunks: list[Chunk],
     *,
     doc_texts: dict[str, str],
     project_name: str,
     project_description: str,
-    concurrency: int = 4,
+    concurrency: int = DEFAULT_CONCURRENCY,
+    batch_size: int = 3,
+    on_progress: Callable[[int, int], Awaitable[None]] | None = None,
 ) -> list[RawRequirement]:
-    """Separate pass for IMPLICIT requirements (assumptions), tagged explicit=False."""
+    """Separate pass for IMPLICIT requirements (assumptions), tagged explicit=False.
+
+    Chunks are batched by document (up to batch_size per LLM call) to reduce
+    the total number of calls. document_id is correct within each batch since
+    all chunks share the same document.
+    """
+    if not chunks:
+        return []
     llm = _structured_llm(ImplicitExtraction)
     sem = asyncio.Semaphore(max(1, concurrency))
 
-    async def _one(c: Chunk) -> list[RawRequirement]:
+    # Group chunks by document_id, then batch within each document.
+    by_doc: dict[str, list[Chunk]] = {}
+    for c in chunks:
+        by_doc.setdefault(c.document_id, []).append(c)
+    batches: list[list[Chunk]] = []
+    for doc_chunks in by_doc.values():
+        for i in range(0, len(doc_chunks), batch_size):
+            batches.append(doc_chunks[i:i + batch_size])
+
+    total = len(batches)
+    done = 0
+
+    async def _one_batch(batch: list[Chunk]) -> list[RawRequirement]:
+        nonlocal done
         async with sem:
             try:
+                excerpts = "\n\n---\n\n".join(
+                    f"[SECTION: {c.section_path or '(unknown)'}]\n{c.text}"
+                    for c in batch
+                )
                 user = (
-                    f"{_project_header(project_name, project_description)}\n"
-                    f"SECTION: {c.section_path or '(unknown)'}\n\n"
-                    f"EXCERPT:\n{c.text}"
+                    f"{_project_header(project_name, project_description)}\n\n"
+                    f"EXCERPTS:\n{excerpts}"
                 )
                 res = await llm.ainvoke(
                     [("system", _IMPLICIT_SYSTEM), ("human", user)]
@@ -474,23 +548,32 @@ async def implicit_pass(
                         statement=im.statement,
                         source_span=im.source_span,
                         section=im.section,
-                        page=im.page or c.page,
+                        page=im.page or batch[0].page,
                         explicit=False,
                         confidence=im.confidence,
                         rationale=im.rationale,
-                        document_id=c.document_id,
+                        document_id=batch[0].document_id,
                         status="draft",
                     ))
                 return out
             except Exception:
                 logger.exception(
-                    "implicit_pass failed: %s idx %d", c.document_id, c.index,
+                    "implicit_pass batch failed: %s",
+                    batch[0].document_id if batch else "?",
                 )
                 return []
+            finally:
+                done += 1
+                if on_progress and (done % 3 == 0 or done == total):
+                    await on_progress(done, total)
 
-    batches = await asyncio.gather(*(_one(c) for c in chunks))
-    flat = [it for sub in batches for it in sub]
+    results = await asyncio.gather(*(_one_batch(b) for b in batches))
+    flat = [it for sub in results for it in sub]
     verify_spans(flat, doc_texts)
+    logger.info(
+        "implicit_pass: %d chunks in %d batches -> %d items",
+        len(chunks), total, len(flat),
+    )
     return flat
 
 

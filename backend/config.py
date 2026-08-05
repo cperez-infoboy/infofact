@@ -103,6 +103,24 @@ class Settings(BaseSettings):
     # bloquear el turno del agente (ver incidente de la sesión 6).
     web_tool_timeout: int = 15
 
+    # Techo por archivo para upload binario de documentos fuente (Fase A de
+    # ingesta). PDFs de RFP/contratos típicamente pesan 5-20 MB. Excedido ->
+    # 413 Request Entity Too Large en POST /api/documents/upload.
+    max_upload_bytes: int = 50 * 1024 * 1024
+
+    # OCR fallback (Fase C): GLM-OCR para PDFs escaneados o con tablas rotadas
+    # donde Docling pierde texto. Endpoint on-demand dedicado de Z.ai (NO el
+    # Coding Plan, que da 1113 Insufficient balance); mismo LLM_API_KEY.
+    # ocr_enabled apaga el router OCR globalmente (todo a Docling).
+    # ocr_text_layer_threshold: chars/pagina bajo el cual un PDF se considera
+    # escaneado y rutea a GLM-OCR (~500 segun el spike sobre sigsa_srs.pdf).
+    llm_ocr_model: str = "glm-ocr"
+    llm_ocr_base_url: str = "https://api.z.ai/api/paas/v4"
+    ocr_enabled: bool = True
+    ocr_pdf_dpi: int = 200
+    ocr_max_pages: int = 100
+    ocr_text_layer_threshold: int = 500
+
     @property
     def supports_vision(self) -> bool:
         """Whether image understanding is available.

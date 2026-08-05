@@ -1,8 +1,8 @@
 """Smoke: /captura_agente dispatch -- directive text + target subagent.
 
 Invokes _rewrite_command directly (no LLM, no container) and asserts the
-directive names requirements-capture-agent, embeds user steering, and that the
-deterministic /captura path is not broken.
+directive names requirements-capture-agent, embeds user steering, and that
+/captura delegates to the same agent-driven subagent.
 
 Run: .venv/bin/python scripts/smoke_captura_agente_dispatch.py
 """
@@ -57,20 +57,24 @@ def main() -> None:
     out = _rewrite_command("/captura-agente")
     check("reconoce variante con guion", "requirements-capture-agent" in out)
 
-    print("== /captura sigue determinista (no roto) ==")
+    print("== /captura rutea al agentico (mismo que /captura_agente) ==")
     out = _rewrite_command("/captura")
     check(
-        "NO nombra requirements-capture-agent",
-        "requirements-capture-agent" not in out,
+        "nombra requirements-capture-agent",
+        "requirements-capture-agent" in out,
     )
     check(
-        "sigue con run_requirements_capture",
-        "run_requirements_capture" in out,
+        "NO menciona run_requirements_capture (determinista quitado)",
+        "run_requirements_capture" not in out,
     )
 
-    print("== /captura docs/x subpath intacto ==")
+    print("== /captura docs/x -> steering embebido ==")
     out = _rewrite_command("/captura docs/x")
-    check('target_subpath="docs/x"', 'target_subpath="docs/x"' in out, out)
+    check(
+        'INSTRUCCIONES DEL USUARIO: "docs/x"',
+        'INSTRUCCIONES DEL USUARIO: "docs/x"' in out,
+        out,
+    )
 
     print("=" * 52)
     if _FAILED:

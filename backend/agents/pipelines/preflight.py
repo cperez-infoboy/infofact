@@ -8,9 +8,9 @@ Host-side (FastAPI process). Never loads the heavy models — import + endpoint
 ping only, so the whole check completes in a second or two.
 
 The capture subagent calls ``check_capture_health`` (a thin @tool wrapper in
-backend/agents/subagents/requirements_capture.py) before ``run_requirements_capture``;
-the wrapper streams ``preflight.progress`` / ``preflight.failed`` over the SSE
-relay and surfaces this report to the model and the UI.
+backend/agents/subagents/requirements_capture_agent.py) before the capture
+stages; the wrapper streams ``preflight.progress`` / ``preflight.failed`` over
+the SSE relay and surfaces this report to the model and the UI.
 """
 from __future__ import annotations
 
