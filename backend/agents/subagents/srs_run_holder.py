@@ -22,11 +22,12 @@ from backend.agents.subagents.capture_run_holder import StageLoopExceeded
 STAGE_QUALITY = "quality"
 STAGE_GOALS = "goals"
 STAGE_COVERAGE = "coverage"
+STAGE_NARRATIVE = "narrative"
 STAGE_COMMIT = "commit"
 
 DEFAULT_STAGE_CAP = 3
 
-_REQUIRED_BEFORE_COMMIT = (STAGE_QUALITY, STAGE_GOALS, STAGE_COVERAGE)
+_REQUIRED_BEFORE_COMMIT = (STAGE_QUALITY, STAGE_GOALS, STAGE_COVERAGE, STAGE_NARRATIVE)
 
 
 @dataclass
@@ -46,6 +47,7 @@ class SrsRun:
     goals_summary: dict[str, Any] | None = None
     coverage: dict[str, Any] | None = None
     traceability: dict[str, Any] | None = None
+    narrative: dict[str, str] | None = None
     markdown: str = ""
     requirement_codes: list[str] = field(default_factory=list)
     requirement_count: int = 0
@@ -67,6 +69,7 @@ class SrsRun:
         self.goals_summary = None
         self.coverage = None
         self.traceability = None
+        self.narrative = None
         self.markdown = ""
         self.requirement_codes = []
         self.requirement_count = 0

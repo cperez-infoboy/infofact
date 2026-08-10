@@ -522,6 +522,22 @@ def build_structure_map(doc, *, document_id: str) -> StructureMap:
     )
 
 
+def verification_text(chunks: list[Chunk], smap: StructureMap) -> str:
+    """Full text for span verification, including vision-generated descriptions.
+
+    Image descriptions are not part of Docling's markdown export, so they must
+    be appended separately for verify_spans to match source_spans from
+    image-derived requirements.
+    """
+    parts = [smap.full_text] if smap.full_text else []
+    parts.extend(
+        c.text for c in chunks
+        if getattr(c, "element_kinds", None)
+        and "image_description" in c.element_kinds
+    )
+    return "\n".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------

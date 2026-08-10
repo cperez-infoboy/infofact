@@ -426,17 +426,44 @@ def make_requirements_tools(project_id: int) -> list:
             return {"error": f"get_requirement failed: {exc}"}
 
     @tool
-    async def approve_requirement(code: str) -> dict:
-        """Mark a requirement APPROVED (human accepts it into the SRS)."""
+    async def approve_requirement(
+        code: str, mark_span_verified: bool = False,
+    ) -> dict:
+        """Mark a requirement APPROVED (human accepts it into the SRS).
+
+        Set mark_span_verified=True when the human has also manually confirmed
+        the source span against the original document — the approval will carry
+        span_verified=True in the same auditable revision.
+        """
         try:
             async with AsyncSessionLocal() as session:
                 req_id = await _code_to_id(session, project_id, code)
                 item = await store.approve_requirement(
-                    session, req_id, changed_by="agent"
+                    session, req_id,
+                    changed_by="agent",
+                    mark_span_verified=mark_span_verified,
                 )
                 return _item_summary(item)
         except Exception as exc:  # noqa: BLE001
             return {"error": f"approve_requirement failed: {exc}"}
+
+    @tool
+    async def verify_span(code: str) -> dict:
+        """Mark a requirement's source span as human-verified.
+
+        Use this when span_verified is False but a human has confirmed the
+        requirement traces to its quoted source. Records a manual verification
+        revision so the audit trail reflects WHO checked it and WHEN.
+        """
+        try:
+            async with AsyncSessionLocal() as session:
+                req_id = await _code_to_id(session, project_id, code)
+                item = await store.verify_span(
+                    session, req_id, changed_by="agent"
+                )
+                return _item_summary(item)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"verify_span failed: {exc}"}
 
     @tool
     async def reject_requirement(code: str, reason: str) -> dict:
@@ -583,6 +610,7 @@ def make_requirements_tools(project_id: int) -> list:
         list_requirements,
         get_requirement,
         approve_requirement,
+        verify_span,
         reject_requirement,
         add_acceptance_criterion,
         build_srs,

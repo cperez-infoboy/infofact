@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Mermaid Test</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<style>body{background:#1a1a1a;color:#ddd;font-family:monospace;padding:2rem}</style>
+</head>
+<body>
+<h2>Test 1: Minimal with underscores</h2>
+<pre id="t1-log"></pre>
+<div id="t1"></div>
+
+<h2>Test 2: Full diagram no accents</h2>
+<pre id="t2-log"></pre>
+<div id="t2"></div>
+
+<h2>Test 3: Full diagram with accents + parentheses</h2>
+<pre id="t3-log"></pre>
+<div id="t3"></div>
+
+<h2>Test 4: Simple no underscores</h2>
+<pre id="t4-log"></pre>
+<div id="t4"></div>
+
+<script>
+const tests = [
+  { id: 't1', code: `sequenceDiagram
+    participant Usuario
+    participant APP_SIGSA
+    Usuario ->> APP_SIGSA : test message` },
+  { id: 't2', code: `sequenceDiagram
+    participant Usuario
+    participant APP_SIGSA
+    participant Servidor_Aplicaciones
+    participant Sistema_SIGE
+    Usuario ->> APP_SIGSA : Ingresa credenciales
+    APP_SIGSA ->> Servidor_Aplicaciones : Envia credenciales
+    Sistema_SIGE -->> Servidor_Aplicaciones : Retorna datos
+    APP_SIGSA -->> Usuario : Redirige a pantalla` },
+  { id: 't3', code: `sequenceDiagram
+    participant Usuario
+    participant APP_SIGSA
+    Usuario ->> APP_SIGSA : Ingresa credenciales (Usuario, Contraseña)
+    APP_SIGSA ->> APP_SIGSA : Envía validación` },
+  { id: 't4', code: `sequenceDiagram
+    participant User
+    participant App
+    User ->> App : test` }
+];
+
+mermaid.initialize({ startOnLoad: false, theme: 'dark' });
+
+async function runTests() {
+  for (const t of tests) {
+    const el = document.getElementById(t.id);
+    const log = document.getElementById(t.id + '-log');
+    try {
+      const { svg } = await mermaid.render('render-' + t.id, t.code);
+      el.innerHTML = svg;
+      log.textContent = 'OK';
+      log.style.color = '#4ade80';
+    } catch (err) {
+      log.textContent = 'ERROR: ' + err.message;
+      log.style.color = '#f87171';
+    }
+  }
+}
+runTests();
+</script>
+</body>
+</html>

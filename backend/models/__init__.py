@@ -36,6 +36,18 @@ from backend.models.srs import (
     SrsDocument,
     SrsStatus,
 )
+from backend.models.analysis import (
+    AdrStatus,
+    AnalysisDocument,
+    AnalysisStatus,
+    ArchitectureDecision,
+    ContractType,
+    DomainEntity,
+    DomainRelationship,
+    MerCardinality,
+    SubProject,
+    SubProjectContract,
+)
 from backend.models.user import User
 
 __all__ = [
@@ -73,4 +85,14 @@ __all__ = [
     "LinkRelation",
     "LinkStatus",
     "SrsStatus",
+    "AnalysisDocument",
+    "DomainEntity",
+    "DomainRelationship",
+    "ArchitectureDecision",
+    "SubProject",
+    "SubProjectContract",
+    "AnalysisStatus",
+    "MerCardinality",
+    "AdrStatus",
+    "ContractType",
 ]

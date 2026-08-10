@@ -26,16 +26,22 @@ from backend.agents.subagents.srs_run_holder import (
     STAGE_COMMIT,
     STAGE_COVERAGE,
     STAGE_GOALS,
+    STAGE_NARRATIVE,
     STAGE_QUALITY,
     clear_run,
     get_or_create_run,
     get_run,
 )
+from backend.agents.tools.documents_tools import make_document_read_tools
 from backend.database import AsyncSessionLocal
 from backend.models.requirement import ReqStatus
 from backend.services import goals_engine, srs_coverage, srs_quality, srs_store
 from backend.services.requirement_store import list_requirements
-from backend.services.srs_assembler import SRS_STRUCTURE, _draft_narrative
+from backend.services.srs_assembler import (
+    SRS_STRUCTURE,
+    _draft_narrative,
+    draft_narrative_llm,
+)
 from backend.services.srs_builder import build_srs
 
 logger = logging.getLogger(__name__)
@@ -70,18 +76,27 @@ mitigar). Vincula cada goal a los requerimientos que lo realizan \
 3. check_coverage   — Audita la cobertura: ISO/IEC 25010 (qué características \
 de calidad no tienen ningún requerimiento), presencia de secciones 29148 y \
 cobertura de goals (goals sin reqs que los realicen = gap).
-4. commit_srs       — Persiste el SrsDocument CANDIDATE: combina narrativa \
+4. draft_narrative  — Redacta con LLM las 8 subsecciones authored del SRS \
+(propósito, alcance, definiciones, referencias, perspectiva, usuarios, entorno \
+y supuestos) usando contexto RAG de los documentos fuente de captura. Puedes \
+consultar los documentos con search_documents / get_document_passage antes de \
+redactar.
+5. commit_srs       — Persiste el SrsDocument CANDIDATE: combina narrativa \
 + secciones proyectadas + hallazgos + goals + cobertura + matriz de \
 trazabilidad. Solo esta etapa escribe la DB.
 
 Flujo:
 1. ORIENTAR — Confirma que hay requerimientos vivos (si no,informa al usuario \
 que primero debe capturar requerimientos con /captura_agente).
-2. ORQUESTAR LAS ETAPAS — Ejecuta analyze_quality -> infer_goals -> \
-check_coverage -> commit_srs EN ESE ORDEN (cobertura depende de los goals).
-3. REFINAR — Si analyze_quality halla bloqueantes graves, mencionalo en tu \
+2. ORIENTARSE EN LAS FUENTES — Usa list_documents y search_documents para \
+revisar los documentos que dieron origen a los requerimientos antes de \
+redactar el SRS.
+3. ORQUESTAR LAS ETAPAS — Ejecuta analyze_quality -> infer_goals -> \
+check_coverage -> draft_narrative -> commit_srs EN ESE ORDEN (cobertura \
+depende de los goals; narrativa usa el contexto acumulado).
+4. REFINAR — Si analyze_quality halla bloqueantes graves, mencionalo en tu \
 reporte antes de continuar (el usuario decide si corregir los reqs primero).
-4. REPORTAR — Tras commit_srs, resume: versión generada, conteo de reqs, \
+5. REPORTAR — Tras commit_srs, resume: versión generada, conteo de reqs, \
 hallazgos por severidad, gaps de cobertura y goals inferidos.
 
 Reglas estrictas:
@@ -303,8 +318,92 @@ Acumula hallazgos de cobertura en el holder. Emite ``coverage.report``.
         }
 
     @tool
+    async def draft_narrative() -> dict:
+        """Etapa 4/5: redacta con LLM las 8 subsecciones authored del SRS.
+
+        Genera prosa para propósito, alcance, definiciones, referencias, \
+perspectiva, usuarios, entorno operativo y supuestos, usando contexto RAG \
+de los documentos fuente de captura. Preserva las secciones deterministas \
+(overview, features) y reapende el bloque de conteos a la perspectiva. \
+Emite ``narrative.drafted`` al terminar.
+        """
+        run = get_run(project_id)
+        if run is None:
+            return _no_run("analyze_quality")
+        if STAGE_COVERAGE not in run.stages_done:
+            return {
+                "error": "missing_stages",
+                "missing": [STAGE_COVERAGE],
+                "message": (
+                    "draft_narrative requiere que check_coverage haya corrido "
+                    "antes (para usar las métricas de cobertura en el contexto)."
+                ),
+            }
+        try:
+            run.bump(STAGE_NARRATIVE)
+        except StageLoopExceeded as exc:
+            return _loop_err(exc)
+
+        on_progress, on_event = _make_emitters()
+        await on_progress(
+            STAGE_NARRATIVE,
+            "redacción narrativa asistida por LLM (8 secciones authored)",
+        )
+        try:
+            async with AsyncSessionLocal() as session:
+                items = await list_requirements(
+                    session, project_id, include_deleted=True
+                )
+            live = [it for it in items if it.status in _LIVE_STATUSES]
+
+            # Narrativa determinista como base/fallback.
+            det_narrative = _draft_narrative(
+                run.project_name,
+                run.project_description,
+                run.quality_summary or {},
+                run.coverage or {},
+                run.goals_summary or {},
+                len(live),
+                live_items=live,
+            )
+            # Enriquecer con LLM (fallback determinista on failure).
+            narrative = await draft_narrative_llm(
+                det_narrative,
+                project_id=project_id,
+                project_name=run.project_name,
+                project_description=run.project_description,
+                live_items=live,
+                quality_summary=run.quality_summary or {},
+                coverage=run.coverage or {},
+                goals_summary=run.goals_summary or {},
+            )
+        except Exception as exc:  # noqa: BLE001 — surface al modelo
+            logger.exception("draft_narrative failed")
+            return {"error": f"draft_narrative failed: {exc}"}
+
+        run.narrative = narrative
+        run.stages_done.add(STAGE_NARRATIVE)
+
+        # Contar cuántas subsecciones authored dejaron de tener placeholder.
+        placeholders = sum(
+            1 for v in narrative.values()
+            if isinstance(v, str) and "Editor:" in v
+        )
+        await on_event("narrative.drafted", {
+            "subsections": 8,
+            "remaining_placeholders": placeholders,
+        })
+
+        return {
+            "stage": STAGE_NARRATIVE,
+            "subsections": 8,
+            "remaining_placeholders": placeholders,
+            "stages_done": sorted(run.stages_done),
+        }
+
+    @tool
     async def commit_srs() -> dict:
-        """Etapa 4/4: persiste el SrsDocument CANDIDATE.
+        """Etapa 5/5: persiste el SrsDocument CANDIDATE.
 
         Combina narrativa (borrador) + secciones proyectadas (markdown) + \
 hallazgos + goals + cobertura + matriz de trazabilidad. Es la ÚNICA etapa \
@@ -336,23 +435,32 @@ y limpia el holder.
             async with AsyncSessionLocal() as session:
                 # Hallazgos (calidad + cobertura) -> persistencia unica.
                 await srs_store.replace_findings(session, project_id, run.findings)
-                # Trazabilidad + proyeccion markdown + codigos vivos.
+                # Trazabilidad + items vivos.
                 traceability = await srs_store.build_traceability(session, project_id)
+                items = await list_requirements(session, project_id, include_deleted=True)
+                live = [it for it in items if it.status in _LIVE_STATUSES]
+                # Narrativa editable: usa la del stage narrative si existe,
+                # si no, genera el borrador determinista como fallback.
+                if run.narrative is not None:
+                    narrative = run.narrative
+                else:
+                    narrative = _draft_narrative(
+                        run.project_name,
+                        run.project_description,
+                        run.quality_summary or {},
+                        run.coverage or {},
+                        run.goals_summary or {},
+                        len(live),
+                        live_items=live,
+                    )
+                # Proyeccion Markdown (con narrative + structure 29148).
                 built = await build_srs(
                     session,
                     project_id,
                     project_name=run.project_name,
                     project_description=run.project_description,
-                )
-                items = await list_requirements(session, project_id, include_deleted=True)
-                live = [it for it in items if it.status in _LIVE_STATUSES]
-                narrative = _draft_narrative(
-                    run.project_name,
-                    run.project_description,
-                    run.quality_summary or {},
-                    run.coverage or {},
-                    run.goals_summary or {},
-                    len(live),
+                    narrative=narrative,
+                    structure=SRS_STRUCTURE,
                 )
                 payload = {
                     "structure": SRS_STRUCTURE,
@@ -397,7 +505,7 @@ y limpia el holder.
             ),
         }
 
-    return [analyze_quality, infer_goals, check_coverage, commit_srs]
+    return [analyze_quality, infer_goals, check_coverage, draft_narrative, commit_srs]
 
 
 def make_srs_agent_subagent(
@@ -414,15 +522,18 @@ def make_srs_agent_subagent(
     recibe en ``subagents=[...]`` y DeepAgents envuelve como tool ``task``.
     """
     stage_tools = _make_stage_tools(project_id, project_name, project_description)
+    doc_tools = make_document_read_tools(project_id)
+    tools = stage_tools + doc_tools
     return {
         "name": "srs-agent",
         "description": (
             "Subagente AGENTICO de generación de SRS: analiza la calidad de los "
             "requerimientos (INCOSE/smells/EARS + LLM), infiere el modelo de "
-            "goals (GORE), audita la cobertura (ISO 25010) y persiste un "
-            "SrsDocument CANDIDATE estructurado, editable y trazable. Razona "
-            "etapa por etapa (calidad -> goals -> cobertura -> commit)."
+            "goals (GORE), audita la cobertura (ISO 25010), redacta la "
+            "narrativa del SRS con LLM y persiste un SrsDocument CANDIDATE "
+            "estructurado, editable y trazable. Razona etapa por etapa "
+            "(calidad -> goals -> cobertura -> narrativa -> commit)."
         ),
         "system_prompt": SRS_AGENT_PROMPT,
-        "tools": stage_tools,
+        "tools": tools,
     }

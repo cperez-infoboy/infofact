@@ -38,9 +38,9 @@ logger = logging.getLogger(__name__)
 
 PHASE_PROMPTS: dict[str, str] = {
     "requirements": (
-        "Eres el orquestador de la fase de requerimientos de InfoFact. "
-        "Trabajas en el workspace del proyecto y DELEGAS el trabajo pesado a "
-        "subagentes especializados mediante la tool `task`:\n"
+        "Eres el orquestador de InfoFact. Trabajas en el workspace del "
+        "proyecto y DELEGAS el trabajo pesado a subagentes especializados "
+        "mediante la tool `task`:\n"
         "- `/captura`: extrae y cura requerimientos desde documentos "
         "(subagente `requirements-capture-agent`). Los requerimientos se "
         "persisten como filas tipadas (RequirementItem), NO como Markdown.\n"
@@ -48,6 +48,11 @@ PHASE_PROMPTS: dict[str, str] = {
         "requerimientos capturados — análisis de calidad (INCOSE/smells/EARS), "
         "modelado de goals (GORE) y cobertura (ISO 25010) — y persiste un "
         "SrsDocument versionado (subagente `srs-agent`).\n"
+        "- `/analisis`: genera el análisis y diseño arquitectónico a partir "
+        "de los requerimientos capturados — MER (Modelo Entidad-Relacion), "
+        "diagramas de proceso, análisis NFR, Architecture Decision Records "
+        "(ADRs) y descomposición en sub-proyectos con contratos. Persiste un "
+        "AnalysisDocument versionado (subagente `analysis-agent`).\n"
         "Tienes herramientas de LECTURA para inspeccionar requerimientos, el "
         "SRS, su calidad, cobertura, goals y trazabilidad sin delegar. "
         "Responde en español neutro. No escribas el SRS a mano: el subagente "
@@ -57,6 +62,23 @@ PHASE_PROMPTS: dict[str, str] = {
         "`get_document_passage`): usalas para verificar un requerimiento "
         "contra su fuente, localizar un tema o citar un pasaje literal. No "
         "reemplazan la delegacion de la captura al subagente."
+    ),
+    "analysis": (
+        "Eres el orquestador de la fase de analisis y diseno de InfoFact. "
+        "Tu trabajo es delegar al subagente `analysis-agent` (mediante la "
+        "tool `task`) para producir los artefactos arquitectonicos del "
+        "proyecto a partir de los requerimientos YA capturados:\n"
+        "- `/analisis`: genera el MER (Modelo Entidad-Relacion), diagramas "
+        "de proceso (maquinas de estados + secuencias), analisis NFR con "
+        "stack recomendado, Architecture Decision Records (ADRs) y "
+        "descomposicion en sub-proyectos con contratos. Persiste un "
+        "AnalysisDocument versionado (subagente `analysis-agent`).\n"
+        "Consumes el SRS y los requerimientos capturados en la fase previa. "
+        "NO extraes requerimientos ni los modificas. Tienes herramientas de "
+        "LECTURA para inspeccionar requerimientos y el SRS sin delegar. "
+        "Responde en español neutro. No redactes los artefactos a mano: el "
+        "subagente `analysis-agent` los genera y persiste a partir de los "
+        "requerimientos vivos del proyecto."
     ),
 }
 
@@ -141,7 +163,10 @@ def build_agent(
     # project's rows. Built per request alongside the agent (same lifecycle as
     # the sandbox).
     subagents: list[Any] = []
-    if phase == "requirements" and project_id is not None:
+    # All subagents are always available regardless of phase so any command
+    # (/captura, /srs, /analisis) works from any session. The phase controls
+    # only the system prompt (default behavior), not subagent availability.
+    if project_id is not None:
         subagents.append(
             make_requirements_capture_agent_subagent(
                 project_id=project_id,
@@ -160,20 +185,33 @@ def build_agent(
                 project_description=project_description or "",
             )
         )
+        from backend.agents.subagents.analysis_agent import (
+            make_analysis_agent_subagent,
+        )
+        subagents.append(
+            make_analysis_agent_subagent(
+                project_id=project_id,
+                profile=profile,
+                project_slug=project_slug,
+                project_name=project_name or "",
+                project_description=project_description or "",
+            )
+        )
 
-    # Read-only access to the requirements store so the orchestrator can answer
-    # "list / describe / show the decomposition tree of REQ-NNN" directly,
-    # without delegating to the capture subagent. Bound to project_id in the
-    # requirements phase only; mutation tools stay exclusive to the subagent.
+    # Read-only tools for the orchestrator: requirements, SRS, and documents
+    # (including RAG semantic search) are always available so the orchestrator
+    # can answer questions about the project without delegating to a subagent.
     orchestrator_tools: list[Any] = [web_search, fetch_url]
-    if phase == "requirements" and project_id is not None:
+    if project_id is not None:
         from backend.agents.tools.requirements_tools import (
             make_requirements_read_tools,
         )
         orchestrator_tools.extend(make_requirements_read_tools(project_id))
         from backend.agents.tools.srs_tools import make_srs_read_tools
         orchestrator_tools.extend(make_srs_read_tools(project_id))
-        from backend.agents.tools.documents_tools import make_document_read_tools
+        from backend.agents.tools.documents_tools import (
+            make_document_read_tools,
+        )
         orchestrator_tools.extend(make_document_read_tools(project_id))
 
     return create_deep_agent(

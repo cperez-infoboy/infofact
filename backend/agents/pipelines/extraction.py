@@ -30,7 +30,7 @@ from pydantic import BaseModel, Field
 from backend.agents.llm import build_llm, structured_llm
 from backend.agents.pipelines._quality_rules import PREVENTION_RULES
 from backend.agents.pipelines._resilience import DEFAULT_CONCURRENCY
-from backend.agents.pipelines.ingestion import Chunk, StructureMap
+from backend.agents.pipelines.ingestion import Chunk, StructureMap, verification_text
 
 logger = logging.getLogger(__name__)
 
@@ -447,7 +447,7 @@ async def gap_pass(
     )
     return await extract_all(
         candidates,
-        doc_texts={smap.document_id: smap.full_text},
+        doc_texts={smap.document_id: verification_text(chunks, smap)},
         project_name=project_name,
         project_description=project_description,
         concurrency=concurrency,

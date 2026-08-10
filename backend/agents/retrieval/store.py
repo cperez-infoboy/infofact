@@ -141,8 +141,14 @@ async def search(
     *,
     top_k: int = 5,
     session: AsyncSession | None = None,
+    used_in_capture_only: bool = False,
 ) -> list[SearchHit]:
     """Retrieval semantico top-k sobre los documentos del proyecto.
+
+    Cuando ``used_in_capture_only=True``, filtra solo documentos marcados como
+    usados en la captura de requerimientos (``ProjectDocument.used_in_capture``).
+    Esto asegura que el SRS agent solo consulte documentos que generaron los
+    requerimientos, no documentos presentes en el proyecto sin capturar.
 
     Scoping (sin cross-leak)::
 
@@ -166,29 +172,32 @@ async def search(
     try:
         import numpy as np
 
-        rows = (
-            await session.execute(
-                select(
-                    DocumentEmbedding.chunk_text,
-                    DocumentEmbedding.section_path,
-                    DocumentEmbedding.page,
-                    DocumentEmbedding.parse_id,
-                    DocumentEmbedding.embedding,
-                    ProjectDocument.rel_path,
-                    Project.slug,
-                )
-                .join(
-                    DocumentParse,
-                    DocumentEmbedding.parse_id == DocumentParse.id,
-                )
-                .join(
-                    ProjectDocument,
-                    DocumentParse.sha256 == ProjectDocument.sha256,
-                )
-                .join(Project, Project.id == ProjectDocument.project_id)
-                .where(ProjectDocument.project_id == project_id)
+        stmt = (
+            select(
+                DocumentEmbedding.chunk_text,
+                DocumentEmbedding.section_path,
+                DocumentEmbedding.page,
+                DocumentEmbedding.parse_id,
+                DocumentEmbedding.embedding,
+                ProjectDocument.rel_path,
+                Project.slug,
             )
-        ).all()
+            .join(
+                DocumentParse,
+                DocumentEmbedding.parse_id == DocumentParse.id,
+            )
+            .join(
+                ProjectDocument,
+                DocumentParse.sha256 == ProjectDocument.sha256,
+            )
+            .join(Project, Project.id == ProjectDocument.project_id)
+            .where(ProjectDocument.project_id == project_id)
+        )
+        if used_in_capture_only:
+            stmt = stmt.where(
+                ProjectDocument.used_in_capture == True  # noqa: E712
+            )
+        rows = (await session.execute(stmt)).all()
         if not rows:
             return []
 

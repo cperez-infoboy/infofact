@@ -127,16 +127,25 @@ def make_document_read_tools(project_id: int) -> list:
             return {"error": f"list_documents failed: {exc}"}
 
     @tool
-    async def search_documents(query: str, top_k: int = 5) -> dict:
+    async def search_documents(
+        query: str, top_k: int = 5, captured_only: bool = True
+    ) -> dict:
         """Busqueda semantica top-k sobre los documentos fuente del proyecto.
 
         Devuelve los chunks mas relevantes a ``query`` con su texto,
         ``document_id``, ``section_path``, ``page`` y ``score``. Usalo para
         localizar donde un tema o requerimiento se trata en los documentos, o
         para verificar si un requerimiento esta respaldado por la fuente.
+
+        ``captured_only`` (default True): restringe la busqueda a los documentos
+        usados en la captura de requerimientos. Pasar False para buscar en
+        todos los documentos del proyecto.
         """
         try:
-            hits = await retrieval.search(project_id, query, top_k=top_k)
+            hits = await retrieval.search(
+                project_id, query, top_k=top_k,
+                used_in_capture_only=captured_only,
+            )
             return {
                 "count": len(hits),
                 "items": [

@@ -121,6 +121,17 @@
         >
           AGR
         </button>
+        <button
+          type="button"
+          class="absolute top-1 right-36 z-20 px-2 py-0.5 text-[10px] font-mono uppercase tracking-wider rounded-sm border border-border bg-surface-2 text-text-dim hover:bg-surface-3 hover:text-text transition-colors {$activeTabId ===
+          'analysis'
+            ? 'bg-accent text-bg border-accent'
+            : ''}"
+          onclick={() => openView('analysis')}
+          title="Ver análisis arquitectónico generado desde los requerimientos"
+        >
+          ANÁLISIS
+        </button>
       </div>
 
       <ResizeHandle onResize={onChatResize} />

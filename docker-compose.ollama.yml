@@ -1,0 +1,32 @@
+# Ollama — servidor LLM local para pruebas con qwen3.6
+#
+# Requisitos previos:
+#   1. nvidia-container-toolkit instalado
+#   2. `sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker`
+#
+# Uso:
+#   docker compose -f docker-compose.ollama.yml up -d
+#   docker compose -f docker-compose.ollama.yml exec ollama ollama pull qwen3.6:27b
+#
+# API (OpenAI-compatible):
+#   curl http://localhost:11434/v1/chat/completions \
+#     -H "Content-Type: application/json" \
+#     -d '{"model":"qwen3.6:27b","messages":[{"role":"user","content":"hola"}]}'
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      # Modelos descargados (~17 GB para qwen3.6:27b). Persistente.
+      - ./data/ollama:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped

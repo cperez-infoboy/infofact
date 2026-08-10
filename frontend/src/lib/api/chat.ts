@@ -16,6 +16,13 @@
 //   event: goal.inferred\ndata: {code, kind, statement, status}
 //   event: coverage.report\ndata: {total, functional, nfr, gaps_25010, ...}
 //   event: srs.ready\ndata: {version, status, requirement_count, ...}
+//   event: analysis.progress\ndata: {"stage": "...", "message": "..."}
+//   event: analysis.mer_ready\ndata: {entities, relationships}
+//   event: analysis.nfr_ready\ndata: {...}
+//   event: analysis.process_ready\ndata: {diagrams}
+//   event: analysis.adr_ready\ndata: {adrs}
+//   event: analysis.subproject_ready\ndata: {sub_projects}
+//   event: analysis.ready\ndata: {version, status, requirement_count, entities, relationships, adrs, sub_projects}
 
 export interface ToolInput {
   [key: string]: unknown;
@@ -114,6 +121,43 @@ export interface SrsReadyEvent {
   goals: number;
 }
 
+/** Fine event: MER listo (analysis.mer_ready). */
+export interface AnalysisMerReadyEvent {
+  entities?: number;
+  relationships?: number;
+}
+
+/** Fine event: NFR listo (analysis.nfr_ready). Payload opaco por ahora. */
+export interface AnalysisNfrReadyEvent {
+  [key: string]: unknown;
+}
+
+/** Fine event: diagramas de proceso listos (analysis.process_ready). */
+export interface AnalysisProcessReadyEvent {
+  diagrams?: number;
+}
+
+/** Fine event: ADRs listos (analysis.adr_ready). */
+export interface AnalysisAdrReadyEvent {
+  adrs?: number;
+}
+
+/** Fine event: sub-proyectos listos (analysis.subproject_ready). */
+export interface AnalysisSubProjectReadyEvent {
+  sub_projects?: number;
+}
+
+/** Fine event: análisis candidato listo (analysis.ready). */
+export interface AnalysisReadyEvent {
+  version: number;
+  status: string;
+  requirement_count: number;
+  entities: number;
+  relationships: number;
+  adrs: number;
+  sub_projects: number;
+}
+
 export interface StreamHandlers {
   onToken?: (delta: string) => void;
   onToolStart?: (name: string, input: ToolInput) => void;
@@ -128,6 +172,14 @@ export interface StreamHandlers {
   onGoalInferred?: (g: GoalInferredEvent) => void;
   onCoverageReport?: (c: CoverageReportEvent) => void;
   onSrsReady?: (r: SrsReadyEvent) => void;
+  // Fine events del subagente analysis-agent (Phase 2: Analysis & Design).
+  onAnalysisProgress?: (p: ProgressEvent) => void;
+  onAnalysisMerReady?: (e: AnalysisMerReadyEvent) => void;
+  onAnalysisNfrReady?: (e: AnalysisNfrReadyEvent) => void;
+  onAnalysisProcessReady?: (e: AnalysisProcessReadyEvent) => void;
+  onAnalysisAdrReady?: (e: AnalysisAdrReadyEvent) => void;
+  onAnalysisSubProjectReady?: (e: AnalysisSubProjectReadyEvent) => void;
+  onAnalysisReady?: (r: AnalysisReadyEvent) => void;
   onCompleted?: () => void;
   onFailed?: (error: string) => void;
 }
@@ -322,6 +374,40 @@ function dispatchEvent(ev: ParsedEvent, handlers: StreamHandlers): void {
       break;
     case 'srs.ready':
       handlers.onSrsReady?.(payload as unknown as SrsReadyEvent);
+      break;
+    case 'analysis.progress':
+      handlers.onAnalysisProgress?.({
+        stage: (payload.stage as string) ?? '',
+        message: (payload.message as string) ?? '',
+      });
+      break;
+    case 'analysis.mer_ready':
+      handlers.onAnalysisMerReady?.(
+        payload as unknown as AnalysisMerReadyEvent
+      );
+      break;
+    case 'analysis.nfr_ready':
+      handlers.onAnalysisNfrReady?.(
+        payload as unknown as AnalysisNfrReadyEvent
+      );
+      break;
+    case 'analysis.process_ready':
+      handlers.onAnalysisProcessReady?.(
+        payload as unknown as AnalysisProcessReadyEvent
+      );
+      break;
+    case 'analysis.adr_ready':
+      handlers.onAnalysisAdrReady?.(
+        payload as unknown as AnalysisAdrReadyEvent
+      );
+      break;
+    case 'analysis.subproject_ready':
+      handlers.onAnalysisSubProjectReady?.(
+        payload as unknown as AnalysisSubProjectReadyEvent
+      );
+      break;
+    case 'analysis.ready':
+      handlers.onAnalysisReady?.(payload as unknown as AnalysisReadyEvent);
       break;
     case 'completed':
       handlers.onCompleted?.();

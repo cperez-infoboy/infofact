@@ -277,11 +277,18 @@ async def reproject_srs(
     """Refresca SOLO las secciones proyectadas de una versión (markdown + codes)."""
     async with AsyncSessionLocal() as db:
         project = await _load_owned_project(db, project_id, user)
+        # Cargar narrativa y estructura de la versión existente para
+        # preservar el texto editado por el usuario al re-proyectar.
+        existing = await srs_store.get_srs_version(db, project_id, version)
+        if existing is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "not_found")
         built = await build_srs(
             db,
             project_id,
             project_name=project.name,
             project_description=project.description or "",
+            narrative=existing.narrative,
+            structure=existing.structure,
         )
         try:
             srs = await srs_store.reproject_srs(
@@ -297,6 +304,167 @@ async def reproject_srs(
         except ValueError as exc:
             raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
     return _srs_out(srs)
+
+
+# ---------------------------------------------------------------------------
+# Secciones del SRS (acceso granular para agente / UI)
+# ---------------------------------------------------------------------------
+
+
+class SectionSubsectionOut(BaseModel):
+    id: str
+    title: str
+    has_content: bool
+
+
+class SectionOut(BaseModel):
+    id: str
+    title: str
+    kind: str
+    subsections: list[SectionSubsectionOut] | None = None
+    item_count: int | None = None
+
+
+class SectionContentOut(BaseModel):
+    id: str
+    title: str
+    kind: str
+    content: str | None = None
+    items: list[dict] | None = None
+
+
+@router.get(
+    "/projects/{project_id}/srs/versions/{version}/sections",
+    response_model=list[SectionOut],
+)
+async def list_srs_sections(
+    project_id: int,
+    version: int,
+    user: User = Depends(get_current_user),
+) -> list[SectionOut]:
+    """Devuelve el árbol de secciones del SRS con metadatos.
+
+    Para secciones ``authored`` indica si cada subsection tiene contenido.
+    Para secciones ``projected`` indica cuántos requerimientos pertenecen.
+    """
+    from backend.services.srs_builder import SECTION_REQTYPE_MAP
+    from backend.services.requirement_store import list_requirements
+
+    async with AsyncSessionLocal() as db:
+        await _load_owned_project(db, project_id, user)
+        srs = await srs_store.get_srs_version(db, project_id, version)
+        if srs is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "not_found")
+
+        all_items = await list_requirements(db, project_id, include_deleted=False)
+        live_items = [
+            it for it in all_items
+            if it.status.value in ("validated", "approved", "draft")
+        ]
+
+    result: list[SectionOut] = []
+    for section in srs.structure:
+        sec = SectionOut(
+            id=section["id"],
+            title=section["title"],
+            kind=section.get("kind", "projected"),
+        )
+        if section.get("kind") == "authored" and section.get("subsections"):
+            sec.subsections = []
+            for sub in section["subsections"]:
+                sec.subsections.append(SectionSubsectionOut(
+                    id=sub["id"],
+                    title=sub["title"],
+                    has_content=bool(srs.narrative.get(sub["id"])),
+                ))
+        elif section["id"] in SECTION_REQTYPE_MAP:
+            reqtypes = SECTION_REQTYPE_MAP[section["id"]]
+            sec.item_count = sum(
+                1 for it in live_items if it.type in reqtypes
+            )
+        result.append(sec)
+    return result
+
+
+@router.get(
+    "/projects/{project_id}/srs/versions/{version}/sections/{section_id}",
+    response_model=SectionContentOut,
+)
+async def get_srs_section(
+    project_id: int,
+    version: int,
+    section_id: str,
+    user: User = Depends(get_current_user),
+) -> SectionContentOut:
+    """Devuelve el contenido de una sección o subsection específica.
+
+    Para ``authored``: el texto de ``narrative[section_id]``.
+    Para ``projected``: los RequirementItem de esa sección.
+    """
+    from backend.services.srs_builder import SECTION_REQTYPE_MAP
+    from backend.services.requirement_store import list_requirements
+
+    async with AsyncSessionLocal() as db:
+        await _load_owned_project(db, project_id, user)
+        srs = await srs_store.get_srs_version(db, project_id, version)
+        if srs is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "not_found")
+
+    # Buscar la sección o subsection en la estructura.
+    target_title: str = section_id
+    target_kind: str = "projected"
+
+    for section in srs.structure:
+        if section["id"] == section_id:
+            target_title = section["title"]
+            target_kind = section.get("kind", "projected")
+            break
+        for sub in section.get("subsections", []):
+            if sub["id"] == section_id:
+                target_title = sub["title"]
+                target_kind = section.get("kind", "authored")
+                break
+
+    if target_kind == "authored":
+        content = srs.narrative.get(section_id, "")
+        return SectionContentOut(
+            id=section_id,
+            title=target_title,
+            kind="authored",
+            content=content or None,
+        )
+
+    # Projected: devolver items de la sección.
+    if section_id not in SECTION_REQTYPE_MAP:
+        return SectionContentOut(
+            id=section_id,
+            title=target_title,
+            kind="projected",
+            items=[],
+        )
+
+    reqtypes = SECTION_REQTYPE_MAP[section_id]
+    async with AsyncSessionLocal() as db:
+        all_items = await list_requirements(db, project_id, include_deleted=False)
+
+    items_data = [
+        {
+            "code": it.code,
+            "statement": it.statement,
+            "priority": it.priority.value,
+            "type": it.type.value,
+            "acceptance_criteria": list(it.acceptance_criteria or []),
+            "derived": it.derived,
+        }
+        for it in all_items
+        if it.type in reqtypes and it.status.value in ("validated", "approved", "draft")
+    ]
+    return SectionContentOut(
+        id=section_id,
+        title=target_title,
+        kind="projected",
+        items=items_data,
+    )
 
 
 # ---------------------------------------------------------------------------

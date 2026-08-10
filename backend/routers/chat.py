@@ -140,6 +140,9 @@ _CAPTURA_AGENTE_PREFIXES = ("/captura_agente", "/captura-agente")
 # /srs (síntesis de SRS) -> subagente srs-agent. Sin conflicto de prefijo
 # con /captura ni /agrupar (no comparten raíz).
 _SRS_PREFIX = "/srs"
+# /analisis (Fase 2: analisis y diseno arquitectonico) -> subagente
+# analysis-agent. Sin conflicto de prefijo con los demás comandos.
+_ANALYSIS_PREFIX = "/analisis"
 
 # Marcadores de decision del usuario sobre los requerimientos existentes. La
 # guardia router-level solo deja pasar la captura cuando el texto los contiene
@@ -295,6 +298,45 @@ def _srs_directive(user_instructions: str) -> str:
     return directive
 
 
+def _analysis_directive(user_instructions: str) -> str:
+    """Directiva para el comando ``/analisis`` (subagente analysis-agent).
+
+    Delega al subagente ``analysis-agent`` la generación de artefactos
+    arquitectonicos (MER, diagramas de proceso, NFR, ADRs, sub-proyectos) a
+    partir de los requerimientos YA capturados. Sin gate router-level propio:
+    cada invocacion crea una versión CANDIDATE nueva del AnalysisDocument
+    (versionado, no destructivo). El subagente gestiona el caso "no hay
+    requerimientos vivos" informándolo al usuario.
+    """
+    directive = (
+        "[DIRECTIVE] Delega INMEDIATAMENTE al subagente `analysis-agent` "
+        "(usando la tool `task`) para ejecutar el analisis y diseno "
+        "arquitectonico del proyecto a partir de los requerimientos YA "
+        "capturados. NO explores el sistema de archivos antes de delegar (sin "
+        "ls, glob, read_file ni execute): el subagente lee los requerimientos "
+        "vivos del store. Este subagente RAZONA la generación etapa por etapa "
+        "en este orden: generate_mer (Modelo Entidad-Relacion) -> "
+        "analyze_nfrs (decisiones arquitectonicas + stack) -> "
+        "generate_processes (maquinas de estados + secuencias) -> "
+        "generate_adrs (Architecture Decision Records) -> "
+        "propose_subprojects (descomposicion + contratos) -> "
+        "commit_analysis (persiste un AnalysisDocument CANDIDATE). Respeta "
+        "las dependencias: procesos necesita el MER, ADRs necesita el "
+        "analisis NFR, sub-proyectos necesita MER + ADRs. Si no hay "
+        "requerimientos vivos, el subagente lo informará: el usuario debe "
+        "capturar primero con /captura. Cuando termine, reporta al usuario: "
+        "entidades, relaciones, ADRs, sub-proyectos y diagramas generados."
+    )
+    if user_instructions:
+        directive += " INSTRUCCIONES DEL USUARIO: "
+        directive += chr(34) + user_instructions + chr(34)
+        directive += (
+            " (incorporalas en el razonamiento entre etapas; dirigen el "
+            "razonamiento, no parámetros internos del pipeline)."
+        )
+    return directive
+
+
 def _rewrite_command(content: str) -> str:
     """Reescribe los slash commands en directivas al subagente.
 
@@ -328,6 +370,14 @@ def _rewrite_command(content: str) -> str:
             stripped[len(_SRS_PREFIX):].strip().lstrip("/").strip()
         )
         return _srs_directive(_user_instructions)
+
+    # /analisis -> Fase 2: analisis y diseno arquitectonico (subagente
+    # analysis-agent). Texto tras el comando es steering del usuario.
+    if stripped.startswith(_ANALYSIS_PREFIX):
+        _user_instructions = (
+            stripped[len(_ANALYSIS_PREFIX):].strip().lstrip("/").strip()
+        )
+        return _analysis_directive(_user_instructions)
 
     # /captura_agente (and /captura-agente) -> agent-driven subagent. Checked
     # BEFORE the /captura branch because "/captura_agente" startswith

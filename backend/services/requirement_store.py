@@ -19,6 +19,7 @@ lifecycles; a fresh AsyncSessionLocal per tool call is the intended pattern.
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from sqlalchemy import delete, func, select
@@ -35,6 +36,8 @@ from backend.models.requirement import (
     RequirementRevision,
 )
 from backend.services._req_codes import gen_opaque_code
+
+logger = logging.getLogger(__name__)
 
 _SOFT_DELETED = frozenset(
     {ReqStatus.REJECTED, ReqStatus.MERGED, ReqStatus.SUPERSEDED}
@@ -230,13 +233,26 @@ async def add_acceptance_criterion(
 
 
 async def approve_requirement(
-    session: AsyncSession, req_id: int, *, changed_by: str = "human"
+    session: AsyncSession,
+    req_id: int,
+    *,
+    changed_by: str = "human",
+    mark_span_verified: bool = False,
 ) -> RequirementItem:
-    """Mark a requirement APPROVED by a human."""
+    """Mark a requirement APPROVED by a human.
+
+    When mark_span_verified is True, also sets span_verified=True — use this
+    when the human has manually confirmed the source span against the original
+    document (the pipeline's fuzzy match is not the only path to verification).
+    """
     item = await _get_item(session, req_id)
     item.status = ReqStatus.APPROVED
+    if mark_span_verified:
+        item.span_verified = True
     await _append_revision(
-        session, item, reason="approve", changed_by=changed_by
+        session, item,
+        reason="approve" + ("+span_verified" if mark_span_verified else ""),
+        changed_by=changed_by,
     )
     await session.commit()
     await session.refresh(item)
@@ -250,11 +266,60 @@ async def reject_requirement(
     reason: str,
     changed_by: str = "human",
 ) -> RequirementItem:
-    """Soft-delete: status -> REJECTED. Row stays for audit."""
+    """Soft-delete: status -> REJECTED. Row stays for audit.
+
+    Children (items with parent_id = this item) are auto-detached: promoted to
+    independent items (parent_id=None, derived=False) with a revision entry.
+    Only REJECTED triggers this — SUPERSEDED (split) and MERGED keep parent_id
+    for their own lifecycle semantics.
+    """
     item = await _get_item(session, req_id)
     item.status = ReqStatus.REJECTED
     await _append_revision(
         session, item, reason=reason[:_CHANGE_REASON_MAX], changed_by=changed_by
+    )
+
+    # Auto-detach children: promote them to independent items.
+    children = list(await session.scalars(
+        select(RequirementItem).where(
+            RequirementItem.parent_id == item.id,
+            RequirementItem.project_id == item.project_id,
+        )
+    ))
+    for child in children:
+        child.parent_id = None
+        child.derived = False
+        await _append_revision(
+            session, child,
+            reason=f"parent_rejected:{item.code}",
+            changed_by=changed_by,
+        )
+    if children:
+        logger.info(
+            "reject_requirement: detached %d children of %s (status=REJECTED)",
+            len(children), item.code,
+        )
+
+    await session.commit()
+    await session.refresh(item)
+    return item
+
+
+async def verify_span(
+    session: AsyncSession, req_id: int, *, changed_by: str = "human"
+) -> RequirementItem:
+    """Mark a requirement's source span as human-verified.
+
+    Use this when the pipeline's fuzzy match could not confirm the span
+    (span_verified=False) but a human has checked it against the source
+    document.  Records a revision entry so the manual verification is auditable.
+    """
+    item = await _get_item(session, req_id)
+    if item.span_verified:
+        return item
+    item.span_verified = True
+    await _append_revision(
+        session, item, reason="manual_span_verified", changed_by=changed_by
     )
     await session.commit()
     await session.refresh(item)
@@ -587,7 +652,19 @@ async def list_requirements(
         stmt = stmt.where(RequirementItem.derived == derived)
     if merged_into is not None:
         stmt = stmt.where(RequirementItem.merged_into == merged_into)
-    stmt = stmt.order_by(RequirementItem.id)
+    # Family-grouped ordering: each parent is immediately followed by its
+    # children. COALESCE(parent_id, id) gives every row a "family key" (the
+    # parent's own id for parents, or the parent's id for children). Within a
+    # family, parents come first (parent_id IS NULL → sorted ahead), then
+    # children by insertion order (id). Without this, _persist's two-pass
+    # layout (all parents in Pass 1, all children in Pass 2) makes every
+    # derived item appear at the end of the list, creating the visual illusion
+    # that they all belong to the last parent.
+    stmt = stmt.order_by(
+        func.coalesce(RequirementItem.parent_id, RequirementItem.id),
+        RequirementItem.parent_id.is_(None).desc(),
+        RequirementItem.id,
+    )
     rows = await session.scalars(stmt)
     return list(rows)
 

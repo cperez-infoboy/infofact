@@ -19,7 +19,8 @@ EXPECTED_READ = {"build_srs", "get_requirement", "list_requirements"}
 EXPECTED_MUTATIONS = {
     "add_requirement", "update_requirement", "delete_requirement",
     "merge_requirements", "split_requirement", "link_requirements",
-    "resolve_conflict", "approve_requirement", "reject_requirement",
+    "resolve_conflict", "approve_requirement", "verify_span",
+    "reject_requirement",
     "add_acceptance_criterion",
 }
 

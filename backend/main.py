@@ -29,6 +29,10 @@ async def lifespan(app: FastAPI):
     await migrate_projects_slug()
     await migrate_project_documents_parser_hint()
     await migrate_requirement_explicit_priority()
+    await migrate_project_documents_used_in_capture()
+    await migrate_analysis_diagram_descriptions()
+    await migrate_analysis_architecture_diagrams()
+    await migrate_subproject_project_code()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
@@ -209,6 +213,153 @@ async def migrate_requirement_explicit_priority() -> None:
         )
 
 
+async def migrate_project_documents_used_in_capture() -> None:
+    """Add ``project_documents.used_in_capture`` if missing (default false).
+
+    Idempotent: no-op when the column exists. Runs before ``create_all``.
+    Existing rows backfill to false — only fresh captures mark documents.
+    """
+    from sqlalchemy import inspect, text
+
+    log = logging.getLogger(__name__)
+
+    async with engine.begin() as conn:
+        def _columns(sync_conn):
+            inspector = inspect(sync_conn)
+            if "project_documents" not in inspector.get_table_names():
+                return None
+            return {c["name"] for c in inspector.get_columns("project_documents")}
+
+        columns = await conn.run_sync(_columns)
+        if columns is None:
+            return
+        if "used_in_capture" in columns:
+            log.info(
+                "migrate_project_documents_used_in_capture: column already present, skipping"
+            )
+            return
+        log.info(
+            "migrate_project_documents_used_in_capture: adding column used_in_capture"
+        )
+        await conn.execute(
+            text(
+                "ALTER TABLE project_documents "
+                "ADD COLUMN used_in_capture BOOLEAN DEFAULT 0"
+            )
+        )
+
+
+async def migrate_analysis_diagram_descriptions() -> None:
+    """Add ``mer_diagram_description`` and ``component_diagram_description``
+    to ``analysis_documents`` if missing.
+
+    Idempotent: no-op if columns already exist. Runs before ``create_all``.
+    """
+    from sqlalchemy import inspect, text
+
+    log = logging.getLogger(__name__)
+
+    async with engine.begin() as conn:
+        def _columns(sync_conn):
+            inspector = inspect(sync_conn)
+            if "analysis_documents" not in inspector.get_table_names():
+                return None
+            return {c["name"] for c in inspector.get_columns("analysis_documents")}
+
+        columns = await conn.run_sync(_columns)
+        if columns is None:
+            return
+
+        for col in ("mer_diagram_description", "component_diagram_description"):
+            if col not in columns:
+                log.info("migrate_analysis_diagram_descriptions: adding %s", col)
+                await conn.execute(
+                    text(
+                        f"ALTER TABLE analysis_documents "
+                        f"ADD COLUMN {col} TEXT DEFAULT ''"
+                    )
+                )
+
+
+async def migrate_analysis_architecture_diagrams() -> None:
+    """Add system architecture + infrastructure columns to analysis_documents.
+
+    Idempotent: no-op if columns already exist. Runs before create_all.
+    """
+    from sqlalchemy import inspect, text
+
+    log = logging.getLogger(__name__)
+
+    async with engine.begin() as conn:
+        def _columns(sync_conn):
+            inspector = inspect(sync_conn)
+            if "analysis_documents" not in inspector.get_table_names():
+                return None
+            return {
+                c["name"]
+                for c in inspector.get_columns("analysis_documents")
+            }
+
+        columns = await conn.run_sync(_columns)
+        if columns is None:
+            return
+
+        for col in (
+            "system_architecture_diagram",
+            "system_architecture_description",
+            "infrastructure_diagram",
+            "infrastructure_description",
+        ):
+            if col not in columns:
+                log.info(
+                    "migrate_analysis_architecture_diagrams: adding %s", col
+                )
+                await conn.execute(
+                    text(
+                        f"ALTER TABLE analysis_documents "
+                        f"ADD COLUMN {col} TEXT DEFAULT ''"
+                    )
+                )
+
+
+async def migrate_subproject_project_code() -> None:
+    """Add ``sub_projects.project_code`` if missing (nullable, for project areas).
+
+    Idempotent: no-op when the column exists. Runs before create_all.
+    """
+    from sqlalchemy import inspect, text
+
+    log = logging.getLogger(__name__)
+
+    async with engine.begin() as conn:
+        def _columns(sync_conn):
+            inspector = inspect(sync_conn)
+            if "sub_projects" not in inspector.get_table_names():
+                return None
+            return {
+                c["name"]
+                for c in inspector.get_columns("sub_projects")
+            }
+
+        columns = await conn.run_sync(_columns)
+        if columns is None:
+            return
+        if "project_code" in columns:
+            log.info(
+                "migrate_subproject_project_code: column already present, skipping"
+            )
+            return
+        log.info(
+            "migrate_subproject_project_code: adding column project_code"
+        )
+        await conn.execute(
+            text(
+                "ALTER TABLE sub_projects "
+                "ADD COLUMN project_code VARCHAR(32)"
+            )
+        )
+
+
 app = FastAPI(title="InfoFact", lifespan=lifespan)
 
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
@@ -225,6 +376,8 @@ from backend.routers import requirements as requirements_router
 app.include_router(requirements_router.router, prefix="/api", tags=["requirements"])
 from backend.routers import srs as srs_router
 app.include_router(srs_router.router, prefix="/api", tags=["srs"])
+from backend.routers import analysis as analysis_router
+app.include_router(analysis_router.router, prefix="/api", tags=["analysis"])
 # Explorar / editar archivos del workspace del usuario.
 app.include_router(workspaces.router, prefix="/api/workspaces", tags=["workspaces"])
 # Documentos fuente del proyecto: upload binario + scan + CRUD (Fase A ingesta).

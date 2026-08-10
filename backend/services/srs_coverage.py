@@ -200,10 +200,21 @@ async def compute_coverage(
         },
         "iso_29148_sections": {
             "introduction": True,
+            "definitions": False,
+            "references": False,
             "overall_description": has_specific,
+            "product_perspective": has_specific,
+            "user_classes": False,
+            "operating_environment": False,
+            "assumptions": False,
             "specific_requirements": has_specific,
             "functional": has_functional,
+            "business_rules": by_type.get("process", 0) > 0,
             "nonfunctional": has_nfr,
+            "constraints": (
+                by_type.get("constraint", 0) + by_type.get("compliance", 0) > 0
+            ),
+            "data_interfaces": by_type.get("data", 0) > 0,
         },
         "goals": {
             "total": len(goals),

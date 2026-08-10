@@ -124,6 +124,134 @@ calidad, cobertura, trazabilidad y un preview del markdown)."""
             "findings": srs_store.findings_to_dicts(findings, code_map),
         }
 
+    @tool
+    async def list_srs_sections() -> dict:
+        """Devuelve el árbol de secciones del SRS activo con metadatos.
+
+        Para secciones ``authored`` indica si cada subsection tiene contenido.
+        Para secciones ``projected`` indica cuántos requerimientos pertenecen.
+        Útil para navecar el SRS sin cargar el documento completo.
+        """
+        from backend.services.srs_builder import SECTION_REQTYPE_MAP
+        from backend.services.requirement_store import list_requirements
+
+        async with AsyncSessionLocal() as session:
+            srs = await srs_store.get_latest_srs(session, project_id)
+            if srs is None:
+                return {
+                    "error": "no_srs",
+                    "message": "Aún no hay un SRS generado. Usa /srs.",
+                }
+            all_items = await list_requirements(
+                session, project_id, include_deleted=False
+            )
+            live_items = [
+                it for it in all_items
+                if it.status.value in ("validated", "approved", "draft")
+            ]
+
+        sections: list[dict[str, Any]] = []
+        for section in srs.structure:
+            entry: dict[str, Any] = {
+                "id": section["id"],
+                "title": section["title"],
+                "kind": section.get("kind", "projected"),
+            }
+            if section.get("kind") == "authored" and section.get("subsections"):
+                entry["subsections"] = [
+                    {
+                        "id": sub["id"],
+                        "title": sub["title"],
+                        "has_content": bool(srs.narrative.get(sub["id"])),
+                    }
+                    for sub in section["subsections"]
+                ]
+            elif section["id"] in SECTION_REQTYPE_MAP:
+                reqtypes = SECTION_REQTYPE_MAP[section["id"]]
+                entry["item_count"] = sum(
+                    1 for it in live_items if it.type in reqtypes
+                )
+            sections.append(entry)
+        return {"sections": sections}
+
+    @tool
+    async def read_srs_section(section_id: str) -> dict:
+        """Devuelve el contenido de una sección específica del SRS.
+
+        Para ``authored`` (e.g. ``intro.definitions``, ``overall.users``):
+        el texto de la narrativa.
+        Para ``projected`` (e.g. ``functional``, ``nfr``, ``constraints``):
+        lista de RequirementItem con code, statement, priority, type.
+        """
+        from backend.services.srs_builder import SECTION_REQTYPE_MAP
+        from backend.services.requirement_store import list_requirements
+
+        async with AsyncSessionLocal() as session:
+            srs = await srs_store.get_latest_srs(session, project_id)
+            if srs is None:
+                return {
+                    "error": "no_srs",
+                    "message": "Aún no hay un SRS generado.",
+                }
+
+        # Determine section kind from structure.
+        target_kind = "projected"
+        target_title = section_id
+        for section in srs.structure:
+            if section["id"] == section_id:
+                target_kind = section.get("kind", "projected")
+                target_title = section["title"]
+                break
+            for sub in section.get("subsections", []):
+                if sub["id"] == section_id:
+                    target_kind = "authored"
+                    target_title = sub["title"]
+                    break
+
+        if target_kind == "authored":
+            content = srs.narrative.get(section_id, "")
+            return {
+                "section_id": section_id,
+                "title": target_title,
+                "kind": "authored",
+                "content": content or None,
+            }
+
+        # Projected: return items.
+        if section_id not in SECTION_REQTYPE_MAP:
+            return {
+                "section_id": section_id,
+                "title": target_title,
+                "kind": "projected",
+                "items": [],
+            }
+
+        reqtypes = SECTION_REQTYPE_MAP[section_id]
+        async with AsyncSessionLocal() as session:
+            all_items = await list_requirements(
+                session, project_id, include_deleted=False
+            )
+
+        items_data = [
+            {
+                "code": it.code,
+                "statement": it.statement,
+                "priority": it.priority.value,
+                "type": it.type.value,
+                "acceptance_criteria": list(it.acceptance_criteria or []),
+                "derived": it.derived,
+            }
+            for it in all_items
+            if it.type in reqtypes
+            and it.status.value in ("validated", "approved", "draft")
+        ]
+        return {
+            "section_id": section_id,
+            "title": target_title,
+            "kind": "projected",
+            "items": items_data,
+        }
+
     return [
         list_srs_versions,
         get_latest_srs,
@@ -132,4 +260,6 @@ calidad, cobertura, trazabilidad y un preview del markdown)."""
         list_goals,
         get_traceability,
         get_requirement_findings,
+        list_srs_sections,
+        read_srs_section,
     ]

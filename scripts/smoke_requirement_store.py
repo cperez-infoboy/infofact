@@ -181,7 +181,7 @@ async def main() -> None:
     # test session factory so tool calls hit the in-memory DB.
     requirements_tools.AsyncSessionLocal = Session
     tools = requirements_tools.make_requirements_tools(pid)
-    check("factory returns 13 tools", len(tools) == 13, f"count={len(tools)}")
+    check("factory returns 16 tools", len(tools) == 16, f"count={len(tools)}")
 
     by_name = {t.name: t for t in tools}
 

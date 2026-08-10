@@ -15,6 +15,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from sqlalchemy import (
+    Boolean,
     DateTime,
     ForeignKey,
     Index,
@@ -65,4 +66,8 @@ class ProjectDocument(Base):
     parser_hint: Mapped[str] = mapped_column(String(16), default="auto")
     parsed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Flag: este documento fue parte de la última captura de requerimientos.
+    # Lo marca ingest_documents; lo limpia reset_project_capture. El RAG del
+    # SRS agent filtra por este flag para no mezclar documentos no capturados.
+    used_in_capture: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())

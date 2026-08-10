@@ -155,6 +155,17 @@
     }
   }
 
+  function downloadMarkdown(): void {
+    if (!active?.markdown) return;
+    const blob = new Blob([active.markdown], { type: 'text/markdown' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `SRS_v${active.version}.md`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
   const SEV_CLASS: Record<string, string> = {
     blocker: 'text-danger border-danger/40 bg-danger/5',
     major: 'text-warning border-warning/40 bg-warning/5',
@@ -237,6 +248,17 @@
         disabled={loading || projectId === null}
         title="Refrescar versiones"
       >↻</button
+      >
+      {#if active?.markdown}
+        <button
+          type="button"
+          class="px-2 py-0.5 text-text-dim hover:text-text font-mono"
+          onclick={downloadMarkdown}
+          title="Descargar Markdown"
+          aria-label="Descargar Markdown"
+          >↓</button
+        >
+      {/if}
       >
       {#if onClose}
         <button

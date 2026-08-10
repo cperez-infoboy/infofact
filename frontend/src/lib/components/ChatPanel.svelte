@@ -208,10 +208,14 @@
         items.push({ type: 'user', msg: m });
         i++;
       } else {
-        // isFinal: el próximo mensaje NO es un tool → es la respuesta del
-        // turno, no razonamiento intermedio. Se renderiza completo.
-        const nextIsTool = i + 1 < list.length && list[i + 1].kind === 'tool';
-        items.push({ type: 'assistant', msg: m, isFinal: !nextIsTool });
+        // isFinal: el próximo mensaje NO es un tool NI otro assistant → es la
+        // respuesta final del turno. Dos assistants consecutivos (subagente →
+        // orquestador tras delegación via task) hacen que el primero sea
+        // intermedio; sólo el último assistant del turno se renderiza completo.
+        const next = list[i + 1];
+        const nextIsToolOrAssistant =
+          next !== undefined && (next.kind === 'tool' || next.kind === 'assistant');
+        items.push({ type: 'assistant', msg: m, isFinal: !nextIsToolOrAssistant });
         i++;
       }
     }

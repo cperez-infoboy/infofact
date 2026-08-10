@@ -20,6 +20,15 @@ import {
   onCoverageReport,
   onSrsReady
 } from '$lib/stores/srs';
+import {
+  onAnalysisProgress,
+  onAnalysisMerReady,
+  onAnalysisNfrReady,
+  onAnalysisProcessReady,
+  onAnalysisAdrReady,
+  onAnalysisSubProjectReady,
+  onAnalysisReady
+} from '$lib/stores/analysis';
 
 // --- Captura: qué tools abren/cierran el banner vivo --------------------
 // startCapture() resetea el estado del pipeline (wipes conflictos/reportes),
@@ -227,6 +236,14 @@ export async function sendMessage(sessionId: number, content: string): Promise<b
           const [match] = pendingTools.splice(idx, 1);
           completeToolMessage(match.id, output);
         }
+        // Cuando termina la delegación (task), cerrar el segmento de texto
+        // del subagente para que el texto del orquestador abra un mensaje
+        // nuevo. Sin esto, el texto del orquestador se concatena al último
+        // mensaje del subagente (currentAssistantId sigue apuntando ahí).
+        if (name === 'task' && currentAssistantId !== null) {
+          closeAssistantMessage(currentAssistantId, false);
+          currentAssistantId = null;
+        }
         // Sin match: no hay tool message para cerrar, ignorar.
         // Fin de la captura: conservar hallazgos en UI, sólo bajar flag running.
         // commit_capture cierra la variante agentica por etapas.
@@ -266,6 +283,16 @@ export async function sendMessage(sessionId: number, content: string): Promise<b
       onGoalInferred: (g) => onGoalInferred(g),
       onCoverageReport: (c) => onCoverageReport(c),
       onSrsReady: (r) => onSrsReady(r),
+      // Fine events del subagente analysis-agent (Phase 2): el store de
+      // análisis auto-inicia el run en el primer analysis.progress y lo
+      // cierra en analysis.ready.
+      onAnalysisProgress: (p) => onAnalysisProgress(p),
+      onAnalysisMerReady: (e) => onAnalysisMerReady(e),
+      onAnalysisNfrReady: (e) => onAnalysisNfrReady(e),
+      onAnalysisProcessReady: (e) => onAnalysisProcessReady(e),
+      onAnalysisAdrReady: (e) => onAnalysisAdrReady(e),
+      onAnalysisSubProjectReady: (e) => onAnalysisSubProjectReady(e),
+      onAnalysisReady: (r) => onAnalysisReady(r),
       onCompleted: () => {
         if (currentAssistantId !== null) {
           closeAssistantMessage(currentAssistantId, true);

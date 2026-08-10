@@ -237,6 +237,14 @@ async def reset_project_capture(
     srs = await delete_all_srs(session, project_id)
     plans = await delete_all_plans(session, project_id)
     reqs = await delete_all_requirements(session, project_id)
+    # Clear used_in_capture so the SRS RAG doesn't reference stale documents.
+    from sqlalchemy import update as sa_update
+    from backend.models.project_document import ProjectDocument
+    await session.execute(
+        sa_update(ProjectDocument)
+        .where(ProjectDocument.project_id == project_id)
+        .values(used_in_capture=False)
+    )
     await session.commit()
     logger.info(
         "reset_project_capture(project_id=%s): deleted %d requirement(s), "

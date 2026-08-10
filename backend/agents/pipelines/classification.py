@@ -512,6 +512,24 @@ async def _classify_batch(
 # Pass B: decompose
 # ---------------------------------------------------------------------------
 
+# Section markers that identify OCR/vision-extracted content. Items from these
+# sections lack the rich textual context of structured document sections, so
+# decomposing them tends to hallucinate unrelated sub-items (e.g. a color
+# palette caption yielding sub-items about login, logo, architecture).
+_VISION_SECTION_MARKERS: tuple[str, ...] = ("OCR", "Imagen embebida")
+
+
+def _is_vision_extracted(item: RawRequirement) -> bool:
+    """True when the item was extracted from OCR/vision content.
+
+    Guards Pass B (decomposition): vision-extracted items carry minimal context
+    (often just a caption or OCR'd title from a diagram), making LLM
+    decomposition unreliable and prone to hallucination.
+    """
+    s = (item.section or "").strip()
+    return bool(s) and any(m in s for m in _VISION_SECTION_MARKERS)
+
+
 async def _decompose_item(item: RawRequirement) -> list[DecomposedItem]:
     """Decompose one high-level item into operational sub-items.
 
@@ -640,8 +658,22 @@ async def classify_all(
     n_sub = 0
     if decompose:
         to_decompose = [
-            it for it in items if decisions[it.id].decomposition_needed
+            it for it in items
+            if decisions[it.id].decomposition_needed
+            and not _is_vision_extracted(it)
         ]
+        n_vision_skipped = sum(
+            1 for it in items
+            if decisions[it.id].decomposition_needed
+            and _is_vision_extracted(it)
+        )
+        if n_vision_skipped:
+            logger.info(
+                "classification: skipped decomposition for %d vision/OCR "
+                "item(s) (section indicates image extraction; lacks context "
+                "for safe decomposition)",
+                n_vision_skipped,
+            )
 
         async def _one_dec(it: RawRequirement) -> list[DecomposedItem]:
             async with sem:

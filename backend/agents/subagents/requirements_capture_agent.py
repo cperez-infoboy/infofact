@@ -52,7 +52,7 @@ from backend.agents.pipelines.extraction import (
     implicit_pass,
     filter_boilerplate_chunks,
 )
-from backend.agents.pipelines.ingestion import discover_documents
+from backend.agents.pipelines.ingestion import discover_documents, verification_text
 from backend.agents.pipelines.parse_cache import parse_document_cached
 from backend.services.document_service import parser_hint_map
 from backend.agents.subagents.capture_run_holder import (
@@ -404,6 +404,41 @@ def _make_orient_tool(host_workspace: Path):
     return orient_documents
 
 
+async def _mark_used_in_capture(
+    project_id: int, docs: list[Path], host_workspace: Path
+) -> None:
+    """Mark the discovered documents as used_in_capture in ProjectDocument.
+
+    Maps filesystem paths to rel_path (relative to workspace root) and updates
+    the matching rows. Documents not in this batch keep their existing flag
+    (append mode); reset mode already cleared all flags via reset_project_capture.
+    """
+    from sqlalchemy import update as sa_update
+    from backend.database import AsyncSessionLocal
+    from backend.models.project_document import ProjectDocument
+
+    root = host_workspace.resolve()
+    rel_paths: list[str] = []
+    for d in docs:
+        try:
+            rel_paths.append(str(d.relative_to(root)))
+        except ValueError:
+            continue
+    if not rel_paths:
+        return
+    async with AsyncSessionLocal() as session:
+        for rp in rel_paths:
+            await session.execute(
+                sa_update(ProjectDocument)
+                .where(
+                    ProjectDocument.project_id == project_id,
+                    ProjectDocument.rel_path == rp,
+                )
+                .values(used_in_capture=True)
+            )
+        await session.commit()
+
+
 def _no_run(required_first: str) -> dict:
     """Standard reply when a stage tool runs with no active capture."""
     return {
@@ -567,7 +602,7 @@ def _make_stage_tools(
                 project_description=run.project_description,
             )
             per_doc.append((chunks, smap))
-            doc_texts[smap.document_id] = smap.full_text
+            doc_texts[smap.document_id] = verification_text(chunks, smap)
             all_chunks.extend(chunks)
             await on_progress(
                 STAGE_INGEST, "parseado " + d.name,
@@ -584,6 +619,11 @@ def _make_stage_tools(
         run.doc_texts = doc_texts
         run.all_chunks = all_chunks
         run.stages_done.add(STAGE_INGEST)
+
+        # Mark discovered documents as used_in_capture so the SRS RAG
+        # only searches within capture-processed documents.
+        await _mark_used_in_capture(project_id, docs, host_workspace)
+
         return {
             "documents": [d.name for d in docs],
             "total_chunks": len(all_chunks),
