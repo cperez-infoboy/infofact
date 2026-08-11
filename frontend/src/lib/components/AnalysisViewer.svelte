@@ -1,12 +1,13 @@
 <script lang="ts">
   // Visor del Análisis versiónado (Phase 2: Analysis & Design). Muestra el
   // MER (Modelo Entidad-Relación), diagramas de procesos, análisis NFR, ADRs
-  // y descomposición en sub-proyectos. Cada /analysis genera una versión
-  // CANDIDATE persistida. Renderizado como view tab del FileViewer.
+  // y descomposición arquitectónica unificada. Cada /analysis genera una
+  // versión CANDIDATE persistida. Renderizado como view tab del FileViewer.
   //
-  // Pestañas: Viso general · MER · Procesos · NFR · ADRs · Sub-proyectos.
-  // El progreso vivo del subagente analysis-agent (stores/analysis) se
-  // refleja en el header mientras corre un /analysis. Runes OK (.svelte).
+  // Pestañas: Visión general · Arquitectura · MER · Procesos · NFR · ADRs.
+  // El tab "Arquitectura" integra sistema → proyectos → sub-proyectos →
+  // componentes → contratos → infraestructura en una sola narrativa.
+  // Runes OK (.svelte).
 
   import { onMount } from 'svelte';
   import {
@@ -23,6 +24,7 @@
     type Adr,
     type SubProject,
     type SubProjectContract,
+    type AnalysisProject,
     type ProcessDiagram,
     type NfrAnalysis
   } from '$lib/api/analysis';
@@ -49,16 +51,14 @@
     | 'mer'
     | 'process'
     | 'nfr'
-    | 'adrs'
-    | 'subprojects';
+    | 'adrs';
   const TABS: { id: Tab; label: string }[] = [
     { id: 'overview', label: 'Visión general' },
     { id: 'architecture', label: 'Arquitectura' },
     { id: 'mer', label: 'MER' },
     { id: 'process', label: 'Procesos' },
     { id: 'nfr', label: 'NFR' },
-    { id: 'adrs', label: 'ADRs' },
-    { id: 'subprojects', label: 'Sub-proyectos' }
+    { id: 'adrs', label: 'ADRs' }
   ];
 
   let versions = $state<AnalysisVersion[]>([]);
@@ -86,6 +86,7 @@
   let adrs = $state<Adr[] | null>(null);
   let subProjects = $state<SubProject[] | null>(null);
   let contracts = $state<SubProjectContract[] | null>(null);
+  let analysisProjects = $state<AnalysisProject[] | null>(null);
   let merLoading = $state(false);
   let adrsLoading = $state(false);
   let subProjectsLoading = $state(false);
@@ -122,6 +123,7 @@
     adrs = null;
     subProjects = null;
     contracts = null;
+    analysisProjects = null;
   }
 
   async function loadDetail(): Promise<void> {
@@ -178,6 +180,7 @@
       const data = await getAnalysisSubProjects(projectId, selVersion);
       subProjects = data.subprojects;
       contracts = data.contracts;
+      analysisProjects = data.projects ?? [];
     } catch {
       subProjects = [];
       contracts = [];
@@ -190,7 +193,7 @@
     tab = t;
     if (t === 'mer') void loadMer();
     else if (t === 'adrs') void loadAdrs();
-    else if (t === 'subprojects') void loadSubProjects();
+    else if (t === 'architecture') void loadSubProjects();
   }
 
   function fmtDate(iso: string | null): string {
@@ -219,6 +222,7 @@
       entities: entities ?? null,
       relationships: relationships ?? null,
       adrs: adrs ?? null,
+      projects: analysisProjects ?? null,
       subprojects: subProjects ?? null,
       contracts: contracts ?? null,
       generated_at: active.generated_at
@@ -435,7 +439,7 @@
       </div>
     {:else if tab === 'architecture'}
       <div class="p-4 max-w-4xl mx-auto space-y-4">
-        <!-- System Architecture -->
+        <!-- §1 — Arquitectura del sistema -->
         <div>
           <h3
             class="text-xs font-mono uppercase tracking-wider text-text-dim mb-2"
@@ -462,8 +466,218 @@
           {/if}
         </div>
 
-        <!-- Infrastructure -->
-        <div>
+        {#if subProjectsLoading}
+          <div class="border-t border-border pt-4 text-text-dim text-xs font-mono">
+            Cargando descomposición…
+          </div>
+        {:else}
+          <!-- §2 — Proyectos (Subdominios DDD) -->
+          {#if analysisProjects && analysisProjects.length > 0}
+            <div class="border-t border-border pt-4">
+              <h3 class="text-xs font-mono uppercase tracking-wider text-text-dim mb-2"
+                >Proyectos (Subdominios)</h3>
+              <div class="grid grid-cols-1 md:grid-cols-2 gap-2">
+                {#each analysisProjects as proj (proj.id)}
+                  {@const projSubCount = subProjects?.filter((sp) => sp.project_code === proj.code).length ?? 0}
+                  <div class="border border-border bg-surface-2 p-2 text-xs">
+                    <div class="flex items-baseline gap-2 flex-wrap">
+                      <span class="text-text font-semibold">{proj.name}</span>
+                      <span class="text-text-faint text-[10px] font-mono">{proj.code}</span>
+                      <span class="text-[9px] uppercase px-1.5 py-0.5 border font-mono
+                        {proj.domain_type === 'core'
+                          ? 'border-accent/40 text-accent bg-accent/5'
+                          : proj.domain_type === 'supporting'
+                            ? 'border-border text-text-dim bg-surface-2'
+                            : 'border-success/40 text-success bg-success/5'}"
+                        >{proj.domain_type}</span>
+                    </div>
+                    {#if proj.description}
+                      <p class="text-text-dim mt-0.5">{proj.description}</p>
+                    {/if}
+                    {#if proj.bounded_contexts.length > 0}
+                      <div class="mt-0.5 flex flex-wrap gap-1 text-[9px] font-mono">
+                        <span class="text-text-faint">BCs:</span>
+                        {#each proj.bounded_contexts as bc (bc)}
+                          <span class="text-text-dim">{bc}</span>
+                        {/each}
+                      </div>
+                    {/if}
+                    <div class="mt-1 flex gap-3 text-[9px] font-mono text-text-faint">
+                      <span>{proj.entity_codes.length} entidades</span>
+                      <span>{projSubCount} sub-proyectos</span>
+                      <span>{proj.traced_req_codes.length} requisitos</span>
+                    </div>
+                  </div>
+                {/each}
+              </div>
+            </div>
+          {/if}
+
+          <!-- §3 — Sub-proyectos por Proyecto -->
+          {#if analysisProjects && analysisProjects.length > 0}
+            <div class="border-t border-border pt-4">
+              <h3 class="text-xs font-mono uppercase tracking-wider text-text-dim mb-2"
+                >Sub-proyectos por Proyecto</h3>
+              {#each analysisProjects as proj (proj.id)}
+                {@const projSubs = subProjects?.filter((sp) => sp.project_code === proj.code) ?? []}
+                <div class="mb-3 border-l-2 border-accent/40 pl-3">
+                  <div class="flex items-baseline gap-2 flex-wrap">
+                    <span class="text-sm font-semibold text-text">{proj.name}</span>
+                    <span class="text-text-faint text-[10px] font-mono">{proj.code}</span>
+                  </div>
+                  {#if projSubs.length > 0}
+                    <div class="mt-2 grid grid-cols-1 md:grid-cols-2 gap-2">
+                      {#each projSubs as sp (sp.id)}
+                        <div class="border border-border bg-surface-2 p-2 text-xs">
+                          <div class="flex items-baseline gap-2 flex-wrap font-mono">
+                            <span class="text-text font-semibold">{sp.name}</span>
+                            <span class="text-text-faint text-[10px]">{sp.code}</span>
+                          </div>
+                          <p class="mt-1 text-text-dim">{sp.responsibility}</p>
+                          {#if Object.keys(sp.stack).length > 0}
+                            <div class="mt-2">
+                              <div class="text-[10px] uppercase text-text-faint font-mono">Stack</div>
+                              <div class="flex flex-wrap gap-1 mt-0.5">
+                                {#each Object.entries(sp.stack) as [layer, choice] (layer)}
+                                  <span class="font-mono text-[10px] px-1 border border-border text-text-dim"
+                                    >{layer}: {choice}</span>
+                                {/each}
+                              </div>
+                            </div>
+                          {/if}
+                          {#if sp.bounded_contexts.length > 0}
+                            <div class="mt-1 flex flex-wrap gap-1 text-[9px] font-mono">
+                              <span class="text-text-faint">BC:</span>
+                              {#each sp.bounded_contexts as bc (bc)}
+                                <span class="text-text-dim">{bc}</span>
+                              {/each}
+                            </div>
+                          {/if}
+                          {#if sp.entity_codes.length > 0}
+                            <div class="mt-1 flex flex-wrap gap-1 text-[9px] font-mono">
+                              <span class="text-text-faint">entidades:</span>
+                              {#each sp.entity_codes as ec (ec)}
+                                <span class="text-accent">{ec}</span>
+                              {/each}
+                            </div>
+                          {/if}
+                          {#if sp.nfr_codes.length > 0}
+                            <div class="mt-1 flex flex-wrap gap-1 text-[9px] font-mono">
+                              <span class="text-text-faint">NFRs:</span>
+                              {#each sp.nfr_codes as code (code)}
+                                <span class="text-accent">{code}</span>
+                              {/each}
+                            </div>
+                          {/if}
+                        </div>
+                      {/each}
+                    </div>
+                  {/if}
+                </div>
+              {/each}
+            </div>
+          {:else if subProjects && subProjects.length > 0}
+            <!-- Sin proyectos: render plano (backward compat) -->
+            <div class="border-t border-border pt-4">
+              <h3 class="text-xs font-mono uppercase tracking-wider text-text-dim mb-2"
+                >Sub-proyectos</h3>
+              <div class="grid grid-cols-1 md:grid-cols-2 gap-2">
+                {#each subProjects as sp (sp.id)}
+                  <div class="border border-border bg-surface-2 p-2 text-xs">
+                    <div class="flex items-baseline gap-2 flex-wrap font-mono">
+                      <span class="text-text font-semibold">{sp.name}</span>
+                      <span class="text-text-faint text-[10px]">{sp.code}</span>
+                    </div>
+                    <p class="mt-1 text-text-dim">{sp.responsibility}</p>
+                    {#if Object.keys(sp.stack).length > 0}
+                      <div class="mt-2">
+                        <div class="text-[10px] uppercase text-text-faint font-mono">Stack</div>
+                        <div class="flex flex-wrap gap-1 mt-0.5">
+                          {#each Object.entries(sp.stack) as [layer, choice] (layer)}
+                            <span class="font-mono text-[10px] px-1 border border-border text-text-dim"
+                              >{layer}: {choice}</span>
+                          {/each}
+                        </div>
+                      </div>
+                    {/if}
+                    {#if sp.bounded_contexts.length > 0}
+                      <div class="mt-1 flex flex-wrap gap-1 text-[9px] font-mono">
+                        <span class="text-text-faint">BC:</span>
+                        {#each sp.bounded_contexts as bc (bc)}
+                          <span class="text-text-dim">{bc}</span>
+                        {/each}
+                      </div>
+                    {/if}
+                    {#if sp.entity_codes.length > 0}
+                      <div class="mt-1 flex flex-wrap gap-1 text-[9px] font-mono">
+                        <span class="text-text-faint">entidades:</span>
+                        {#each sp.entity_codes as ec (ec)}
+                          <span class="text-accent">{ec}</span>
+                        {/each}
+                      </div>
+                    {/if}
+                    {#if sp.nfr_codes.length > 0}
+                      <div class="mt-1 flex flex-wrap gap-1 text-[9px] font-mono">
+                        <span class="text-text-faint">NFRs:</span>
+                        {#each sp.nfr_codes as code (code)}
+                          <span class="text-accent">{code}</span>
+                        {/each}
+                      </div>
+                    {/if}
+                  </div>
+                {/each}
+              </div>
+            </div>
+          {/if}
+
+          <!-- §4 — Diagrama de Componentes -->
+          {#if active.component_diagram}
+            <div class="border-t border-border pt-4">
+              <h3 class="text-xs font-mono uppercase tracking-wider text-text-dim mb-2"
+                >Diagrama de Componentes</h3>
+              <div class="border border-border bg-bg">
+                <MermaidRenderer code={active.component_diagram} id="subcomp-diagram" editable={isEditable} onsave={(c) => saveDiagram('component_diagram', c)} />
+              </div>
+              {#if active.component_diagram_description}
+                <p class="mt-1 text-text-dim italic">↳ {active.component_diagram_description}</p>
+              {/if}
+            </div>
+          {/if}
+
+          <!-- §5 — Contratos entre Sub-proyectos -->
+          {#if contracts && contracts.length > 0}
+            <div class="border-t border-border pt-4">
+              <h3 class="text-xs font-mono uppercase tracking-wider text-text-dim mb-2"
+                >Contratos ({contracts.length})</h3>
+              <ul class="space-y-2">
+                {#each contracts as c (c.id)}
+                  <li class="border border-border bg-surface-2 p-2 text-xs">
+                    <div class="flex items-baseline gap-2 flex-wrap font-mono">
+                      <span class="text-accent">{c.from_subproject_code}</span>
+                      <span class="text-text-faint">→</span>
+                      <span class="text-accent">{c.to_subproject_code}</span>
+                      <span class="text-[10px] uppercase border border-border px-1 text-text-dim"
+                        >{c.contract_type}</span>
+                    </div>
+                    <div class="text-text font-semibold mt-1">{c.name}</div>
+                    {#if c.description}
+                      <p class="text-text-dim mt-0.5">{c.description}</p>
+                    {/if}
+                    {#if c.spec}
+                      <details class="mt-1">
+                        <summary class="text-[10px] font-mono text-text-faint cursor-pointer">Spec</summary>
+                        <pre class="text-[10px] font-mono text-text-dim mt-1 whitespace-pre-wrap bg-bg p-1 border border-border">{c.spec}</pre>
+                      </details>
+                    {/if}
+                  </li>
+                {/each}
+              </ul>
+            </div>
+          {/if}
+        {/if}
+
+        <!-- §6 — Infraestructura -->
+        <div class="border-t border-border pt-4">
           <h3
             class="text-xs font-mono uppercase tracking-wider text-text-dim mb-2"
             >Infraestructura sugerida</h3
@@ -805,129 +1019,6 @@
               {/if}
             </article>
           {/each}
-        {/if}
-      </div>
-    {:else if tab === 'subprojects'}
-      <div class="p-4 max-w-4xl mx-auto space-y-4">
-        {#if subProjectsLoading}
-          <div class="text-text-dim text-xs font-mono">
-            Cargando sub-proyectos…
-          </div>
-        {:else if subProjects && subProjects.length === 0}
-          <div class="text-text-faint text-xs font-mono">
-            Sin sub-proyectos para esta versión. La descomposición arquitectónica
-            se genera a partir del MER y los bounded contexts.
-          </div>
-        {:else if subProjects}
-          <!-- Component diagram -->
-          {#if active.component_diagram}
-            <div>
-              <h3 class="text-xs font-mono uppercase tracking-wider text-text-dim mb-2"
-                >Diagrama de componentes</h3
-              >
-              <div class="border border-border bg-bg">
-                <MermaidRenderer code={active.component_diagram} id="subcomp-diagram" editable={isEditable} onsave={(c) => saveDiagram('component_diagram', c)} />
-              </div>
-              {#if active.component_diagram_description}
-                <p class="mt-1 text-text-dim italic">↳ {active.component_diagram_description}</p>
-              {/if}
-            </div>
-          {/if}
-
-          <!-- Sub-proyectos -->
-          <div>
-            <h3 class="text-xs font-mono uppercase tracking-wider text-text-dim mb-2"
-              >Sub-proyectos ({subProjects.length})</h3
-            >
-            <div class="grid grid-cols-1 md:grid-cols-2 gap-2">
-              {#each subProjects as sp (sp.id)}
-                <div class="border border-border bg-surface-2 p-2 text-xs">
-                  <div class="flex items-baseline gap-2 flex-wrap font-mono">
-                    <span class="text-text font-semibold">{sp.name}</span>
-                    <span class="text-text-faint text-[10px]">{sp.code}</span>
-                  </div>
-                  <p class="mt-1 text-text-dim">{sp.responsibility}</p>
-
-                  {#if Object.keys(sp.stack).length > 0}
-                    <div class="mt-2">
-                      <div class="text-[10px] uppercase text-text-faint font-mono"
-                        >Stack</div
-                      >
-                      <div class="flex flex-wrap gap-1 mt-0.5">
-                        {#each Object.entries(sp.stack) as [layer, choice] (layer)}
-                          <span class="font-mono text-[10px] px-1 border border-border text-text-dim"
-                            >{layer}: {choice}</span
-                          >
-                        {/each}
-                      </div>
-                    </div>
-                  {/if}
-
-                  {#if sp.bounded_contexts.length > 0}
-                    <div class="mt-1 flex flex-wrap gap-1 text-[9px] font-mono">
-                      <span class="text-text-faint">BC:</span>
-                      {#each sp.bounded_contexts as bc (bc)}
-                        <span class="text-text-dim">{bc}</span>
-                      {/each}
-                    </div>
-                  {/if}
-
-                  {#if sp.entity_codes.length > 0}
-                    <div class="mt-1 flex flex-wrap gap-1 text-[9px] font-mono">
-                      <span class="text-text-faint">entidades:</span>
-                      {#each sp.entity_codes as ec (ec)}
-                        <span class="text-accent">{ec}</span>
-                      {/each}
-                    </div>
-                  {/if}
-
-                  {#if sp.nfr_codes.length > 0}
-                    <div class="mt-1 flex flex-wrap gap-1 text-[9px] font-mono">
-                      <span class="text-text-faint">NFRs:</span>
-                      {#each sp.nfr_codes as code (code)}
-                        <span class="text-accent">{code}</span>
-                      {/each}
-                    </div>
-                  {/if}
-                </div>
-              {/each}
-            </div>
-          </div>
-
-          <!-- Contratos -->
-          {#if contracts && contracts.length > 0}
-            <div>
-              <h3 class="text-xs font-mono uppercase tracking-wider text-text-dim mb-2"
-                >Contratos ({contracts.length})</h3
-              >
-              <ul class="space-y-2">
-                {#each contracts as c (c.id)}
-                  <li class="border border-border bg-surface-2 p-2 text-xs">
-                    <div class="flex items-baseline gap-2 flex-wrap font-mono">
-                      <span class="text-accent">{c.from_subproject_code}</span>
-                      <span class="text-text-faint">→</span>
-                      <span class="text-accent">{c.to_subproject_code}</span>
-                      <span class="text-[10px] uppercase border border-border px-1 text-text-dim"
-                        >{c.contract_type}</span
-                      >
-                    </div>
-                    <div class="text-text font-semibold mt-1">{c.name}</div>
-                    {#if c.description}
-                      <p class="text-text-dim mt-0.5">{c.description}</p>
-                    {/if}
-                    {#if c.spec}
-                      <details class="mt-1">
-                        <summary class="text-[10px] font-mono text-text-faint cursor-pointer"
-                          >Spec</summary
-                        >
-                        <pre class="text-[10px] font-mono text-text-dim mt-1 whitespace-pre-wrap bg-bg p-1 border border-border">{c.spec}</pre>
-                      </details>
-                    {/if}
-                  </li>
-                {/each}
-              </ul>
-            </div>
-          {/if}
         {/if}
       </div>
     {/if}

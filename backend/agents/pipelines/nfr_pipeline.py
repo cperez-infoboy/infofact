@@ -196,7 +196,8 @@ class NfrCritiqueFinding(BaseModel):
     issue_type: str = Field(
         description=(
             "generic_decision | orphan_nfr | unjustified_stack | "
-            "contradiction | category_mismatch | missing_layer"
+            "contradiction | category_mismatch | missing_layer | "
+            "requirement_contradiction"
         ),
     )
     description: str
@@ -224,6 +225,11 @@ _NFR_DISCOVERY_PROMPT = (
     "reliability, data_consistency, scalability, maintainability, usability.\n"
     "- decision_summary: una oracion concreta y accionable (evita "
     "generalidades como 'usar buenas practicas').\n"
+    "- RESTRICCIONES TECNOLOGICAS: Si un requerimiento (especialmente tipo "
+    "constraint) menciona una tecnologia, producto, proveedor o estandar "
+    "obligatorio (ej. \"SQL Server\", \"Azure\", \"Active Directory\", \"SMTP\"), "
+    "la decision_summary DEBE usar esa tecnologia. No la reemplaces por "
+    "una alternativa ni sugieras una \"mejor opcion\".\n"
     "- req_code debe tomarse literalmente del input; no inventes codigos.\n"
     "- Si un NFR es ambiguo o no accionable, omitilo.\n"
     "Devuelve SOLO el objeto estructurado."
@@ -234,6 +240,7 @@ _NFR_GAP_PASS_PROMPT = (
     "funcionales NO fueron cubiertos en la primera pasada de analisis. "
     "Revisa cada uno y determina si justifica una decision arquitectonica "
     "nueva. Si ninguno genera una decision nueva, devuelve una lista vacia.\n"
+    "Respeta las tecnologias explicitamente mandateadas en los requerimientos.\n"
     "Devuelve SOLO el objeto estructurado."
 )
 
@@ -257,6 +264,9 @@ _NFR_DETAIL_PROMPT = (
     "reliability, data_consistency, scalability, maintainability, usability.\n"
     "- stack: cubre como minimo las capas backend y database. Anade messaging, "
     "cache, deployment o monitoring solo si los NFRs las justifican.\n"
+    "- RESTRICCIONES TECNOLOGICAS: Si un requerimiento (especialmente tipo "
+    "constraint) indica una tecnologia obligatoria, el stack y las "
+    "decisiones DEBEN usar esa tecnologia. No la reemplaces.\n"
     "- rationale debe explicar por que la decision aborda el NFR, no "
     "simplemente repetir el enunciado.\n"
     "- req_code debe tomarse literalmente del input; no inventes codigos.\n"
@@ -281,6 +291,11 @@ _NFR_BATCH_DETAIL_PROMPT = (
     "- category debe ser exactamente uno de: performance, security, "
     "reliability, data_consistency, scalability, maintainability, usability.\n"
     "- stack_component: tecnologia o patron especifico recomendado.\n"
+    "- RESTRICCIONES TECNOLOGICAS: Si el requerimiento original indica una "
+    "tecnologia obligatoria, stack_component DEBE ser esa tecnologia. "
+    "No la reemplaces. Si el requerimiento dice \"SQL Server\", el "
+    "stack_component debe ser \"SQL Server\", no PostgreSQL ni otra "
+    "alternativa.\n"
     "- rationale debe explicar por que la decision aborda el NFR, no "
     "simplemente repetir el enunciado.\n"
     "- req_code debe tomarse literalmente del input; no inventes codigos.\n"
@@ -293,6 +308,12 @@ _NFR_STACK_PROMPT = (
     "decisiones arquitectonicas ya tomadas, deriva el stack tecnologico "
     "recomendado por capas y las estrategias transversales.\n\n"
     "Reglas:\n"
+    "- PRIORIDAD ABSOLUTA — RESTRICCIONES TECNOLOGICAS: Si las decisiones "
+    "mencionan una tecnologia que proviene de un requerimiento constraint "
+    "(ej. \"SQL Server\", \"Azure\", \"Active Directory\"), el stack DEBE usar "
+    "ESA tecnologia para la capa correspondiente. No la reemplaces por "
+    "una alternativa que consideres \"mejor\". Las restricciones explicitas "
+    "de los requerimientos no son negociables.\n"
     "- IDIOMA: manten el idioma original de las decisiones.\n"
     "- stack: cubre como minimo las capas backend y database. Anade "
     "messaging, cache, deployment o monitoring solo si las decisiones las "
@@ -315,7 +336,11 @@ _NFR_CRITIQUE_PROMPT = (
     "3. unjustified_stack: una tecnologia del stack sin justificacion clara.\n"
     "4. contradiction: dos decisiones que se contradicen entre si.\n"
     "5. category_mismatch: la categoria asignada no corresponde al NFR.\n"
-    "6. missing_layer: una capa critica del stack ausente (ej. database).\n\n"
+    "6. missing_layer: una capa critica del stack ausente (ej. database).\n"
+    "7. requirement_contradiction: una decision o tecnologia del stack "
+    "contradice una restriccion explicita del requerimiento original "
+    "(ej. el requerimiento dice \"SQL Server\" pero el stack usa "
+    "PostgreSQL).\n\n"
     "Si el analisis esta correcto, devuelve findings vacio.\n"
     "Devuelve SOLO el objeto estructurado."
 )
@@ -372,7 +397,10 @@ def _build_nfr_items_text(
     lines.append("")
 
     for it in items:
-        lines.append(f"REQ_CODE: {it.code}")
+        if it.type.value == "constraint":
+            lines.append(f"REQ_CODE: {it.code} [RESTRICCION]")
+        else:
+            lines.append(f"REQ_CODE: {it.code}")
         lines.append(f"TYPE: {it.type.value}")
         lines.append(f"STATEMENT: {it.statement}")
         if it.source:
@@ -391,6 +419,26 @@ def _build_nfr_items_text(
                 lines.append(f"SOURCE: {quote[:300]}")
         lines.append("")
 
+    return "\n".join(lines)
+
+
+def _build_constraints_block(items) -> str:
+    """Extract constraint-type items as a priority context block.
+
+    Surfaced in every batch so the LLM sees global technology mandates
+    even when processing non-constraint requirements (e.g. a reliability
+    NFR about HA knows SQL Server is the mandated database).
+    """
+    constraint_items = [it for it in items if it.type.value == "constraint"]
+    if not constraint_items:
+        return ""
+    lines = [
+        "RESTRICCIONES TECNOLOGICAS OBLIGATORIAS "
+        "(aplican a TODAS las decisiones de este lote):"
+    ]
+    for it in constraint_items[:20]:
+        lines.append(f"- [{it.code}] {it.statement[:200]}")
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -413,11 +461,13 @@ async def _discover_nfr_decisions(
     output truncation with large NFR sets. Batches run concurrently up to
     ``concurrency`` parallel calls.
     """
+    constraints_block = _build_constraints_block(items)
     batches = list(_chunk(items, _NFR_BATCH_SIZE))
     if len(batches) <= 1:
         return await _discover_nfr_batch(
             items, project_name, project_description,
             softgoals=softgoals, feedback=feedback,
+            constraints_block=constraints_block,
         )
 
     sem = asyncio.Semaphore(concurrency)
@@ -427,6 +477,7 @@ async def _discover_nfr_decisions(
             return await _discover_nfr_batch(
                 batch, project_name, project_description,
                 softgoals=softgoals, feedback=feedback,
+                constraints_block=constraints_block,
             )
 
     results = await asyncio.gather(
@@ -454,12 +505,15 @@ async def _discover_nfr_batch(
     project_description: str,
     softgoals: list[Any] | None = None,
     feedback: str = "",
+    constraints_block: str = "",
 ) -> list[NfrDecisionCandidate]:
     """Discover decisions for a single batch of NFR items."""
     user_text = _build_nfr_items_text(
         items_batch, project_name, project_description,
         softgoals=softgoals, feedback=feedback,
     )
+    if constraints_block:
+        user_text = constraints_block + "\n" + user_text
     msgs = [("system", _NFR_DISCOVERY_PROMPT), ("human", user_text)]
     llm = structured_llm(NfrDiscoverySchema)
     try:
@@ -496,10 +550,13 @@ async def _gap_pass_nfr(
         return []
 
     uncovered_items = [it for it in items if it.code in uncovered]
+    constraints_block = _build_constraints_block(items)
     user_text = _build_nfr_items_text(
         uncovered_items, project_name, project_description,
         softgoals=softgoals, feedback=feedback,
     )
+    if constraints_block:
+        user_text = constraints_block + "\n" + user_text
     already = ", ".join(c.req_code for c in candidates) or "(ninguna)"
     user_text += (
         f"\nDECISIONES YA IDENTIFICADAS: {already}\n"
@@ -545,6 +602,8 @@ async def _enrich_nfr_decisions(
     if not candidates:
         return [], [], "", ""
 
+    constraints_block = _build_constraints_block(items)
+
     # Build a lookup of items by code so each batch only sends its own items.
     items_by_code = {it.code: it for it in items}
 
@@ -553,6 +612,7 @@ async def _enrich_nfr_decisions(
         decisions = await _enrich_nfr_batch(
             items, candidates, project_name, project_description,
             softgoals=softgoals, feedback=feedback,
+            constraints_block=constraints_block,
         )
     else:
         sem = asyncio.Semaphore(concurrency)
@@ -567,6 +627,7 @@ async def _enrich_nfr_decisions(
                 return await _enrich_nfr_batch(
                     batch_items, batch, project_name, project_description,
                     softgoals=softgoals, feedback=feedback,
+                    constraints_block=constraints_block,
                 )
 
         results = await asyncio.gather(
@@ -590,6 +651,7 @@ async def _enrich_nfr_decisions(
     stack, data_consistency, patterns = await _derive_stack(
         decisions, project_name, project_description,
         softgoals=softgoals,
+        items=items,
     )
     return decisions, stack, data_consistency, patterns
 
@@ -601,12 +663,15 @@ async def _enrich_nfr_batch(
     project_description: str,
     softgoals: list[Any] | None = None,
     feedback: str = "",
+    constraints_block: str = "",
 ) -> list[NfrDecision]:
     """Enrich a single batch of candidates into full decisions."""
     user_text = _build_nfr_items_text(
         items_batch, project_name, project_description,
         softgoals=softgoals, feedback=feedback,
     )
+    if constraints_block:
+        user_text = constraints_block + "\n" + user_text
     candidate_lines = []
     for c in candidates_batch:
         candidate_lines.append(
@@ -638,6 +703,7 @@ async def _derive_stack(
     project_name: str,
     project_description: str,
     softgoals: list[Any] | None = None,
+    items=None,
 ) -> tuple[list[StackDecision], str, str]:
     """Derive global stack/patterns from the consolidated decision set.
 
@@ -670,9 +736,26 @@ async def _derive_stack(
             softgoals, section_title="ATRIBUTOS DE CALIDAD (SOFTGOALS)"
         )
 
+    constraints_block = ""
+    if items:
+        constraint_items = [
+            it for it in items if it.type.value == "constraint"
+        ]
+        if constraint_items:
+            constraint_lines = []
+            for it in constraint_items[:20]:
+                constraint_lines.append(
+                    f"- [{it.code}] {it.statement[:200]}"
+                )
+            constraints_block = (
+                "\nREQUERIMIENTOS DE RESTRICCION (PRIORIDAD ABSOLUTA):\n"
+                + "\n".join(constraint_lines) + "\n\n"
+            )
+
     user_text = (
         f"{header}\n\n"
         f"{softgoals_block}"
+        f"{constraints_block}"
         f"DECISIONES ARQUITECTONICAS TOMADAS ({len(decisions)} total):\n"
         f"{decision_summary}\n\n"
         f"Deriva el stack tecnologico por capas a partir de estas decisiones.\n"

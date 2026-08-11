@@ -42,6 +42,13 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel, Field
 
 from backend.agents.llm import structured_llm
+from backend.agents.pipelines._diagram_colors import (
+    STATE_ERROR,
+    STATE_FINAL,
+    STATE_INITIAL,
+    STATE_NORMAL,
+    class_def,
+)
 from backend.agents.pipelines._resilience import (
     DEFAULT_CONCURRENCY,
     _format_feedback,
@@ -296,6 +303,8 @@ _MERMAID_GENERATION_PROMPT = (
     "- participants: lista los actores y entidades en cada diagrama de "
     "secuencia.\n"
     "- Genera SOLO los diagramas para las entidades e interacciones listadas.\n"
+    "- description: para cada diagrama, escribe una descripcion breve (1-2 oraciones) "
+    "del ciclo de vida o interaccion que representa.\n"
     "Devuelve SOLO el objeto estructurado."
 )
 
@@ -409,6 +418,12 @@ def _render_state_diagram(sm: "StateMachineSchema") -> str:
     All identifiers are sanitized; labels are escaped. The output is
     guaranteed to be syntactically valid Mermaid because Python controls
     every character.
+
+    States are colored by role:
+    - initial → green border (stroke-width 3px)
+    - final (no outgoing transitions) → red border (stroke-width 3px)
+    - error (name contains cancel/error/fail/reject) → bright red fill
+    - normal → blue fill
     """
     lines: list[str] = ["stateDiagram-v2"]
 
@@ -444,6 +459,24 @@ def _render_state_diagram(sm: "StateMachineSchema") -> str:
         if state not in sources:
             state_id = _sanitize_mermaid_id(state)
             lines.append(f"    {state_id} --> [*]")
+
+    # classDef + class assignments for semantic coloring by state role.
+    lines.append("    " + class_def("st_initial", *STATE_INITIAL, sw=3))
+    lines.append("    " + class_def("st_final", *STATE_FINAL, sw=3))
+    lines.append("    " + class_def("st_error", *STATE_ERROR))
+    lines.append("    " + class_def("st_normal", *STATE_NORMAL))
+    error_keywords = ("cancel", "error", "fail", "reject", "invalid")
+    for state in all_states:
+        sid = _sanitize_mermaid_id(state)
+        state_lower = state.lower()
+        if state == sm.initial_state:
+            lines.append(f"    class {sid} st_initial")
+        elif any(kw in state_lower for kw in error_keywords):
+            lines.append(f"    class {sid} st_error")
+        elif state not in sources:
+            lines.append(f"    class {sid} st_final")
+        else:
+            lines.append(f"    class {sid} st_normal")
 
     return "\n".join(lines)
 

@@ -123,6 +123,15 @@ NFR, proyectos necesita MER + ADRs, sub-proyectos necesita proyectos, \
 arquitectura necesita MER + NFR + sub-proyectos.
 3. REFINAR — Si una etapa genera resultados vacios o con errores, mencionalo \
 en tu reporte antes de continuar. \
+Si en cualquier etapa detectas que un artefacto previo tiene un problema \
+(entidades mal clasificadas en el MER, bounded contexts mal definidos, \
+decisiones NFR inconsistentes), puedes VOLVER ATRAS y re-ejecutar la etapa \
+que necesite correccion. Por ejemplo, si descubrir_proyectos revela que dos \
+BCs estan mal separados, puedes re-ejecutar generate_mer para corregir las \
+fronteras de BCs. Despues de re-ejecutar una etapa, debes re-ejecutar en \
+cascada todas las etapas que dependan del cambio (ver dependencias abajo). \
+No abuses de esto: cada etapa tiene un maximo de 3 intentos. Si despues de \
+2 intentos una etapa sigue fallando, reporta el problema y continua. \
 Despues de discover_projects verifica: cada BC esta en exactamente un \
 proyecto? Hay dos proyectos con mucho solapamiento de procesos? Si es asi, \
 re-ejecuta discover_projects con feedback. \
@@ -158,6 +167,13 @@ re-generarse
 Reglas estrictas:
 - NO inventas requerimientos ni entidades. Trabajas SOLO a partir de los \
 requerimientos vivos del proyecto.
+- RESPETA las restricciones tecnologicas explicitas de los requerimientos. \
+Si un requerimiento (especialmente tipo CONSTRAINT) indica una tecnologia \
+obligatoria (ej. SQL Server, Azure, Active Directory), usa ESA tecnologia \
+en el stack, los ADRs y la arquitectura. No la reemplaces por una \
+alternativa que consideres mejor. Si hay una razon tecnica fuerte para \
+cuestionar la restriccion, senalala en el ADR como contexto, pero la \
+decision del stack debe honrar el requerimiento.
 - El idioma de los enunciados y descripciones se PRESERVA (no traduzcas). Los \
 mensajes van en español neutro.
 - Conserva el ciclo de cada etapa (cap de 3 intentos por etapa): si una etapa \

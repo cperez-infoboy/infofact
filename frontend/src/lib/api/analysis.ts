@@ -113,6 +113,19 @@ export interface SubProject {
   bounded_contexts: string[];
   nfr_codes: string[];
   entity_codes: string[];
+  project_code: string | null;
+}
+
+/** Proyecto (área funcional mayor = subdominio DDD). */
+export interface AnalysisProject {
+  id: number;
+  code: string;
+  name: string;
+  description: string;
+  domain_type: 'core' | 'supporting' | 'generic';
+  bounded_contexts: string[];
+  entity_codes: string[];
+  traced_req_codes: string[];
 }
 
 /** Contrato entre dos sub-proyectos. */
@@ -203,12 +216,13 @@ export function getAnalysisAdrs(
   );
 }
 
-/** Sub-proyectos + contratos de una versión. */
+/** Sub-proyectos + contratos + proyectos de una versión. */
 export function getAnalysisSubProjects(
   projectId: number,
   version: number
-): Promise<{ subprojects: SubProject[]; contracts: SubProjectContract[] }> {
+): Promise<{ projects: AnalysisProject[]; subprojects: SubProject[]; contracts: SubProjectContract[] }> {
   return apiFetch<{
+    projects: AnalysisProject[];
     subprojects: SubProject[];
     contracts: SubProjectContract[];
   }>(`/api/projects/${projectId}/analysis/versions/${version}/subprojects`);

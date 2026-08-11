@@ -35,6 +35,12 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from backend.agents.llm import structured_llm
+from backend.agents.pipelines._diagram_colors import (
+    AGGREGATE_ROOT_STROKE,
+    BC_PALETTE,
+    NETWORK_DEFAULT,
+    class_def,
+)
 from backend.agents.pipelines._resilience import (
     DEFAULT_CONCURRENCY,
     _format_feedback,
@@ -398,6 +404,10 @@ def _render_mermaid(
 
     Entity names are sanitized to alphanumeric + underscore (Mermaid
     identifiers). Relationship labels are quoted to allow spaces.
+
+    Each entity is assigned a ``classDef`` color based on its bounded
+    context. Aggregate roots receive a gold border (stroke-width 3px).
+    Entities without a bounded context get the default gray styling.
     """
     if not entities:
         return "erDiagram"
@@ -420,6 +430,39 @@ def _render_mermaid(
         card = _MERMAID_CARDINALITY.get(rel.cardinality.strip(), "||--o{")
         label = rel.label or "relates_to"
         lines.append(f'    {from_id} {card} {to_id} : "{label}"')
+
+    # classDef + class assignments for semantic coloring by bounded context.
+    unique_bcs = sorted(
+        {e.bounded_context for e in entities if e.bounded_context}
+    )
+    bc_to_idx: dict[str, int] = {bc: i for i, bc in enumerate(unique_bcs)}
+    for i, _bc in enumerate(unique_bcs):
+        fill, stroke = BC_PALETTE[i % len(BC_PALETTE)]
+        lines.append("    " + class_def(f"bc{i}", fill, stroke))
+    # Entities without BC get gray.
+    lines.append(
+        "    "
+        + class_def("bc_default", NETWORK_DEFAULT[0], NETWORK_DEFAULT[1])
+    )
+    # Aggregate root highlight: gold border, thicker.
+    lines.append(
+        "    "
+        + class_def(
+            "agg_root",
+            NETWORK_DEFAULT[0],
+            AGGREGATE_ROOT_STROKE,
+            sw=3,
+        )
+    )
+    for ent in entities:
+        ent_id = ent.name.replace(" ", "_").upper()
+        if ent.bounded_context and ent.bounded_context in bc_to_idx:
+            cls = f"bc{bc_to_idx[ent.bounded_context]}"
+        else:
+            cls = "bc_default"
+        lines.append(f"    class {ent_id} {cls}")
+        if ent.aggregate_root:
+            lines.append(f"    class {ent_id} agg_root")
 
     return "\n".join(lines)
 

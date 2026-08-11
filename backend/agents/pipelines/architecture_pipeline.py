@@ -47,6 +47,12 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel, Field
 
 from backend.agents.llm import structured_llm
+from backend.agents.pipelines._diagram_colors import (
+    LAYER_COLORS,
+    TYPE_COLORS,
+    class_def,
+    network_color,
+)
 from backend.agents.pipelines._resilience import (
     DEFAULT_CONCURRENCY,
     _format_feedback,
@@ -301,8 +307,13 @@ def _render_system_architecture(
     Components are grouped by layer into subgraphs. Connections become
     labeled edges. All identifiers and labels are sanitized to guarantee
     syntactically valid Mermaid.
+
+    Each component is assigned a ``classDef`` color based on its layer
+    (presentation=blue, application=green, data=amber, external=gray),
+    with type-specific overrides (database=amber, auth=violet,
+    cache=cyan, messaging=magenta, agent=orange).
     """
-    lines: list[str] = ["graph TD"]
+    lines: list[str] = ["flowchart TD"]
 
     # Group components by layer.
     by_layer: dict[str, list[ArchitectureComponent]] = {}
@@ -317,7 +328,7 @@ def _render_system_architecture(
             continue
         sub_id = _sanitize_mermaid_id(f"layer_{layer}")
         display = _LAYER_DISPLAY.get(layer, layer)
-        lines.append(f'    subgraph {sub_id} ["{display}"]')
+        lines.append(f'    subgraph {sub_id}["{display}"]')
         for comp in comps:
             cid = _sanitize_mermaid_id(comp.id)
             if comp.technology:
@@ -325,8 +336,24 @@ def _render_system_architecture(
             else:
                 label = comp.name
             clabel = _sanitize_graph_label(label)
-            lines.append(f'        {cid} ["{clabel}"]')
+            lines.append(f'        {cid}["{clabel}"]')
         lines.append("    end")
+
+    # classDef + class assignments for semantic coloring by layer/type.
+    lines.append("    " + class_def("L_presentation", *LAYER_COLORS["presentation"]))
+    lines.append("    " + class_def("L_application", *LAYER_COLORS["application"]))
+    lines.append("    " + class_def("L_data", *LAYER_COLORS["data"]))
+    lines.append("    " + class_def("L_external", *LAYER_COLORS["external"]))
+    for ctype, (fill, stroke) in TYPE_COLORS.items():
+        lines.append("    " + class_def(f"T_{ctype}", fill, stroke))
+    for comp in components:
+        cid = _sanitize_mermaid_id(comp.id)
+        if comp.component_type in TYPE_COLORS:
+            cls = f"T_{comp.component_type}"
+        else:
+            layer_key = comp.layer if comp.layer in LAYER_COLORS else "external"
+            cls = f"L_{layer_key}"
+        lines.append(f"    class {cid} {cls}")
 
     # Emit connections.
     for conn in connections:
@@ -351,8 +378,12 @@ def _render_infrastructure(containers: list[InfraContainer]) -> str:
 
     Containers are grouped by network into subgraphs. ``depends_on``
     entries become plain edges. All identifiers and labels are sanitized.
+
+    Each container is assigned a ``classDef`` color based on its network
+    zone (frontend=blue, backend=green, database=amber, monitoring=cyan,
+    external=gray).
     """
-    lines: list[str] = ["graph TD"]
+    lines: list[str] = ["flowchart TD"]
 
     # Group containers by network.
     by_network: dict[str, list[InfraContainer]] = {}
@@ -364,7 +395,7 @@ def _render_infrastructure(containers: list[InfraContainer]) -> str:
     for network in sorted(by_network):
         net_id = _sanitize_mermaid_id(f"net_{network}")
         lines.append(
-            f'    subgraph {net_id} ["{_sanitize_graph_label(network)}"]'
+            f'    subgraph {net_id}["{_sanitize_graph_label(network)}"]'
         )
         for c in by_network[network]:
             cid = _sanitize_mermaid_id(c.id)
@@ -374,8 +405,19 @@ def _render_infrastructure(containers: list[InfraContainer]) -> str:
             if c.ports:
                 label_parts.append(":" + ",".join(c.ports))
             clabel = _sanitize_graph_label(" / ".join(label_parts))
-            lines.append(f'        {cid} ["{clabel}"]')
+            lines.append(f'        {cid}["{clabel}"]')
         lines.append("    end")
+
+    # classDef per unique network zone + class assignments.
+    seen_networks = sorted(by_network)
+    for i, network in enumerate(seen_networks):
+        fill, stroke = network_color(network)
+        cls_name = f"net{i}"
+        lines.append("    " + class_def(cls_name, fill, stroke))
+    for i, network in enumerate(seen_networks):
+        for c in by_network[network]:
+            cid = _sanitize_mermaid_id(c.id)
+            lines.append(f"    class {cid} net{i}")
 
     # Emit depends_on edges.
     for c in containers:

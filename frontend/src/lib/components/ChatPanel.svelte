@@ -60,6 +60,16 @@
     web_search: 'Buscando en la web',
     fetch_url: 'Leyendo página web',
     analyze_image: 'Analizando imagen',
+    generate_mer: 'Generando MER del dominio',
+    analyze_nfrs: 'Analizando requerimientos no funcionales',
+    generate_processes: 'Generando diagramas de proceso',
+    generate_adrs: 'Redactando decisiones arquitectónicas',
+    discover_projects: 'Descubriendo proyectos',
+    propose_subprojects: 'Proponiendo sub-proyectos',
+    generate_architecture: 'Generando arquitectura del sistema',
+    commit_analysis: 'Guardando análisis',
+    refine_analysis: 'Cargando análisis para refinamiento',
+    patch_commit: 'Guardando análisis refinado',
   };
 
   function toolLabel(name: string): string {

@@ -259,18 +259,21 @@ def _sanitize_mermaid_label(text: str) -> str:
 def _sanitize_graph_label(text: str) -> str:
     """Sanitize a label for use inside Mermaid graph TD node labels.
 
-    Less aggressive than ``_sanitize_mermaid_label``: preserves ``:``,
-    ``.``, ``(``, ``)`` which are valid in graph node labels. Removes
-    characters that break the graph TD parser:
+    Removes characters that break the graph TD parser in common Mermaid
+    renderers:
 
     - Newlines (\\n, \\r) — break the single-line syntax.
     - Brackets ``[`` ``]`` — conflict with node shape syntax.
+    - Parentheses ``(`` ``)`` — confuse the parser with shape markers.
+    - Double quotes ``"`` — close the ``["..."]`` node label prematurely.
     - Pipes ``|`` — edge label separators.
     - ``%%`` — Mermaid comment marker.
     """
     result = text.strip()
     result = result.replace("\n", " ").replace("\r", "")
     result = result.replace("[", "").replace("]", "")
+    result = result.replace("(", "").replace(")", "")
+    result = result.replace('"', "")
     result = result.replace("|", "/")
     result = result.replace("%%", "")
     return result
@@ -294,8 +297,11 @@ def _sanitize_mermaid(mermaid_str: str, diagram_type: str) -> str:
         # the diagram breaks. Replace {} with () inside edge labels.
         def _fix_edge_label(match: re.Match) -> str:
             label = match.group(1)
-            label = label.replace("{", "(").replace("}", ")")
-            label = label.replace("[", "(").replace("]", ")")
+            # Remove ALL bracket/parenthesis types from edge labels — they
+            # confuse the Mermaid graph parser inside |...| edge labels.
+            label = label.replace("{", "").replace("}", "")
+            label = label.replace("[", "").replace("]", "")
+            label = label.replace("(", "").replace(")", "")
             return f"|{label}|"
 
         result = re.sub(r"\|([^|]+)\|", _fix_edge_label, result)
