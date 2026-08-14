@@ -32,6 +32,7 @@ from backend.agents.subagents.srs_run_holder import (
     get_or_create_run,
     get_run,
 )
+from backend.agents.size_guard import SizeGuardMiddleware
 from backend.agents.tools.documents_tools import make_document_read_tools
 from backend.database import AsyncSessionLocal
 from backend.models.requirement import ReqStatus
@@ -536,4 +537,7 @@ def make_srs_agent_subagent(
         ),
         "system_prompt": SRS_AGENT_PROMPT,
         "tools": tools,
+        # deepagents NO propaga el middleware del orquestador a los
+        # subagentes: cada spec necesita su propia guarda de tamaño.
+        "middleware": [SizeGuardMiddleware()],
     }

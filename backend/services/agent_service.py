@@ -27,6 +27,7 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from backend.agents.llm import build_llm
 from backend.agents.sandboxes.docker_sandbox import DockerSandbox
+from backend.agents.size_guard import SizeGuardMiddleware
 from backend.agents.tools import fetch_url, web_search
 from backend.agents.subagents.requirements_capture_agent import (
     make_requirements_capture_agent_subagent,
@@ -221,6 +222,10 @@ def build_agent(
         tools=orchestrator_tools,
         subagents=subagents or None,
         checkpointer=checkpointer,
+        # Guarda de tamaño del input: trunca (sin eliminar) los mensajes
+        # gigantes que puedan venir del checkpointer antes de cada llamada
+        # al modelo. Transitorio: no reescribe el estado del thread.
+        middleware=[SizeGuardMiddleware()],
     )
 
 
@@ -282,6 +287,26 @@ def _coerce_text(content: Any) -> str:
     return "".join(parts)
 
 
+def _cap_history_text(text: str, *, limit: int | None = None) -> str:
+    """Capa el texto al límite (llm_max_message_chars) con marcador.
+
+    Ningún GET /sessions/{id} debe mandar megabytes al frontend: los threads
+    envenenados (sesión 44) viven en el checkpointer y la reconstrucción de
+    historia es la ventana por la que se ven. El marcador informa exactamente
+    cuánto se omitió.
+    """
+    if limit is None:
+        limit = settings.llm_max_message_chars
+    if len(text) <= limit:
+        return text
+    omitted = len(text) - limit
+    return (
+        text[:limit]
+        + f"\n[Contenido truncado: se omitieron {omitted} caracteres "
+        + f"(limite {limit}).]"
+    )
+
+
 async def reconstruct_history(
     checkpointer: AsyncSqliteSaver, session_id: int
 ) -> list[dict]:
@@ -331,11 +356,11 @@ async def reconstruct_history(
             out.append({
                 "id": f"u-{len(out)}",
                 "role": "user",
-                "content": _coerce_text(msg.content),
+                "content": _cap_history_text(_coerce_text(msg.content)),
                 "created_at": None,
             })
         elif isinstance(msg, AIMessage):
-            text = _coerce_text(msg.content)
+            text = _cap_history_text(_coerce_text(msg.content))
             if text:
                 out.append({
                     "id": f"a-{len(out)}",
@@ -361,7 +386,7 @@ async def reconstruct_history(
             tc_id = msg.tool_call_id
             idx = pending.get(tc_id)
             if idx is not None:
-                out[idx]["content"] = _coerce_text(msg.content)
+                out[idx]["content"] = _cap_history_text(_coerce_text(msg.content))
                 if not out[idx].get("tool_name") and getattr(msg, "name", None):
                     out[idx]["tool_name"] = msg.name
             else:
@@ -370,7 +395,7 @@ async def reconstruct_history(
                 out.append({
                     "id": f"t-{len(out)}",
                     "role": "tool",
-                    "content": _coerce_text(msg.content),
+                    "content": _cap_history_text(_coerce_text(msg.content)),
                     "created_at": None,
                     "tool_name": getattr(msg, "name", None) or "",
                     "tool_call_id": tc_id,

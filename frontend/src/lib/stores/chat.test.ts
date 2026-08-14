@@ -34,7 +34,7 @@ import {
   loadHistoryFromDetail,
   _resetChatForTests
 } from './chat';
-import { parseSseEvents } from '$lib/api/chat';
+import { parseSseEvents, dispatchEvent } from '$lib/api/chat';
 
 describe('chat store - low-level ops', () => {
   beforeEach(() => {
@@ -216,6 +216,74 @@ describe('chat store - parser SSE', () => {
     const buf = 'event: x\ndata: linea1\ndata: linea2\n\n';
     const { events } = parseSseEvents(buf);
     expect(events[0].data).toBe('linea1\nlinea2');
+  });
+});
+
+describe('chat store - relay.truncated (topes anti-veneno, sesión 44)', () => {
+  beforeEach(() => {
+    _resetChatForTests();
+    handlersHolder.handlers = null;
+  });
+
+  it('onRelayTruncated marca el assistant message activo con el aviso', async () => {
+    await sendMessage(42, 'captura');
+    const h = handlersHolder.handlers!;
+    h.onToken?.('x'.repeat(2000));
+    h.onRelayTruncated?.({ shown: 2000, omitted: 1_098_000, limit: 30_000 });
+    h.onCompleted?.();
+
+    let list: any[] = [];
+    messages.subscribe((v) => (list = v))();
+    const a = list.find((m) => m.kind === 'assistant');
+    expect(a.truncated).toEqual({ shown: 2000, omitted: 1_098_000, limit: 30_000 });
+    expect(a.content).toBe('x'.repeat(2000));
+    expect(a.streaming).toBe(false);
+  });
+
+  it('onRelayTruncated sin segmento abierto abre uno para el aviso (y no se cae)', async () => {
+    await sendMessage(42, 'captura');
+    const h = handlersHolder.handlers!;
+    // Sin tokens previos: el aviso debe tener dónde adjuntarse.
+    h.onRelayTruncated?.({ shown: 0, omitted: 500, limit: 30_000 });
+    h.onCompleted?.();
+
+    let list: any[] = [];
+    messages.subscribe((v) => (list = v))();
+    const a = list.find((m) => m.kind === 'assistant');
+    expect(a).toBeDefined();
+    expect(a.truncated.omitted).toBe(500);
+  });
+});
+
+describe('api chat - dispatchEvent', () => {
+  it('relay.truncated dispara onRelayTruncated con payload numérico', () => {
+    const calls: any[] = [];
+    dispatchEvent(
+      { event: 'relay.truncated', data: '{"shown":1,"omitted":2,"limit":3}' },
+      { onRelayTruncated: (t) => calls.push(t) }
+    );
+    expect(calls).toEqual([{ shown: 1, omitted: 2, limit: 3 }]);
+  });
+
+  it('tipos desconocidos se ignoran sin romper (default explícito)', () => {
+    expect(() =>
+      dispatchEvent({ event: 'future.event', data: '{"x":1}' }, {})
+    ).not.toThrow();
+  });
+
+  it('token y completed siguen fluyendo igual que antes', () => {
+    const tokens: string[] = [];
+    let completed = 0;
+    dispatchEvent(
+      { event: 'token', data: '{"delta":"a"}' },
+      { onToken: (d) => tokens.push(d) }
+    );
+    dispatchEvent(
+      { event: 'completed', data: '{}' },
+      { onCompleted: () => (completed += 1) }
+    );
+    expect(tokens).toEqual(['a']);
+    expect(completed).toBe(1);
   });
 });
 

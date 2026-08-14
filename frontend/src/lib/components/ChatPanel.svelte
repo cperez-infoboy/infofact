@@ -379,6 +379,13 @@
         pensando…
       </div>
     {/if}
+    {#if msg.truncated}
+      <div
+        class="self-start max-w-[95%] text-xs text-text-dim bg-surface-2 border border-border px-2 py-1 rounded-md"
+      >
+        Salida truncada: se omitieron {msg.truncated.omitted.toLocaleString('es')} caracteres
+      </div>
+    {/if}
   </div>
 {/snippet}
 

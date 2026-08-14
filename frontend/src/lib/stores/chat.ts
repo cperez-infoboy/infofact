@@ -1,7 +1,11 @@
 // Store del chat: mensajes por sesión + stream SSE + cancel.
 // Archivo .ts PLANO → writable de svelte/store.
 import { writable } from 'svelte/store';
-import { streamMessage, type ToolInput } from '$lib/api/chat';
+import {
+  streamMessage,
+  type RelayTruncatedEvent,
+  type ToolInput
+} from '$lib/api/chat';
 import type { MessageOut } from '$lib/api/projects';
 import {
   captureStage,
@@ -55,6 +59,9 @@ export interface AssistantMessage {
   content: string;
   streaming: boolean;
   created_at: string;
+  /** Aviso cuando el relay descartó texto por los topes anti-veneno
+   *  (evento SSE relay.truncated, sesión 44). */
+  truncated?: RelayTruncatedEvent | null;
 }
 
 export interface ToolMessage {
@@ -123,6 +130,21 @@ export function appendToken(assistantId: string, delta: string): void {
   );
 }
 
+/** Marca el assistant message con el aviso de salida truncada
+ *  (evento SSE relay.truncated: el relay descartó texto del turno). */
+export function markAssistantTruncated(
+  assistantId: string,
+  info: RelayTruncatedEvent
+): void {
+  messages.update((list) =>
+    list.map((m) =>
+      m.kind === 'assistant' && m.id === assistantId
+        ? { ...m, truncated: info }
+        : m
+    )
+  );
+}
+
 /** Crea un tool message top-level (status=running). Devuelve su id. */
 export function pushToolMessage(name: string, input: ToolInput): string {
   const id = nextId('t');
@@ -168,8 +190,16 @@ export function closeAssistantMessage(
         : m
     );
     if (!dropIfEmpty) return updated;
+    // Un mensaje con aviso de truncado se conserva aunque no tenga contenido:
+    // el aviso es lo que el usuario debe ver.
     return updated.filter(
-      (m) => !(m.kind === 'assistant' && m.id === assistantId && !m.content)
+      (m) =>
+        !(
+          m.kind === 'assistant' &&
+          m.id === assistantId &&
+          !m.content &&
+          !m.truncated
+        )
     );
   });
 }
@@ -228,6 +258,15 @@ export async function sendMessage(sessionId: number, content: string): Promise<b
         if (CAPTURE_START_TOOLS.has(name)) {
           startCapture();
         }
+      },
+      onRelayTruncated: (t) => {
+        // El relay descartó texto del turno (topes anti-veneno, sesión 44).
+        // Defensivo: si no hay segmento abierto (el truncado llegó sin tokens
+        // previos), abrir uno para que el aviso tenga dónde adjuntarse.
+        if (currentAssistantId === null) {
+          currentAssistantId = openAssistantMessage();
+        }
+        markAssistantTruncated(currentAssistantId, t);
       },
       onToolEnd: (name, output) => {
         // FIFO match por nombre: primer pending con mismo name.

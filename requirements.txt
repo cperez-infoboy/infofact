@@ -10,6 +10,9 @@ python-multipart>=0.0.9
 httpx>=0.27
 ddgs>=9.0
 deepagents>=0.5
+# AgentMiddleware / ModelRequest (backend/agents/size_guard.py): hoy entra
+# transitiva por deepagents, pero la usamos directo: fijarla explicita.
+langchain>=1.0
 langchain-openai>=0.2
 langgraph-checkpoint-sqlite>=2.0
 docling>=2.0

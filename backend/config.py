@@ -74,6 +74,21 @@ class Settings(BaseSettings):
     # makes dense schemas readable. Lower to cut vision cost on simpler docs.
     vision_images_scale: float = 4.0
 
+    # Guardas de tamaño (incidente de la sesión 44: un mensaje assistant de
+    # 1.1 MB —el JSON crudo del anotador— envenenó la historia del chat y el
+    # input del LLM en cada turno). Cuatro techos env-overridables:
+    #   - relay_max_delta_chars: cap por evento `token` SSE. Una llamada
+    #     anidada no-streaming puede llegar como UN delta gigante.
+    #   - relay_max_assistant_chars: techo de acumulación de texto assistant
+    #     por turno (los reports legítimos observados son de 1-5K).
+    #   - llm_max_message_chars: ~6K tokens por mensaje individual; una
+    #     anotación sana de ~100 secciones sigue entrando.
+    #   - llm_total_input_chars: ~60K tokens de prompt total por turno.
+    relay_max_delta_chars: int = 2_000
+    relay_max_assistant_chars: int = 30_000
+    llm_max_message_chars: int = 24_000
+    llm_total_input_chars: int = 240_000
+
     # Agent container lifecycle
     agent_image: str = "infofact-agent"
     # Path en el HOST donde viven los workspaces por perfil. En dev es relativo

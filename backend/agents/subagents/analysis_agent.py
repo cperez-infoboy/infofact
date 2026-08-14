@@ -29,6 +29,7 @@ from typing import Any
 
 from langchain_core.tools import tool
 
+from backend.agents.size_guard import SizeGuardMiddleware
 from backend.agents.subagents.analysis_run_holder import (
     STAGE_ADR,
     STAGE_ARCHITECTURE,
@@ -1540,4 +1541,7 @@ def make_analysis_agent_subagent(
         ),
         "system_prompt": ANALYSIS_AGENT_PROMPT,
         "tools": stage_tools + _make_read_tools(project_id),
+        # deepagents NO propaga el middleware del orquestador a los
+        # subagentes: cada spec necesita su propia guarda de tamaño.
+        "middleware": [SizeGuardMiddleware()],
     }

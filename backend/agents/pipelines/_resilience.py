@@ -429,7 +429,7 @@ async def _repair_mermaid(mermaid_str: str, reason: str, diagram_type: str) -> s
 
     Returns the repaired Mermaid string, or the original on failure.
     """
-    from backend.agents.llm import build_llm
+    from backend.agents.llm import build_pipeline_llm
 
     prompt = (
         f"El siguiente diagrama Mermaid tipo {diagram_type} tiene un error de "
@@ -438,7 +438,7 @@ async def _repair_mermaid(mermaid_str: str, reason: str, diagram_type: str) -> s
         f"ni markdown."
     )
     try:
-        llm = build_llm(temperature=0.0)
+        llm = build_pipeline_llm(temperature=0.0)
         result = await llm.ainvoke([("system", prompt), ("human", mermaid_str)])
         content = result.content if hasattr(result, "content") else str(result)
         # Strip markdown code fences if present.

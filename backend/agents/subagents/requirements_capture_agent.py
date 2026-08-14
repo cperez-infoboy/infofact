@@ -68,6 +68,7 @@ from backend.agents.subagents.capture_run_holder import (
     get_or_create_run,
     get_run,
 )
+from backend.agents.size_guard import SizeGuardMiddleware
 from backend.agents.tools.grouping_tools import make_grouping_tools
 from backend.agents.tools.requirements_tools import make_requirements_tools
 from backend.agents.tools.vision_tools import make_vision_tools
@@ -1054,4 +1055,7 @@ def make_requirements_capture_agent_subagent(
             *grouping_tools,
             *vision_tools,
         ],
+        # deepagents NO propaga el middleware del orquestador a los
+        # subagentes: cada spec necesita su propia guarda de tamaño.
+        "middleware": [SizeGuardMiddleware()],
     }

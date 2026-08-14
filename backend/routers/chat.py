@@ -25,6 +25,7 @@ from fastapi.responses import StreamingResponse
 from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 from pydantic import BaseModel, Field
 
+from backend.config import settings
 from backend.database import AsyncSessionLocal
 from backend.deps import COOKIE_NAME, decode_access_token
 from backend.models import ChatMessage, ChatSession, Project, User
@@ -85,6 +86,85 @@ def _truncate(text: str, limit: int = MAX_TOOL_OUTPUT_CHARS) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + "..."
+
+
+class _RelayAccumulator:
+    """Acumula el texto assistant del turno con topes anti-veneno (sesión 44).
+
+    Un delta puede ser gigante (una llamada anidada no-streaming llega como UN
+    mensaje completo) y el acumulado del turno no tiene por qué crecer sin
+    límite: esta clase acota las tres salidas del relay.
+
+    - Cada delta se emite con a lo sumo ``max_delta`` caracteres.
+    - Cuando se descarta contenido (tope por delta o techo ``max_total`` del
+      turno) deja de emitir lo recortado y emite UN único evento custom
+      ``relay.truncated`` (``{"shown", "omitted", "limit"}``), con las cifras
+      del momento del primer descarte.
+    - ``result()`` devuelve el acumulado capado + marcador con la cuenta final
+      de omitidos: es lo que se persiste en ChatMessage Y lo que emite el
+      evento ``completed`` (mismo texto en ambos lados).
+
+    ``tool_start``/``tool_end``/custom no pasan por acá: ya están acotados
+    por MAX_TOOL_OUTPUT_CHARS / _safe_json.
+    """
+
+    def __init__(self, *, max_delta: int, max_total: int) -> None:
+        self._max_delta = max_delta
+        self._max_total = max_total
+        self._parts: list[str] = []
+        self._shown = 0
+        self._omitted = 0
+        self._truncated_notified = False
+
+    @property
+    def shown(self) -> int:
+        """Caracteres de texto assistant realmente emitidos en el turno."""
+        return self._shown
+
+    @property
+    def omitted(self) -> int:
+        """Caracteres descartados por los topes (delta y turno)."""
+        return self._omitted
+
+    def _truncated_frame(self) -> str:
+        return _sse(
+            "relay.truncated",
+            {
+                "shown": self._shown,
+                "omitted": self._omitted,
+                "limit": self._max_total,
+            },
+        )
+
+    def add(self, text: str) -> list[str]:
+        """Agrega un delta y devuelve los frames SSE a emitir por él."""
+        if not text:
+            return []
+        frames: list[str] = []
+        room = self._max_total - self._shown
+        take = max(min(len(text), room, self._max_delta), 0)
+        if take > 0:
+            emit = text[:take]
+            self._parts.append(emit)
+            self._shown += len(emit)
+            frames.append(_sse("token", {"delta": emit}))
+        dropped = len(text) - take
+        if dropped > 0:
+            self._omitted += dropped
+            if not self._truncated_notified:
+                self._truncated_notified = True
+                frames.append(self._truncated_frame())
+        return frames
+
+    def result(self) -> str:
+        """Acumulado capado + marcador: lo persistido y lo emitido en completed."""
+        text = "".join(self._parts)
+        if self._omitted > 0:
+            text += (
+                f"\n\n[Salida truncada: se omitieron {self._omitted} caracteres "
+                f"(limite {self._max_total}).]"
+            )
+        return text
 
 
 def _stringify(obj: Any) -> str:
@@ -479,7 +559,10 @@ async def send_message(
     content = _rewrite_command(body.content)
 
     async def event_stream() -> AsyncGenerator[str, None]:
-        accumulated: list[str] = []
+        accumulator = _RelayAccumulator(
+            max_delta=settings.relay_max_delta_chars,
+            max_total=settings.relay_max_assistant_chars,
+        )
         seen_tool_calls: set[str] = set()
         try:
             async for chunk in agent.astream(
@@ -508,8 +591,8 @@ async def send_message(
                         text = getattr(token, "content", "")
                         # Delta de texto (ignorar mensajes que traen tool calls).
                         if isinstance(text, str) and text and not calls:
-                            accumulated.append(text)
-                            yield _sse("token", {"delta": text})
+                            for frame in accumulator.add(text):
+                                yield frame
                         # Inicio de tool call: emitir tool_start una vez por id.
                         if calls:
                             for c in calls:
@@ -544,7 +627,7 @@ async def send_message(
                         ev_data = cdata.get("data", {})
                         yield _sse(ev_name, _safe_json(ev_data))
 
-            assistant_text = "".join(accumulated)
+            assistant_text = accumulator.result()
             try:
                 async with AsyncSessionLocal() as db:
                     db.add(

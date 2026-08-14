@@ -7,6 +7,7 @@
 //   event: tool_end\ndata: {"name": "...", "output": "..."}
 //   event: completed\ndata: {}
 //   event: failed\ndata: {"error": "..."}
+//   event: relay.truncated\ndata: {"shown": N, "omitted": N, "limit": N}
 //   event: extraction.progress\ndata: {"stage": "...", "message": "..."}
 //   event: conflict.found\ndata: {kind:"duplicate"|"contradiction", ...}
 //   event: validation.report\ndata: {total, kept, rejected, flagged}
@@ -158,10 +159,19 @@ export interface AnalysisReadyEvent {
   sub_projects: number;
 }
 
+/** Fine event: el relay descartó texto assistant por los topes anti-veneno
+ *  (sesión 44). shown/omitted son caracteres; limit es el techo del turno. */
+export interface RelayTruncatedEvent {
+  shown: number;
+  omitted: number;
+  limit: number;
+}
+
 export interface StreamHandlers {
   onToken?: (delta: string) => void;
   onToolStart?: (name: string, input: ToolInput) => void;
   onToolEnd?: (name: string, output: string) => void;
+  onRelayTruncated?: (t: RelayTruncatedEvent) => void;
   onProgress?: (p: ProgressEvent) => void;
   onConflict?: (c: ConflictEvent) => void;
   onValidationReport?: (r: ValidationReport) => void;
@@ -297,7 +307,8 @@ export async function streamMessage(
   return controller;
 }
 
-function dispatchEvent(ev: ParsedEvent, handlers: StreamHandlers): void {
+/** Exportada para tests: permite ejercer el dispatch sin stream real. */
+export function dispatchEvent(ev: ParsedEvent, handlers: StreamHandlers): void {
   let payload: Record<string, unknown> = {};
   try {
     payload = JSON.parse(ev.data);
@@ -323,6 +334,13 @@ function dispatchEvent(ev: ParsedEvent, handlers: StreamHandlers): void {
         (payload.name as string) ?? 'unknown',
         (payload.output as string) ?? ''
       );
+      break;
+    case 'relay.truncated':
+      handlers.onRelayTruncated?.({
+        shown: Number(payload.shown ?? 0),
+        omitted: Number(payload.omitted ?? 0),
+        limit: Number(payload.limit ?? 0),
+      });
       break;
     case 'extraction.progress':
       handlers.onProgress?.({
@@ -414,6 +432,10 @@ function dispatchEvent(ev: ParsedEvent, handlers: StreamHandlers): void {
       break;
     case 'failed':
       handlers.onFailed?.((payload.error as string) ?? 'unknown_error');
+      break;
+    default:
+      // Tipos desconocidos: ignorados a propósito. El backend puede agregar
+      // eventos nuevos sin romper clientes viejos.
       break;
   }
 }

@@ -24,8 +24,10 @@ from pathlib import Path
 from typing import Literal
 
 from langchain_core.messages import HumanMessage
+from langchain_core.runnables import Runnable
 from langchain_openai import ChatOpenAI
 
+from backend.agents.llm import with_nostream
 from backend.config import settings
 
 logger = logging.getLogger(__name__)
@@ -114,12 +116,14 @@ _PROMPT_BY_KIND: dict[str, str] = {
 
 # --- internals -------------------------------------------------------------
 
-def _vision_llm(model: str) -> ChatOpenAI:
-    """ChatOpenAI pointed at a vision model.
+def _vision_llm(model: str) -> Runnable:
+    """ChatOpenAI pointed at a vision model, outside the stream `messages`.
 
     Uses the vision-specific endpoint/key (LLM_VISION_*) when set, otherwise
     falls back to the shared LLM_* values -- so vision can target any
-    OpenAI-compatible provider independently of the text agent.
+    OpenAI-compatible provider independently of the text agent. Lleva el tag
+    `nostream` (with_nostream): la respuesta de vision no debe emitirse al
+    stream `messages` del grafo (incidente de la sesión 44).
     """
     api_key = settings.llm_vision_api_key or settings.llm_api_key
     if not api_key:
@@ -127,7 +131,7 @@ def _vision_llm(model: str) -> ChatOpenAI:
             "No API key for vision: set LLM_VISION_API_KEY (or LLM_API_KEY)."
         )
     base_url = settings.llm_vision_base_url or settings.llm_base_url
-    return ChatOpenAI(
+    return with_nostream(ChatOpenAI(
         model=model,
         api_key=api_key,
         base_url=base_url,
@@ -135,7 +139,7 @@ def _vision_llm(model: str) -> ChatOpenAI:
         streaming=False,
         stream_chunk_timeout=300,  # GLM can stall mid-stream; matches build_llm
         max_retries=2,             # SDK handles 429/5xx natively
-    )
+    ))
 
 
 def _image_to_data_uri(path: Path) -> str:

@@ -14,6 +14,7 @@ from __future__ import annotations
 import re
 
 from langchain_openai import ChatOpenAI
+from langgraph.constants import TAG_NOSTREAM
 
 from backend.config import settings
 
@@ -43,6 +44,35 @@ def build_llm(*, temperature: float = 0.3, streaming: bool = False) -> ChatOpenA
         # failures and the last-mile persistent-429 case.
         max_retries=2,
     )
+
+
+# ---------------------------------------------------------------------------
+# Llamadas dentro de tools: fuera del stream `messages`
+# ---------------------------------------------------------------------------
+
+# Incidente de la sesión 44: un StructuredRunnable invocado dentro de una tool
+# hereda el árbol de callbacks del grafo, así que LangGraph emitía su AIMessage
+# COMPLETO (JSON crudo del anotador, 1.1 MB) al stream `messages`, y el relay lo
+# acumulaba, lo persistía y lo mandaba al navegador. Con el tag `nostream`
+# (TAG_NOSTREAM de langgraph) la llamada no se registra en el stream: el
+# progreso de estas pasadas ya viaja por eventos custom (`extraction.progress`).
+
+
+def with_nostream(llm):
+    """Devuelve el LLM con el tag `nostream` ligado (fuera del stream)."""
+    return llm.with_config(tags=[TAG_NOSTREAM])
+
+
+def build_pipeline_llm(*, temperature: float = 0.3, streaming: bool = False):
+    """LLM para pasadas estructuradas dentro de tools, fuera del stream.
+
+    Drop-in de build_llm() para TODO LLM que corra dentro de una tool del
+    agente (pipeline de captura, reparación de diagramas, vision): mismo
+    cliente, pero LangGraph no emite su respuesta al stream `messages`, así
+    nunca llega al relay ni al navegador. El modelo conversacional NO usa
+    esta variante: sus tokens sí deben streamearse.
+    """
+    return with_nostream(build_llm(temperature=temperature, streaming=streaming))
 
 
 # ---------------------------------------------------------------------------
@@ -111,14 +141,34 @@ class StructuredRunnable:
                 return self._schema.model_validate_json(match.group(0))
             raise
 
+    @staticmethod
+    def _nostream_config(config):
+        """Fusiona el tag `nostream` en el config, respetando tags del caller.
+
+        LangGraph no registra en el stream `messages` las llamadas con este
+        tag, así el JSON crudo de las pasadas estructuradas nunca llega al
+        relay ni al navegador (incidente de la sesión 44). No pisa los tags
+        que el caller ya haya mandado: solo agrega el que falta.
+        """
+        config = dict(config or {})
+        tags = list(config.get("tags") or [])
+        if TAG_NOSTREAM not in tags:
+            tags.append(TAG_NOSTREAM)
+        config["tags"] = tags
+        return config
+
     async def ainvoke(self, messages, config=None, **kwargs):
         msgs = list(messages) + [("system", _format_instructions(self._schema))]
-        resp = await self._llm.ainvoke(msgs, config=config, **kwargs)
+        resp = await self._llm.ainvoke(
+            msgs, config=self._nostream_config(config), **kwargs
+        )
         return self._parse(resp.content)
 
     def invoke(self, messages, config=None, **kwargs):
         msgs = list(messages) + [("system", _format_instructions(self._schema))]
-        resp = self._llm.invoke(msgs, config=config, **kwargs)
+        resp = self._llm.invoke(
+            msgs, config=self._nostream_config(config), **kwargs
+        )
         return self._parse(resp.content)
 
 
