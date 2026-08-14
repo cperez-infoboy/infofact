@@ -63,7 +63,7 @@ logger = logging.getLogger(__name__)
 # Bump cuando cambie el FORMATO de los campos cacheados (chunks_json, sections,
 # tablas, etc.) para forzar re-parseo de caches escritos por versiones previas
 # del codigo. Distinto del parser_used y de la version de Docling.
-_PARSE_SCHEMA_VERSION = "1"
+_PARSE_SCHEMA_VERSION = "2"
 
 
 # ---------------------------------------------------------------------------

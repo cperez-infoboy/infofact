@@ -23,9 +23,10 @@ the pipeline does not.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterator
 
 from backend.config import settings
 
@@ -50,6 +51,13 @@ DOCLING_EXTENSIONS = {
 }
 PLAINTEXT_EXTENSIONS = {".txt", ".md", ".csv"}
 DOC_EXTENSIONS = DOCLING_EXTENSIONS | PLAINTEXT_EXTENSIONS
+
+# Char budget for plaintext chunks (~4 chars/token heuristic ≈ the 8000-token
+# budget chunk_document uses for Docling). A size guide, not an exact count.
+_PLAINTEXT_CHUNK_CHARS = 32_000
+
+# ATX heading (#{1..6} + title); trailing closing #'s are optional.
+_ATX_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
 
 # Standalone raster images. Docling handles their OCR/layout; when vision is
 # available the vision model also describes them semantically.
@@ -438,12 +446,142 @@ def chunk_document(doc, document_id: str, *, max_tokens: int = 8000) -> list[Chu
     return _enforce_atomic(out)
 
 
+def _table_header(lines: list[str]) -> str | None:
+    """First line when the block looks like a delimited table, else None.
+
+    Signature: first two lines share the same count of commas / pipes / tabs
+    (CSV, markdown pipe table, TSV). Deliberately cheap — it only decides
+    whether to repeat one header row on hard splits.
+    """
+    if len(lines) < 2:
+        return None
+
+    def counts(line: str) -> tuple[int, int, int]:
+        return (line.count(","), line.count("|"), line.count("\t"))
+
+    head, second = counts(lines[0]), counts(lines[1])
+    if head == second and any(head):
+        return lines[0]
+    return None
+
+
+def _hard_split_lines(piece: str) -> list[str]:
+    """Last-resort split of an oversized piece by line (keeps lines whole).
+
+    When the piece looks tabular, the header row is repeated at the top of
+    each continuation chunk so the extractor never sees orphaned data rows
+    without column context.
+    """
+    lines = piece.splitlines()
+    header = _table_header(lines)
+    out: list[str] = []
+    cur: list[str] = []
+    size = 0
+    for line in lines:
+        add = len(line) + 1
+        if cur and size + add > _PLAINTEXT_CHUNK_CHARS:
+            out.append("\n".join(cur))
+            cur, size = ([header] if header else []), ((len(header) + 1) if header else 0)
+        cur.append(line)
+        size += add
+    if cur:
+        out.append("\n".join(cur))
+    return out
+
+
+def _split_plaintext(text: str, fallback_path: str) -> list[tuple[str, str]]:
+    """Split plaintext into ``(section_path, text)`` chunks under a char budget.
+
+    Splits on markdown ATX headings (outside fenced code blocks) and blank
+    lines, then greedily packs the pieces up to ``_PLAINTEXT_CHUNK_CHARS``.
+    A large .md returned whole would force the extractor to emit every
+    requirement in a single structured output (truncation risk) and hurt
+    recall mid-file (lost-in-the-middle). Pieces larger than the budget (e.g.
+    a CSV or a long table with no blank lines) are hard-split by line.
+    """
+    headings: list[tuple[int, str]] = []  # breadcrumb of (level, title)
+    pieces: list[tuple[str, str]] = []
+    buf: list[str] = []
+    buf_crumb = fallback_path
+    in_fence = False
+
+    def crumb() -> str:
+        return " > ".join(t for _, t in headings) if headings else fallback_path
+
+    def flush() -> None:
+        nonlocal buf, buf_crumb
+        if buf:
+            pieces.append((buf_crumb, "\n".join(buf)))
+            buf = []
+            buf_crumb = fallback_path
+
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+        match = None if in_fence else _ATX_HEADING_RE.match(stripped)
+        if match:
+            flush()
+            level, title = len(match.group(1)), match.group(2).strip()
+            while headings and headings[-1][0] >= level:
+                headings.pop()
+            headings.append((level, title))
+            buf = [stripped]
+            buf_crumb = crumb()
+            continue
+        if not stripped:
+            flush()
+            continue
+        if not buf:
+            buf_crumb = crumb()
+        buf.append(raw.rstrip())
+
+    flush()
+
+    # Greedy packing under the char budget. A chunk never ends on a heading:
+    # trailing heading pieces carry over so a section title is never separated
+    # from its content (the next extractor call would see a bare title).
+    def _is_heading_piece(text: str) -> bool:
+        return "\n" not in text and _ATX_HEADING_RE.match(text.strip()) is not None
+
+    chunks: list[tuple[str, str]] = []
+    cur: list[tuple[str, str]] = []  # (crumb, text) pieces being packed
+    size = 0
+    for piece_crumb, piece in pieces:
+        parts = (
+            [piece]
+            if len(piece) <= _PLAINTEXT_CHUNK_CHARS
+            else _hard_split_lines(piece)
+        )
+        for part in parts:
+            if cur and size + len(part) + 1 > _PLAINTEXT_CHUNK_CHARS:
+                carry: list[tuple[str, str]] = []
+                while cur and _is_heading_piece(cur[-1][1]):
+                    carry.insert(0, cur.pop())
+                if cur:
+                    chunks.append((cur[0][0], "\n".join(t for _, t in cur)))
+                cur = carry
+                size = sum(len(t) + 1 for _, t in carry)
+            cur.append((piece_crumb, part))
+            size += len(part) + 1
+    if cur:
+        chunks.append((cur[0][0], "\n".join(t for _, t in cur)))
+    return chunks
+
+
 def _chunk_plaintext(path: Path, document_id: str) -> list[Chunk]:
-    """Plaintext files (.txt/.md/.csv) bypass the layout parser."""
+    """Plaintext files (.txt/.md/.csv) bypass the layout parser.
+
+    The text is split by ``_split_plaintext`` instead of returned whole so a
+    large file reaches the extractor as several bounded chunks.
+    """
     text = path.read_text(encoding="utf-8", errors="replace")
     if not text.strip():
         return []
-    return [Chunk(text=text, document_id=document_id, section_path=path.name)]
+    return [
+        Chunk(text=t, document_id=document_id, section_path=crumb, index=i)
+        for i, (crumb, t) in enumerate(_split_plaintext(text, path.name))
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -542,17 +680,51 @@ def verification_text(chunks: list[Chunk], smap: StructureMap) -> str:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _scan_headings(text: str) -> Iterator[tuple[int, str]]:
+    """Yield ``(level, title)`` for each ATX heading outside fenced blocks.
+
+    Fence tracking is line-granular (``` toggles); good enough for documents
+    the pipeline sees and keeps ``#`` comments inside code fences from being
+    misread as section headings.
+    """
+    in_fence = False
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        match = _ATX_HEADING_RE.match(stripped)
+        if match:
+            yield len(match.group(1)), match.group(2).strip()
+
+
+def _plaintext_sections(text: str, fallback_title: str) -> list[SectionNode]:
+    """SectionNodes from markdown headings; single-section fallback."""
+    sections = [
+        SectionNode(id=title[:80], title=title, level=level, page=None)
+        for level, title in _scan_headings(text)
+    ]
+    if not sections:
+        return [SectionNode(id=fallback_title, title=fallback_title, level=1,
+                            page=None)]
+    return sections
+
+
 def _parse_plaintext(path: Path):
     """Rama plaintext como ``ParsedDoc`` (para el router, Fase C)."""
     from backend.agents.parsers.base import ParsedDoc
 
     document_id = str(path)
     chunks = _chunk_plaintext(path, document_id)
+    # Full text drives span verification — keep the file verbatim, not a
+    # chunk join (chunk packing drops blank-line separators).
+    full_text = path.read_text(encoding="utf-8", errors="replace")
     smap = StructureMap(
         document_id=document_id,
-        sections=[SectionNode(id=path.name, title=path.name, level=1,
-                              page=None)],
-        full_text=chunks[0].text if chunks else "",
+        sections=_plaintext_sections(full_text, path.name),
+        full_text=full_text,
     )
     return ParsedDoc(chunks=chunks, smap=smap, parser_used="plaintext")
 
