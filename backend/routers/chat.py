@@ -95,11 +95,12 @@ class _RelayAccumulator:
     mensaje completo) y el acumulado del turno no tiene por qué crecer sin
     límite: esta clase acota las tres salidas del relay.
 
-    - Cada delta se emite con a lo sumo ``max_delta`` caracteres.
-    - Cuando se descarta contenido (tope por delta o techo ``max_total`` del
-      turno) deja de emitir lo recortado y emite UN único evento custom
-      ``relay.truncated`` (``{"shown", "omitted", "limit"}``), con las cifras
-      del momento del primer descarte.
+    - Cada frame ``token`` lleva a lo sumo ``max_delta`` caracteres: un delta
+      grande se parte en varios frames chicos (protege el transporte, no
+      descarta contenido).
+    - Solo el techo ``max_total`` del turno descarta contenido: deja de emitir
+      lo recortado y emite UN único evento custom ``relay.truncated``
+      (``{"shown", "omitted", "limit"}``), con las cifras acumuladas.
     - ``result()`` devuelve el acumulado capado + marcador con la cuenta final
       de omitidos: es lo que se persiste en ChatMessage Y lo que emite el
       evento ``completed`` (mismo texto en ambos lados).
@@ -137,17 +138,26 @@ class _RelayAccumulator:
         )
 
     def add(self, text: str) -> list[str]:
-        """Agrega un delta y devuelve los frames SSE a emitir por él."""
+        """Agrega un delta y devuelve los frames SSE a emitir por él.
+
+        El tope por delta es de TRANSPORTE (tamaño de frame): un delta
+        grande se PARTE en frames chicos de ``max_delta`` (un solo frame
+        gigante congela el browser). Solo el techo ``max_total`` del turno
+        descarta contenido real.
+        """
         if not text:
             return []
         frames: list[str] = []
-        room = self._max_total - self._shown
-        take = max(min(len(text), room, self._max_delta), 0)
+        room = max(self._max_total - self._shown, 0)
+        take = min(len(text), room)
         if take > 0:
             emit = text[:take]
             self._parts.append(emit)
             self._shown += len(emit)
-            frames.append(_sse("token", {"delta": emit}))
+            for i in range(0, len(emit), self._max_delta):
+                frames.append(
+                    _sse("token", {"delta": emit[i : i + self._max_delta]})
+                )
         dropped = len(text) - take
         if dropped > 0:
             self._omitted += dropped

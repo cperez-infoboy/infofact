@@ -2,8 +2,8 @@
 
 Casos del plan:
   (a) deltas chicos se emiten todos como frames ``token``;
-  (b) UN delta de 1.1M chars emite <= max_delta de token + EXACTAMENTE UN
-      evento ``relay.truncated`` con shown/omitted/limit coherentes;
+  (b) UN delta de 1.1M chars se PARTE en frames de <= max_delta hasta el
+      techo del turno + EXACTAMENTE UN ``relay.truncated`` con el resto;
   (c) superado el techo del turno deja de emitir tokens y ``result()``
       devuelve el acumulado capado + marcador con la cuenta correcta;
   (d) ``result()`` sin overflow no tiene marcador.
@@ -36,7 +36,7 @@ def test_small_deltas_all_emitted_as_token_frames():
     assert acc.omitted == 0
 
 
-def test_giant_delta_emits_capped_token_and_single_truncated_event():
+def test_giant_delta_is_split_and_total_cap_truncates_once():
     acc = _RelayAccumulator(max_delta=2_000, max_total=30_000)
     frames = acc.add("x" * 1_100_000)
 
@@ -44,18 +44,30 @@ def test_giant_delta_emits_capped_token_and_single_truncated_event():
     tokens = [data for event, data in parsed if event == "token"]
     truncated = [data for event, data in parsed if event == "relay.truncated"]
 
-    # (b) UN token capado a max_delta...
-    assert len(tokens) == 1
-    assert len(tokens[0]["delta"]) == 2_000
-    assert tokens[0]["delta"] == "x" * 2_000
-    # ...y EXACTAMENTE UN relay.truncated con cifras coherentes.
-    assert len(truncated) == 1
-    assert truncated[0] == {
-        "shown": 2_000,
-        "omitted": 1_098_000,
-        "limit": 30_000,
-    }
-    assert acc.omitted == 1_098_000
+    # (b) el delta se parte en frames de <= max_delta hasta llenar el
+    # presupuesto del turno (30.000 = 15 frames de 2.000)...
+    assert len(tokens) == 15
+    assert all(t["delta"] == "x" * 2_000 for t in tokens)
+    # ...y EXACTAMENTE UN relay.truncated con el resto descartado.
+    assert truncated == [
+        {"shown": 30_000, "omitted": 1_070_000, "limit": 30_000}
+    ]
+    assert acc.omitted == 1_070_000
+    assert acc.result().startswith("x" * 30_000)
+
+
+def test_big_legit_delta_is_split_not_dropped():
+    """Regresión sesión 44: un delta legítimo de 3.619 chars perdía 1.619
+    chars reales; ahora se parte en frames sin descartar nada."""
+    acc = _RelayAccumulator(max_delta=2_000, max_total=30_000)
+    frames = acc.add("y" * 3_619)
+
+    parsed = [_parse(f) for f in frames]
+    assert [event for event, _ in parsed] == ["token", "token"]
+    deltas = [data["delta"] for event, data in parsed if event == "token"]
+    assert "".join(deltas) == "y" * 3_619
+    assert acc.omitted == 0
+    assert acc.result() == "y" * 3_619
 
 
 def test_total_cap_stops_tokens_and_result_has_marker_with_count():
