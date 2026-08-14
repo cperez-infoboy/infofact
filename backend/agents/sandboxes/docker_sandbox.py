@@ -45,6 +45,7 @@ from deepagents.backends.protocol import (
     ExecuteResponse,
     FileDownloadResponse,
     FileUploadResponse,
+    GlobResult,
     WriteResult,
 )
 from deepagents.backends.sandbox import BaseSandbox
@@ -113,6 +114,35 @@ class DockerSandbox(BaseSandbox):
             raise ValueError(f"path escapes workspace: {path!r}")
         return normalized
 
+    def _glob_search_path(self, path: str | None) -> str:
+        """Anchor glob searches inside the project workspace.
+
+        `BaseSandbox.glob` defaults `path or "/"`, so a bare
+        `glob("**/*.md")` walks the WHOLE container filesystem (CPU storm
+        plus permission noise as uid 1000). Default to the project root
+        (`.` — `execute` already runs with cwd there) and reject escapes
+        via `_safe_path` (cross-project reads, /etc, ...).
+        """
+        if path is None or path.strip() == "":
+            return "."
+        return self._safe_path(path)
+
+    def glob(self, pattern: str, path: str | None = None) -> GlobResult:
+        """Glob bounded to this project's workspace, never the container root."""
+        try:
+            search = self._glob_search_path(path)
+        except ValueError as exc:
+            return GlobResult(error=str(exc))
+        return super().glob(pattern, search)
+
+    async def aglob(self, pattern: str, path: str | None = None) -> GlobResult:
+        """Async version of `glob`, same workspace bound."""
+        try:
+            search = self._glob_search_path(path)
+        except ValueError as exc:
+            return GlobResult(error=str(exc))
+        return await super().aglob(pattern, search)
+
     # --- core exec ---------------------------------------------------------
 
     def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
@@ -130,17 +160,25 @@ class DockerSandbox(BaseSandbox):
         `/workspaces/{slug}`, so the root gets created on demand anyway. Do
         NOT prepend `mkdir -p` to every exec call: wasteful for the hot path.
         """
+        # DeepAgents no pasa timeout; cae al default configurable de settings
+        # (ver config.Settings.sandbox_exec_timeout).
+        effective_timeout = timeout or settings.sandbox_exec_timeout
+        # CONTAINER-SIDE timeout: killing the `docker exec` client on
+        # TimeoutExpired does NOT kill the process inside the container —
+        # a recursive glob from `/` kept burning CPU minutes after the tool
+        # had already returned "timed out". `timeout -k` runs inside and
+        # reaps the process regardless of what happens to the client. The
+        # extra `sh -c` preserves pipelines: `timeout N a | b` would parse
+        # as a pipeline of (timeout N a) | b instead.
+        wrapped = f"timeout -k 5 {effective_timeout} sh -c {shlex.quote(command)}"
         cmd = [
             "docker", "exec",
             "-u", "1000:1000",
             "-w", self.workspace_root,
             self._container,
-            "sh", "-c", command,
+            "sh", "-c", wrapped,
         ]
         logger.debug("docker_exec container=%s cmd=%s", self._container, command)
-        # DeepAgents no pasa timeout; cae al default configurable de settings
-        # (ver config.Settings.sandbox_exec_timeout).
-        effective_timeout = timeout or settings.sandbox_exec_timeout
         try:
             proc = subprocess.run(
                 cmd,
