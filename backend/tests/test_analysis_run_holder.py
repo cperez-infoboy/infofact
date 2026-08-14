@@ -12,10 +12,12 @@ import pytest
 
 from backend.agents.subagents.analysis_run_holder import (
     STAGE_ADR,
+    STAGE_ARCHITECTURE,
     STAGE_COMMIT,
     STAGE_MER,
     STAGE_NFR,
     STAGE_PROCESS,
+    STAGE_PROJECTS,
     STAGE_SUBPROJECT,
     AnalysisRun,
     StageLoopExceeded,
@@ -29,7 +31,9 @@ _ALL_PRE_COMMIT = (
     STAGE_NFR,
     STAGE_PROCESS,
     STAGE_ADR,
+    STAGE_PROJECTS,
     STAGE_SUBPROJECT,
+    STAGE_ARCHITECTURE,
 )
 
 
@@ -136,7 +140,7 @@ def test_reset_clears_results_but_preserves_call_counters():
 def test_reset_clears_stages_done():
     run = _fresh_run(61)
     run.stages_done.update(_ALL_PRE_COMMIT)
-    assert len(run.stages_done) == 5
+    assert len(run.stages_done) == 7
 
     run.reset_pipeline_outputs()
 
@@ -148,7 +152,7 @@ def test_reset_clears_stages_done():
 # --------------------------------------------------------------------------- #
 
 
-def test_missing_stages_returns_all_five_when_nothing_done():
+def test_missing_stages_returns_all_seven_when_nothing_done():
     run = _fresh_run(70)
     missing = run.missing_stages_before_commit()
     assert set(missing) == set(_ALL_PRE_COMMIT)
@@ -165,8 +169,15 @@ def test_missing_stages_returns_only_missing_in_order():
     run.stages_done.add(STAGE_MER)
     run.stages_done.add(STAGE_ADR)
     missing = run.missing_stages_before_commit()
-    # Pipeline order preserved: NFR, PROCESS, SUBPROJECT remain.
-    assert missing == [STAGE_NFR, STAGE_PROCESS, STAGE_SUBPROJECT]
+    # Pipeline order preserved: NFR, PROCESS, PROJECTS, SUBPROJECT,
+    # ARCHITECTURE remain.
+    assert missing == [
+        STAGE_NFR,
+        STAGE_PROCESS,
+        STAGE_PROJECTS,
+        STAGE_SUBPROJECT,
+        STAGE_ARCHITECTURE,
+    ]
 
 
 def test_commit_stage_is_not_required_before_commit():
