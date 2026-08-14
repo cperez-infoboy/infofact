@@ -70,6 +70,10 @@ _IGNORED_DIRS = {
     # InfoFact internal metadata (grouping plans, capture reports). Must never
     # be parsed as a client document — see backend/agents/pipelines/grouping.py.
     ".infofact",
+    # Copias sueltas de planes de agrupado en la raiz del proyecto: threads con
+    # la directiva pre-DB (guardar en .infofact/) pueden recrear el dir afuera
+    # tras fallar por permisos — jamas debe ingerirse como documento cliente.
+    "grouping-plans",
 }
 
 # Labels Docling attaches to text items that represent document headings.

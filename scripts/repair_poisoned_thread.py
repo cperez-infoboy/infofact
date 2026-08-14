@@ -45,6 +45,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -176,6 +177,26 @@ def _session_owner(session_id: int) -> tuple[str, str]:
     return row[0], row[1]
 
 
+def _chown_agent_tree(root: Path) -> None:
+    """Best-effort: deja ``root`` como uid/gid 1000 (el agente del container).
+
+    Este script corre como root dentro del container backend y el dump cae en
+    el bind mount del workspace del agente: sin esto, ``.infofact`` queda
+    root:root y el agente (uid 1000, mismo que usa ``DockerSandbox``) no puede
+    crear NADA debajo — terminó creando archivos fuera del dir (sesión 44,
+    2026-08-14). No-fatal si no hay permisos o no somos root.
+    """
+    if os.geteuid() != 0:
+        return
+    for dirpath, _dirnames, filenames in os.walk(root):
+        try:
+            os.chown(dirpath, 1000, 1000)
+            for fname in filenames:
+                os.chown(os.path.join(dirpath, fname), 1000, 1000)
+        except OSError:
+            continue
+
+
 def dump_forensics(session_id: int, oversize: list[BaseMessage]) -> Path:
     """Dump del original ANTES de tocar el thread. Aborta si no se puede escribir."""
     profile, slug = _session_owner(session_id)
@@ -211,6 +232,8 @@ def dump_forensics(session_id: int, oversize: list[BaseMessage]) -> Path:
             "    Corré con permisos suficientes (sudo si data/ es root-owned) "
             "y el backend detenido. No se modificó nada."
         ) from exc
+    # Incluye los padres creados por mkdir(parents=True): .infofact/ y debug/.
+    _chown_agent_tree(out_dir.parent.parent)
     return out_dir
 
 
