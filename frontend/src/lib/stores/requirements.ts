@@ -9,6 +9,7 @@ import type {
   GroupingPlanDetail,
   ApplyResult
 } from '$lib/api/requirements';
+import type { GroupingReadyEvent } from '$lib/api/chat';
 
 export const items = writable<RequirementItem[]>([]);
 export const selectedId = writable<number | null>(null);
@@ -128,4 +129,18 @@ export async function applyPlan(): Promise<ApplyResult | null> {
   await loadPlans();
   await loadRequirements();
   return res;
+}
+
+/** Handler de grouping.ready (SSE): recarga los planes y selecciona el nuevo.
+ *
+ *  Viene tanto de la ruta directa de /agrupar como de la tool review_grouping
+ *  (ruta agéntica); cierra el gap de refresco manual del panel. NO abre la
+ *  pestaña de agrupamiento por sí sola (paridad con onSrsReady).
+ */
+export async function onGroupingReady(e: GroupingReadyEvent): Promise<void> {
+  if (_projectId === null) return;
+  await loadPlans();
+  if (e.plan_id) {
+    await selectPlan(e.plan_id);
+  }
 }

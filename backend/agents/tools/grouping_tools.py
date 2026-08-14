@@ -2,6 +2,8 @@
 
 review_grouping     — build a plan from the live store, persist it to the
                       grouping_plans table, return the groups for chat.
+                      Optional scope filters: ``types`` (ReqType values) and
+                      ``documents`` (filename | rel_path | container path).
 set_group_decision  — accept / reject / reset a group's curation decision.
 edit_group          — change a group's keeper and/or members (REQ-codes
                       resolved to ids against the live store).
@@ -24,6 +26,12 @@ Design notes
   There is no plan file to rewrite.
 - NUNCA aplicar un plan sin confirmacion explicita del usuario: las fusiones
   son destructivas (soft-delete de los perdedores como MERGED).
+
+``run_grouping_review`` es el nucleo compartido (recibe la session ya abierta):
+la tool y la ruta directa del router para ``/agrupar`` llaman a la MISMA
+funcion, asi ambas producen planes identicos. En exito emite un evento custom
+``grouping.ready`` (best-effort, solo dentro de un contexto de grafo) para que
+el frontend refresque el panel de agrupamiento sin recarga manual.
 """
 from __future__ import annotations
 
@@ -39,6 +47,73 @@ from backend.services import grouping_store as gstore
 from backend.services import requirement_store as store
 
 logger = logging.getLogger(__name__)
+
+
+def _emit_grouping_ready(result: dict) -> None:
+    """Emit ``grouping.ready`` por el canal custom de LangGraph (best-effort).
+
+    Patron de ``_make_emitters._emit_event`` (requirements_capture_agent):
+    ``get_stream_writer`` solo resuelve dentro de un contexto de ejecucion del
+    grafo; fuera de el (ruta directa del router, smokes, invocacion directa)
+    lanza y nos quedamos en silencio. El router relayea el evento al SSE y el
+    frontend refresca el panel de agrupamiento.
+    """
+    if "error" in result:
+        return
+    try:
+        from langgraph.config import get_stream_writer
+
+        writer = get_stream_writer()
+    except Exception:  # noqa: BLE001 — no graph context (direct route / smoke)
+        return
+    try:
+        writer({
+            "event": "grouping.ready",
+            "data": {
+                "plan_id": result.get("plan_id"),
+                "group_count": result.get("group_count", 0),
+            },
+        })
+    except Exception:  # noqa: BLE001 — never break the review for an event
+        return
+
+
+async def run_grouping_review(
+    session,
+    project_id: int,
+    *,
+    types: Optional[list[str]] = None,
+    documents: Optional[list[str]] = None,
+) -> dict:
+    """Nucleo compartido: build -> persist -> reload de un plan de agrupamiento.
+
+    Recibe la session YA ABIERTA (la tool abre la suya; la ruta directa del
+    router reusa la suya) y no maneja sus propias transacciones. En exito
+    devuelve ``plan_id`` / ``group_count`` / ``considered`` / ``scope`` y los
+    grupos resueltos a REQ-codes, y emite ``grouping.ready``; en fallo,
+    ``{"error": ...}``.
+    """
+    try:
+        plan = await build_grouping_plan(
+            session,
+            project_id,
+            project=str(project_id),
+            types=types,
+            documents=documents,
+        )
+        plan_id = await gstore.persist_plan(session, plan, project_id)
+        data = await gstore.get_plan(session, plan_id)
+    except Exception as exc:  # noqa: BLE001 -- surface to the model
+        return {"error": f"review_grouping failed: {exc}"}
+    result = {
+        "plan_id": plan_id,
+        "group_count": len(plan.groups),
+        "considered": plan.considered,
+        "scope": plan.scope,
+        "groups": data["groups"] if data else [],
+    }
+    _emit_grouping_ready(result)
+    return result
 
 
 def make_grouping_tools(project_id: int) -> list:
@@ -57,7 +132,10 @@ def make_grouping_tools(project_id: int) -> list:
         return {it.code: it.id for it in items}
 
     @tool
-    async def review_grouping() -> dict:
+    async def review_grouping(
+        types: Optional[list[str]] = None,
+        documents: Optional[list[str]] = None,
+    ) -> dict:
         """Detect duplicate requirements and persist an editable merge plan.
 
         Reads the live requirement store, finds duplicate groups (verbatim and
@@ -66,22 +144,30 @@ def make_grouping_tools(project_id: int) -> list:
         id, keeper + member REQ-codes, reason, confidence and current decision)
         so they can be shown in the chat for the user to review.
 
+        Optional scope filters (omit both = whole live store, the historical
+        behavior):
+            types: only group requirements of these ReqType values —
+                functional, performance, security, usability, reliability,
+                maintainability, compliance, constraint, process, data.
+                An invalid value is reported back listing the valid ones.
+            documents: only group requirements extracted from these documents.
+                Each entry may be a filename ("spec.pdf"), a workspace
+                rel_path ("docs/spec.pdf") or the absolute container path.
+                Manual requirements (created without a source document) are
+                EXCLUDED while this filter is active.
+        Use them when the user scopes the review (e.g. "agrupa solo los de
+        seguridad" -> types=["security"]; "solo los de spec.pdf" ->
+        documents=["spec.pdf"]).
+
         Does NOT merge anything. After the user curates the plan conversationally
         -- accept/reject groups with set_group_decision, change a keeper or
         members with edit_group -- call apply_grouping_plan.
         """
         try:
             async with AsyncSessionLocal() as session:
-                plan = await build_grouping_plan(
-                    session, project_id, project=str(project_id),
+                return await run_grouping_review(
+                    session, project_id, types=types, documents=documents
                 )
-                plan_id = await gstore.persist_plan(session, plan, project_id)
-                data = await gstore.get_plan(session, plan_id)
-            return {
-                "plan_id": plan_id,
-                "group_count": len(plan.groups),
-                "groups": data["groups"] if data else [],
-            }
         except Exception as exc:  # noqa: BLE001 -- surface to the model
             return {"error": f"review_grouping failed: {exc}"}
 

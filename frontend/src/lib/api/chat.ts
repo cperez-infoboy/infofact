@@ -24,6 +24,7 @@
 //   event: analysis.adr_ready\ndata: {adrs}
 //   event: analysis.subproject_ready\ndata: {sub_projects}
 //   event: analysis.ready\ndata: {version, status, requirement_count, entities, relationships, adrs, sub_projects}
+//   event: grouping.ready\ndata: {plan_id, group_count}
 
 export interface ToolInput {
   [key: string]: unknown;
@@ -159,6 +160,12 @@ export interface AnalysisReadyEvent {
   sub_projects: number;
 }
 
+/** Fine event: plan de agrupamiento listo (grouping.ready, comando /agrupar). */
+export interface GroupingReadyEvent {
+  plan_id: number;
+  group_count: number;
+}
+
 /** Fine event: el relay descartó texto assistant por los topes anti-veneno
  *  (sesión 44). shown/omitted son caracteres; limit es el techo del turno. */
 export interface RelayTruncatedEvent {
@@ -190,6 +197,8 @@ export interface StreamHandlers {
   onAnalysisAdrReady?: (e: AnalysisAdrReadyEvent) => void;
   onAnalysisSubProjectReady?: (e: AnalysisSubProjectReadyEvent) => void;
   onAnalysisReady?: (r: AnalysisReadyEvent) => void;
+  // Fine event del agrupamiento (comando /agrupar, ruta directa o tool).
+  onGroupingReady?: (g: GroupingReadyEvent) => void;
   onCompleted?: () => void;
   onFailed?: (error: string) => void;
 }
@@ -426,6 +435,12 @@ export function dispatchEvent(ev: ParsedEvent, handlers: StreamHandlers): void {
       break;
     case 'analysis.ready':
       handlers.onAnalysisReady?.(payload as unknown as AnalysisReadyEvent);
+      break;
+    case 'grouping.ready':
+      handlers.onGroupingReady?.({
+        plan_id: Number(payload.plan_id ?? 0),
+        group_count: Number(payload.group_count ?? 0),
+      });
       break;
     case 'completed':
       handlers.onCompleted?.();

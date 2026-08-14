@@ -22,6 +22,15 @@ vi.mock('$lib/api/chat', async () => {
   };
 });
 
+// Mockeamos la API de requirements para poder probar el handler de
+// grouping.ready del requirements store (loadPlans + selectPlan) sin fetch.
+vi.mock('$lib/api/requirements', () => ({
+  listGroupingPlans: vi.fn(async () => ({
+    plans: [{ id: 7, status: 'proposed', groups: 1, accepted: 0 }]
+  })),
+  getGroupingPlan: vi.fn(async () => ({ id: 7, groups: [] }))
+}));
+
 import {
   messages,
   sendMessage,
@@ -35,6 +44,15 @@ import {
   _resetChatForTests
 } from './chat';
 import { parseSseEvents, dispatchEvent } from '$lib/api/chat';
+import {
+  setProject,
+  onGroupingReady,
+  activePlanId
+} from '$lib/stores/requirements';
+import {
+  listGroupingPlans,
+  getGroupingPlan
+} from '$lib/api/requirements';
 
 describe('chat store - low-level ops', () => {
   beforeEach(() => {
@@ -284,6 +302,73 @@ describe('api chat - dispatchEvent', () => {
     );
     expect(tokens).toEqual(['a']);
     expect(completed).toBe(1);
+  });
+});
+
+describe('api chat + stores - grouping.ready (comando /agrupar)', () => {
+  beforeEach(() => {
+    _resetChatForTests();
+    handlersHolder.handlers = null;
+    vi.clearAllMocks();
+    setProject(null);
+    activePlanId.set(null);
+  });
+
+  afterEach(() => {
+    setProject(null);
+    activePlanId.set(null);
+  });
+
+  it('dispatchEvent grouping.ready dispara onGroupingReady con coerción numérica', () => {
+    const calls: any[] = [];
+    dispatchEvent(
+      { event: 'grouping.ready', data: '{"plan_id":"7","group_count":2}' },
+      { onGroupingReady: (g) => calls.push(g) }
+    );
+    expect(calls).toEqual([{ plan_id: 7, group_count: 2 }]);
+  });
+
+  it('payload incompleto de grouping.ready coerciona a 0 sin romper', () => {
+    const calls: any[] = [];
+    expect(() =>
+      dispatchEvent(
+        { event: 'grouping.ready', data: '{}' },
+        { onGroupingReady: (g) => calls.push(g) }
+      )
+    ).not.toThrow();
+    expect(calls).toEqual([{ plan_id: 0, group_count: 0 }]);
+  });
+
+  it('el requirements store recarga planes y selecciona el nuevo plan', async () => {
+    setProject(1);
+    await onGroupingReady({ plan_id: 7, group_count: 2 });
+
+    expect(listGroupingPlans).toHaveBeenCalledWith(1);
+    expect(getGroupingPlan).toHaveBeenCalledWith(1, 7);
+
+    let pid: number | null = null;
+    activePlanId.subscribe((v) => (pid = v))();
+    expect(pid).toBe(7);
+  });
+
+  it('onGroupingReady sin proyecto activo no toca la API', async () => {
+    // _projectId === null: guard — nada que recargar.
+    await onGroupingReady({ plan_id: 7, group_count: 2 });
+    expect(listGroupingPlans).not.toHaveBeenCalled();
+    expect(getGroupingPlan).not.toHaveBeenCalled();
+  });
+
+  it('sendMessage conecta el handler SSE al requirements store', async () => {
+    setProject(1);
+    await sendMessage(42, '/agrupar');
+    const h = handlersHolder.handlers!;
+    expect(h.onGroupingReady).toBeDefined();
+
+    h.onGroupingReady?.({ plan_id: 7, group_count: 2 });
+    // El handler es async: esperar un microtask antes de asertar.
+    await new Promise((r) => setTimeout(r, 0));
+    expect(listGroupingPlans).toHaveBeenCalledWith(1);
+    expect(getGroupingPlan).toHaveBeenCalledWith(1, 7);
   });
 });
 

@@ -9,10 +9,10 @@ BEFORE clustering, so it would surface them only as merged reps and never as
 ``DuplicateGroup``; this module expands each cluster's reps to their full
 verbatim buckets so the plan folds twins together.
 
-The plan is a Markdown document with YAML frontmatter, written to
-``.infofact/grouping-plans/<timestamp>/plan.md`` in the project workspace
-(see backend/agents/tools/grouping_tools.py). The user edits it
-conversationally; ``apply_grouping_plan`` parses it back and runs the merges.
+The plan persists as DB rows (``grouping_plans`` + ``grouping_groups``, see
+backend/services/grouping_store.py); the Markdown is a read-only export
+(``serialize_plan_md``). The user edits it structurally via the requirements
+UI or the grouping tools; ``apply_grouping_plan`` runs the merges.
 ``serialize_plan_md`` / ``parse_plan_md`` are exact inverses (round-trip).
 
 Never mutates the store — building a plan is read-only.
@@ -34,7 +34,11 @@ from backend.agents.pipelines.consolidation import (
     embed_texts,
     exact_dedup,
 )
+from sqlalchemy import select
+
 from backend.agents.pipelines.extraction import RawRequirement
+from backend.models.project_document import ProjectDocument
+from backend.models.requirement import ReqType
 from backend.services.requirement_store import list_requirements
 
 logger = logging.getLogger(__name__)
@@ -87,10 +91,26 @@ class GroupingPlan:
     generated_at: str = ""
     project: str = ""
     status: str = "proposed"  # proposed | applied | partially-applied
+    # Alcance del run (solo informativo): considered = items vivos tras aplicar
+    # los filtros types/documents; scope = etiqueta legible del alcance. NO se
+    # persisten: persist_plan solo lee .groups.
+    considered: int = 0
+    scope: str = ""
 
     @classmethod
-    def empty(cls, *, project: str = "") -> "GroupingPlan":
-        return cls(generated_at=_now_iso(), project=project)
+    def empty(
+        cls,
+        *,
+        project: str = "",
+        considered: int = 0,
+        scope: str = "",
+    ) -> "GroupingPlan":
+        return cls(
+            generated_at=_now_iso(),
+            project=project,
+            considered=considered,
+            scope=scope,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +138,108 @@ def _to_raw(item) -> RawRequirement:
     )
 
 
+# ---------------------------------------------------------------------------
+# Scope filters (types / documents)
+# ---------------------------------------------------------------------------
+
+def _normalize_types(types: list[str]) -> set[ReqType]:
+    """Valida y normaliza la lista de ``types`` a valores ``ReqType``.
+
+    Cada valor se acepta tal cual el enum (case-insensitive, sin espacios).
+    Un valor invalido lanza ``ValueError`` listando los validos para que el
+    modelo (o el usuario) corrija sin adivinar.
+    """
+    valid = {t.value: t for t in ReqType}
+    out: set[ReqType] = set()
+    invalid: list[str] = []
+    for raw in types:
+        val = raw.strip().lower()
+        if val in valid:
+            out.add(valid[val])
+        else:
+            invalid.append(raw)
+    if invalid:
+        raise ValueError(
+            f"types invalidos: {invalid}. Valores validos: "
+            + ", ".join(t.value for t in ReqType)
+        )
+    return out
+
+
+async def _resolve_document_filter(
+    session, project_id: int, documents: list[str]
+) -> set[str]:
+    """Resuelve nombres de documento (pedidos por el usuario) a ``rel_path``.
+
+    Acepta filename (``spec.pdf``), rel_path (``docs/spec.pdf``) o path
+    absoluto del container (``/workspaces/{slug}/docs/spec.pdf``); matchea
+    contra las filas ``ProjectDocument`` del proyecto y devuelve la UNION de
+    los rel_paths cubiertos (un filename repetido en dos directorios cubre
+    ambos). Un nombre sin match lanza ``ValueError`` listando los documentos
+    disponibles del proyecto.
+    """
+    rows = (
+        await session.scalars(
+            select(ProjectDocument).where(
+                ProjectDocument.project_id == project_id
+            )
+        )
+    ).all()
+    allowed: set[str] = set()
+    unmatched: list[str] = []
+    for name in documents:
+        wanted = name.strip()
+        matched = {
+            d.rel_path
+            for d in rows
+            if wanted == d.rel_path
+            or wanted == d.filename
+            or wanted.endswith("/" + d.rel_path)
+        }
+        if matched:
+            allowed.update(matched)
+        else:
+            unmatched.append(wanted)
+    if unmatched:
+        available = ", ".join(sorted(d.rel_path for d in rows)) or "(ninguno)"
+        raise ValueError(
+            f"documentos no encontrados: {unmatched}. Documentos del "
+            f"proyecto: {available}"
+        )
+    return allowed
+
+
+def _item_in_documents(item, allowed: set[str]) -> bool:
+    """True si el item proviene de alguno de los rel_paths permitidos.
+
+    ``source["document_id"]`` es el path absoluto en el container; el join es
+    por sufijo ``"/" + rel_path``. Items manuales (``source`` vacio) quedan
+    FUERA cuando hay filtro de documento activo.
+    """
+    if not isinstance(item.source, dict):
+        return False
+    doc_id = item.source.get("document_id")
+    if not isinstance(doc_id, str):
+        return False
+    return any(doc_id.endswith("/" + rel) for rel in allowed)
+
+
+def _scope_label(
+    type_filter: set[ReqType] | None, doc_filter: set[str] | None
+) -> str:
+    """Etiqueta legible del alcance (para el resumen del chat y del plan)."""
+    parts: list[str] = []
+    if type_filter is not None:
+        parts.append(
+            "tipos: " + ", ".join(sorted(t.value for t in type_filter))
+        )
+    if doc_filter is not None:
+        parts.append(
+            "documentos: " + ", ".join(sorted(doc_filter))
+        )
+    return " · ".join(parts)
+
+
 async def build_grouping_plan(
     session,
     project_id: int,
@@ -126,6 +248,8 @@ async def build_grouping_plan(
     duplicate_threshold: float = DEFAULT_DUPLICATE_THRESHOLD,
     strict_duplicate_threshold: float = DEFAULT_STRICT_DUPLICATE_THRESHOLD,
     max_duplicate_candidates: int = DEFAULT_MAX_DUPLICATE_CANDIDATES,
+    types: list[str] | None = None,
+    documents: list[str] | None = None,
 ) -> GroupingPlan:
     """Detect duplicate groups among the live (non-soft-deleted) requirements.
 
@@ -142,12 +266,35 @@ async def build_grouping_plan(
     reps also folds their verbatim twins). Buckets whose rep joins no cluster
     are emitted as standalone verbatim groups.
 
+    Optional scope filters (applied POST-LOAD over the live items, so the
+    store signature stays untouched):
+      - ``types``: only these ReqType values (invalid -> ValueError).
+      - ``documents``: only items whose source document matches one of these
+        names (filename | rel_path | absolute container path, resolved against
+        the ProjectDocument rows of the project). Manual items (source=None)
+        are EXCLUDED when a document filter is active.
+    ``considered``/``scope`` record the effective scope (informational only).
+
     Idempotent by construction: it always reads the current store, so after a
     merge the merged rows are excluded and re-running proposes only what's left.
     """
     items = await list_requirements(session, project_id)
-    if len(items) < 2:
-        return GroupingPlan.empty(project=project)
+    type_filter = _normalize_types(types) if types else None
+    doc_filter = (
+        await _resolve_document_filter(session, project_id, documents)
+        if documents
+        else None
+    )
+    if type_filter is not None:
+        items = [it for it in items if it.type in type_filter]
+    if doc_filter is not None:
+        items = [it for it in items if _item_in_documents(it, doc_filter)]
+    considered = len(items)
+    scope = _scope_label(type_filter, doc_filter)
+    if considered < 2:
+        return GroupingPlan.empty(
+            project=project, considered=considered, scope=scope
+        )
 
     shims = [_to_raw(it) for it in items]
     # code -> RequirementItem, so keeper selection can read priority + explicit_priority.
@@ -221,6 +368,8 @@ async def build_grouping_plan(
         generated_at=_now_iso(),
         project=project,
         status="proposed",
+        considered=considered,
+        scope=scope,
     )
 
 

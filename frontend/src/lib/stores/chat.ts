@@ -33,6 +33,7 @@ import {
   onAnalysisSubProjectReady,
   onAnalysisReady
 } from '$lib/stores/analysis';
+import { onGroupingReady } from '$lib/stores/requirements';
 
 // --- Captura: qué tools abren/cierran el banner vivo --------------------
 // startCapture() resetea el estado del pipeline (wipes conflictos/reportes),
@@ -332,6 +333,9 @@ export async function sendMessage(sessionId: number, content: string): Promise<b
       onAnalysisAdrReady: (e) => onAnalysisAdrReady(e),
       onAnalysisSubProjectReady: (e) => onAnalysisSubProjectReady(e),
       onAnalysisReady: (r) => onAnalysisReady(r),
+      // grouping.ready (/agrupar directo o tool): refresca planes + selecciona
+      // el nuevo plan en el panel de agrupamiento (sin abrir la pestaña).
+      onGroupingReady: (e) => onGroupingReady(e),
       onCompleted: () => {
         if (currentAssistantId !== null) {
           closeAssistantMessage(currentAssistantId, true);

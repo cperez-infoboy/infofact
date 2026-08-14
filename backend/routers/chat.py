@@ -29,6 +29,7 @@ from backend.config import settings
 from backend.database import AsyncSessionLocal
 from backend.deps import COOKIE_NAME, decode_access_token
 from backend.models import ChatMessage, ChatSession, Project, User
+from backend.agents.tools.grouping_tools import run_grouping_review
 from backend.services.agent_service import build_agent
 from backend.services.container_service import ensure_container
 
@@ -272,6 +273,17 @@ def _is_capture_command(content: str) -> bool:
     )
 
 
+def _is_pure_agrupar(content: str) -> bool:
+    """True para el comando ``/agrupar`` EXACTO (con espacios alrededor sí).
+
+    El comando puro es determinista (review_grouping + persistir + resumen),
+    así que send_message lo responde por la ruta directa sin tocar el modelo.
+    Cualquier texto extra ("/agrupar solo seguridad") es steering y va por la
+    ruta agéntica con directiva; no hay DSL de parsing en el router.
+    """
+    return content.strip() == "/agrupar"
+
+
 async def _capture_gate_message(project_id: int, content: str) -> str | None:
     """Guardia router-level (inviolable) para captura sobre datos existentes.
 
@@ -427,11 +439,49 @@ def _analysis_directive(user_instructions: str) -> str:
     return directive
 
 
+def _agrupar_directive(user_instructions: str) -> str:
+    """Directiva para ``/agrupar`` con steering (espejo de ``_srs_directive``).
+
+    El comando puro ya no llega acá en producción (send_message lo responde
+    por la ruta directa); esta directiva cubre el caso con steering, donde el
+    modelo traduce el alcance pedido por el usuario a los argumentos
+    ``types``/``documents`` de ``review_grouping``.
+    """
+    directive = (
+        "[DIRECTIVE] Delega INMEDIATAMENTE al subagente "
+        "`requirements-capture-agent` (usando la tool `task`) para revisar el "
+        "agrupamiento de duplicados del store de requerimientos. Invoca la "
+        "tool `review_grouping` para generar y persistir un plan de "
+        "agrupamiento editable en la DB (NO lo escribas a mano en el "
+        "workspace). Si el usuario acotó el alcance de la revisión (tipos de "
+        "requerimiento y/o documentos específicos), pásalo como los "
+        "argumentos `types` y/o `documents` de `review_grouping`; si el "
+        "alcance no mapea a esos argumentos, revisa todo el store vivo. NO "
+        "apliques el plan todavía: muéstralo y espera a que el usuario lo "
+        "edite o lo apruebe explícitamente antes de llamar "
+        "`apply_grouping_plan` (las fusiones son destructivas). Cuando "
+        "termine, reporta al usuario: plan_id, cantidad de grupos y alcance "
+        "aplicado."
+    )
+    if user_instructions:
+        # chr(34) is the ASCII double quote; keeps literal quotes around the
+        # user text without f-string escape sequences (mismo truco que captura).
+        directive += " INSTRUCCIONES DEL USUARIO: "
+        directive += chr(34) + user_instructions + chr(34)
+        directive += (
+            " (incorpóralas al alcance de review_grouping vía types/documents; "
+            "dirigen el razonamiento, no parámetros internos del pipeline)."
+        )
+    return directive
+
+
 def _rewrite_command(content: str) -> str:
     """Reescribe los slash commands en directivas al subagente.
 
     - ``/captura [subpath]`` -> captura y validación de requerimientos.
-    - ``/agrupar`` -> revisión de duplicados (plan de agrupamiento editable).
+    - ``/agrupar [steering]`` -> revisión de duplicados. El comando puro lo
+      responde la rama directa de ``send_message``; con texto extra, esta
+      directiva delega con el alcance del usuario (types/documents).
     - ``/srs [steering]`` -> generación del SRS (calidad + goals + cobertura + commit).
 
     El mensaje crudo del usuario (el comando literal) ya se persistió en
@@ -441,17 +491,13 @@ def _rewrite_command(content: str) -> str:
     stripped = content.strip()
 
     if stripped.startswith(_AGRUPAR_PREFIX):
-        # /agrupar no toma argumentos: review_grouping lee todo el store vivo.
-        return (
-            "[DIRECTIVE] Delega al subagente `requirements-capture-agent` para "
-            "revisar el agrupamiento de duplicados del store de requerimientos. "
-            "Invoca la "
-            "tool `review_grouping` para generar un plan de agrupamiento editable "
-            "(lo escribe bajo .infofact/grouping-plans/ y lo devuelve para mostrar "
-            "al usuario). NO apliques el plan todavía: muéstralo y espera a que el "
-            "usuario lo edite o lo apruebe explícitamente antes de llamar "
-            "`apply_grouping_plan`."
+        # /agrupar puro no llega acá en producción (rama directa de
+        # send_message); queda para tests/smokes y el caso con steering. El
+        # plan vive en la DB (grouping_plans), no en archivos del workspace.
+        _user_instructions = (
+            stripped[len(_AGRUPAR_PREFIX):].strip().lstrip("/").strip()
         )
+        return _agrupar_directive(_user_instructions)
 
     # /srs -> generación de SRS (subagente srs-agent). Texto tras el comando
     # es steering del usuario, no un subpath. Se chequea antes del fallback.
@@ -489,6 +535,133 @@ def _rewrite_command(content: str) -> str:
         stripped[len(_CAPTURA_PREFIX):].strip().lstrip("/").strip()
     )
     return _captura_agente_directive(_user_instructions)
+
+
+# Máximo de líneas de grupos en el resumen del chat de /agrupar (directo).
+_AGRUPAR_SUMMARY_MAX_GROUPS = 20
+
+
+def _summarize_grouping(result: dict) -> str:
+    """Resumen en español (tuteo neutral) del resultado de run_grouping_review.
+
+    Acotado por diseño: cabecera con plan_id/grupos/alcance, como máximo
+    ``_AGRUPAR_SUMMARY_MAX_GROUPS`` líneas de grupos (keeper ← miembros) y un
+    cierre que remarca que NO se fusionó nada (el apply es una acción aparte).
+    """
+    if "error" in result:
+        return f"No se pudo revisar el agrupamiento: {result['error']}"
+    considered = int(result.get("considered") or 0)
+    scope = str(result.get("scope") or "")
+    scope_frag = f" · alcance: {scope}" if scope else ""
+    if considered < 2:
+        return (
+            f"Se analizaron {considered} requerimiento(s){scope_frag}. Con "
+            "menos de 2 requerimientos en el alcance no hay duplicados que "
+            "agrupar, así que no se detectaron grupos."
+        )
+    group_count = int(result.get("group_count") or 0)
+    groups = result.get("groups") or []
+    if group_count == 0:
+        return (
+            f"No se detectaron duplicados ({considered} analizados"
+            f"{scope_frag})."
+        )
+    lines = [
+        f"Plan de agrupamiento #{result.get('plan_id')}: {group_count} "
+        f"grupo(s) de duplicados sobre {considered} requerimiento(s)"
+        f"{scope_frag}."
+    ]
+    for g in groups[:_AGRUPAR_SUMMARY_MAX_GROUPS]:
+        keeper = (g.get("keeper") or {}).get("code") or "?"
+        members = [m.get("code") for m in (g.get("members") or []) if m.get("code")]
+        shown = ", ".join(members[:2])
+        if len(members) > 2:
+            shown += f" (+{len(members) - 2})"
+        lines.append(f"- {keeper} ← {shown}")
+    if group_count > _AGRUPAR_SUMMARY_MAX_GROUPS:
+        lines.append(
+            f"… y {group_count - _AGRUPAR_SUMMARY_MAX_GROUPS} grupo(s) más"
+        )
+    lines.append(
+        "Revisa los grupos en la pestaña «Agrupamiento» para aceptar o "
+        "rechazar cada fusión. No se fusionó nada todavía: los cambios se "
+        "aplican solo cuando lo confirmes."
+    )
+    return "\n".join(lines)
+
+
+def _agrupar_direct_stream(session_id: int, project_id: int, key: str):
+    """Stream SSE directo para ``/agrupar`` puro (sin rondas del orquestador).
+
+    Secuencia (D2): tool_start -> review_grouping -> tool_end (output
+    truncado) -> token(s) con el resumen (frames acotados por el acumulador)
+    -> grouping.ready -> completed. En excepción: tool_end con el error (para
+    no dejar el chip de tool vivo en el chat) + failed, sin espejo. El
+    mensaje assistant se espeja en ChatMessage best-effort (precedente del
+    gate); el thread del agente no se toca (D3).
+    """
+    async def _stream() -> AsyncGenerator[str, None]:
+        accumulator = _RelayAccumulator(
+            max_delta=settings.relay_max_delta_chars,
+            max_total=settings.relay_max_assistant_chars,
+        )
+        tool_end_sent = False
+        try:
+            yield _sse("tool_start", {"name": "review_grouping", "input": {}})
+            async with AsyncSessionLocal() as session:
+                result = await run_grouping_review(session, project_id)
+            tool_end_sent = True
+            yield _sse(
+                "tool_end",
+                {
+                    "name": "review_grouping",
+                    "output": _truncate(
+                        json.dumps(result, default=str, ensure_ascii=False)
+                    ),
+                },
+            )
+            summary = _summarize_grouping(result)
+            for frame in accumulator.add(summary):
+                yield frame
+            if "error" not in result:
+                yield _sse(
+                    "grouping.ready",
+                    {
+                        "plan_id": result.get("plan_id"),
+                        "group_count": int(result.get("group_count") or 0),
+                    },
+                )
+            assistant_text = accumulator.result()
+            try:
+                async with AsyncSessionLocal() as db:
+                    db.add(
+                        ChatMessage(
+                            session_id=session_id,
+                            role="assistant",
+                            content=assistant_text,
+                        )
+                    )
+                    await db.commit()
+            except Exception:  # noqa: BLE001 - la persistencia no rompe el stream
+                logger.exception(
+                    "no se pudo persistir mensaje del asistente session_id=%s",
+                    session_id,
+                )
+            yield _sse("completed", {"message": assistant_text})
+        except Exception as exc:  # noqa: BLE001 - saneamos y emitimos 'failed'
+            logger.exception(
+                "agrupar direct stream failed session_id=%s", session_id
+            )
+            if not tool_end_sent:
+                yield _sse(
+                    "tool_end",
+                    {"name": "review_grouping", "output": _truncate(_sanitize_error(exc))},
+                )
+            yield _sse("failed", {"error": _sanitize_error(exc)})
+        finally:
+            _active_streams.discard(key)
+
+    return _stream()
 
 
 @router.post("/sessions/{session_id}/messages")
@@ -542,6 +715,19 @@ async def send_message(
                 _active_streams.discard(key)
         return StreamingResponse(
             _gate_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    # /agrupar puro responde por la ruta directa (D1): el comando es
+    # determinista (review + persistir + resumen), no justifica las ~2 rondas
+    # de modelo del orquestador (~42 min en sesiones maduras). Salta
+    # ensure_container: solo toca DB + embeddings locales. El mensaje de
+    # usuario ya quedó persistido arriba y la guarda _active_streams ya está
+    # tomada; el generador la libera en finally.
+    if _is_pure_agrupar(body.content):
+        return StreamingResponse(
+            _agrupar_direct_stream(session_id, project.id, key),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
