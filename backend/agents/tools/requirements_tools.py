@@ -65,7 +65,50 @@ async def _code_to_id(
     return item_id
 
 
-def _item_summary(item: RequirementItem) -> dict[str, Any]:
+def _source_documents(item: RequirementItem) -> list[str]:
+    """Document ids que citan este item, deduplicados (source puede ser dict
+    o lista de dicts tras un merge). Se omiten quotes/secciones a propósito:
+    el listado tiene que seguir siendo compacto."""
+    docs = {
+        (src.get("document_id") or "").strip()
+        for src in store._source_list(item)
+    }
+    docs.discard("")
+    return sorted(docs)
+
+
+def _item_in_document(item: RequirementItem, document: str) -> bool:
+    """Match por substring (case-insensitive) sobre los documentos fuente del
+    item — misma semántica que el filtro documents de un /agrupar scopeado."""
+    needle = document.strip().lower()
+    if not needle:
+        return True
+    return any(
+        needle in (src.get("document_id") or "").lower()
+        for src in store._source_list(item)
+    )
+
+
+async def _parent_code_map(
+    session: AsyncSession, project_id: int, items: list[RequirementItem]
+) -> dict[int, str]:
+    """id -> code de los padres referenciados por ``items``, en UNA query,
+    para que el listado muestre parent_code sin lookups por item."""
+    parent_ids = {it.parent_id for it in items if it.parent_id is not None}
+    if not parent_ids:
+        return {}
+    rows = await session.execute(
+        select(RequirementItem.id, RequirementItem.code).where(
+            RequirementItem.project_id == project_id,
+            RequirementItem.id.in_(parent_ids),
+        )
+    )
+    return {row_id: code for row_id, code in rows.all()}
+
+
+def _item_summary(
+    item: RequirementItem, parent_codes: dict[int, str] | None = None
+) -> dict[str, Any]:
     return {
         "id": item.id,
         "code": item.code,
@@ -74,21 +117,27 @@ def _item_summary(item: RequirementItem) -> dict[str, Any]:
         "priority": item.priority.value,
         "status": item.status.value,
         "span_verified": item.span_verified,
+        # Trazabilidad compacta: sin estos campos el agente terminaba en un
+        # get_requirement por item (N+1) para preguntas de fuente/jerarquía.
+        "source_documents": _source_documents(item),
+        "parent_code": (parent_codes or {}).get(item.parent_id),
+        "derived": bool(item.derived),
+        "confidence": item.confidence,
     }
 
 
 def make_requirements_read_tools(project_id: int) -> list:
-    """Build the read-only tool subset (list / get / build_srs).
+    """Build the read-only tool subset (list / get / build_srs / capture_status).
 
     Registered with the orchestrator so it can answer store queries directly,
     without delegating to the capture subagent. ``project_id`` is closed over
     (same isolation contract as the editing tools); no mutation tool is exposed,
     so the orchestrator cannot change the store.
 
-    The three tool bodies are duplicated from ``make_requirements_tools`` on
+    The read tool bodies are duplicated from ``make_requirements_tools`` on
     purpose: the editing factory interleaves reads with mutations in its return
     list, and restructuring it risks the mutation tools. If you change a read
-    tool here, change its twin there too.
+    tool here, change its twin there too (including capture_status).
     """
 
     @tool
@@ -96,12 +145,17 @@ def make_requirements_read_tools(project_id: int) -> list:
         status: StatusValue | None = None,
         type: ReqTypeValue | None = None,
         priority: PriorityValue | None = None,
+        document: str | None = None,
         include_deleted: bool = False,
     ) -> dict:
         """List requirements in the project, optionally filtered.
 
         Soft-deleted rows (rejected / merged / superseded) are hidden unless
-        include_deleted is true. Returns one compact summary per item.
+        include_deleted is true. `document` filters by source document
+        (substring, case-insensitive) with the same semantics as a scoped
+        grouping review. Each summary carries code, statement, type, priority,
+        status, source_documents, parent_code/derived and confidence — so
+        traceability questions do NOT require one get_requirement per item.
         """
         try:
             async with AsyncSessionLocal() as session:
@@ -113,24 +167,36 @@ def make_requirements_read_tools(project_id: int) -> list:
                     priority=Priority(priority) if priority else None,
                     include_deleted=include_deleted,
                 )
+                if document:
+                    items = [
+                        it for it in items if _item_in_document(it, document)
+                    ]
+                parents = await _parent_code_map(session, project_id, items)
                 return {
                     "count": len(items),
-                    "items": [_item_summary(it) for it in items],
+                    "items": [_item_summary(it, parents) for it in items],
                 }
         except Exception as exc:  # noqa: BLE001
             return {"error": f"list_requirements failed: {exc}"}
 
     @tool
-    async def get_requirement(code: str) -> dict:
-        """Full detail of one requirement: fields, relations, revision history.
+    async def get_requirement(
+        code: str, include_revisions: bool = False
+    ) -> dict:
+        """Full detail of one requirement: fields, relations, parent, source.
 
-        Use this to inspect a requirement before editing, or to review how it
-        changed over time (every mutation is versioned in the revisions list).
+        The revision history is the heaviest part of the payload: it is only
+        included when include_revisions is true. Use this for ONE item that
+        needs deep inspection — for overviews and traceability use
+        list_requirements (its summaries already carry source and hierarchy).
         """
         try:
             async with AsyncSessionLocal() as session:
                 req_id = await _code_to_id(session, project_id, code)
-                return await store.get_requirement(session, req_id)
+                detail = await store.get_requirement(session, req_id)
+                if not include_revisions:
+                    detail.pop("revisions", None)
+                return detail
         except Exception as exc:  # noqa: BLE001
             return {"error": f"get_requirement failed: {exc}"}
 
@@ -169,7 +235,72 @@ def make_requirements_read_tools(project_id: int) -> list:
         except Exception as exc:  # noqa: BLE001
             return {"error": f"build_srs failed: {exc}"}
 
-    return [list_requirements, get_requirement, build_srs]
+    @tool
+    async def capture_status() -> dict:
+        """Census of THIS project: requirement + grouping plan counts, last
+        code, and by_document — how many LIVE (non soft-deleted) requirements
+        cite each source document. A post-merge item can cite several
+        documents (each one counts); items without source fall under
+        "(sin fuente)". This is the compact scoping view: use it instead of
+        reading documents or counting listings by hand.
+
+        Call this BEFORE a capture. If requirements > 0, tell the
+        user how many exist and the last code, then ask whether to reset
+        everything or append. Never reset without explicit user confirmation.
+        """
+        try:
+            async with AsyncSessionLocal() as session:
+                from sqlalchemy import func, select
+                from backend.models.requirement import (
+                    GroupingPlan,
+                    RequirementItem,
+                )
+                req_count = await session.scalar(
+                    select(func.count())
+                    .select_from(RequirementItem)
+                    .where(RequirementItem.project_id == project_id)
+                )
+                plan_count = await session.scalar(
+                    select(func.count())
+                    .select_from(GroupingPlan)
+                    .where(GroupingPlan.project_id == project_id)
+                )
+                last_code = await session.scalar(
+                    select(RequirementItem.code)
+                    .where(RequirementItem.project_id == project_id)
+                    .order_by(RequirementItem.id.desc())
+                    .limit(1)
+                )
+                # GROUP BY documento, empaquetado: conteos por fuente sobre los
+                # items vivos, en una sola llamada diminuta (la alternativa del
+                # agente era volcar 541 statements y contarlos por contexto).
+                live_items = await store.list_requirements(session, project_id)
+                doc_counts: dict[str, int] = {}
+                for it in live_items:
+                    docs = _source_documents(it)
+                    if docs:
+                        for doc in docs:
+                            doc_counts[doc] = doc_counts.get(doc, 0) + 1
+                    else:
+                        doc_counts["(sin fuente)"] = (
+                            doc_counts.get("(sin fuente)", 0) + 1
+                        )
+                by_document = [
+                    {"document": doc, "count": n}
+                    for doc, n in sorted(
+                        doc_counts.items(), key=lambda kv: (-kv[1], kv[0])
+                    )
+                ]
+                return {
+                    "requirements": int(req_count or 0),
+                    "grouping_plans": int(plan_count or 0),
+                    "last_code": last_code,
+                    "by_document": by_document,
+                }
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"capture_status failed: {exc}"}
+
+    return [list_requirements, get_requirement, build_srs, capture_status]
 
 
 def make_requirements_tools(project_id: int) -> list:
@@ -387,12 +518,17 @@ def make_requirements_tools(project_id: int) -> list:
         status: StatusValue | None = None,
         type: ReqTypeValue | None = None,
         priority: PriorityValue | None = None,
+        document: str | None = None,
         include_deleted: bool = False,
     ) -> dict:
         """List requirements in the project, optionally filtered.
 
         Soft-deleted rows (rejected / merged / superseded) are hidden unless
-        include_deleted is true. Returns one compact summary per item.
+        include_deleted is true. `document` filters by source document
+        (substring, case-insensitive) with the same semantics as a scoped
+        grouping review. Each summary carries code, statement, type, priority,
+        status, source_documents, parent_code/derived and confidence — so
+        traceability questions do NOT require one get_requirement per item.
         """
         try:
             async with AsyncSessionLocal() as session:
@@ -404,24 +540,36 @@ def make_requirements_tools(project_id: int) -> list:
                     priority=Priority(priority) if priority else None,
                     include_deleted=include_deleted,
                 )
+                if document:
+                    items = [
+                        it for it in items if _item_in_document(it, document)
+                    ]
+                parents = await _parent_code_map(session, project_id, items)
                 return {
                     "count": len(items),
-                    "items": [_item_summary(it) for it in items],
+                    "items": [_item_summary(it, parents) for it in items],
                 }
         except Exception as exc:  # noqa: BLE001
             return {"error": f"list_requirements failed: {exc}"}
 
     @tool
-    async def get_requirement(code: str) -> dict:
-        """Full detail of one requirement: fields, relations, revision history.
+    async def get_requirement(
+        code: str, include_revisions: bool = False
+    ) -> dict:
+        """Full detail of one requirement: fields, relations, parent, source.
 
-        Use this to inspect a requirement before editing, or to review how it
-        changed over time (every mutation is versioned in the revisions list).
+        The revision history is the heaviest part of the payload: it is only
+        included when include_revisions is true. Use this for ONE item that
+        needs deep inspection — for overviews and traceability use
+        list_requirements (its summaries already carry source and hierarchy).
         """
         try:
             async with AsyncSessionLocal() as session:
                 req_id = await _code_to_id(session, project_id, code)
-                return await store.get_requirement(session, req_id)
+                detail = await store.get_requirement(session, req_id)
+                if not include_revisions:
+                    detail.pop("revisions", None)
+                return detail
         except Exception as exc:  # noqa: BLE001
             return {"error": f"get_requirement failed: {exc}"}
 
@@ -542,7 +690,12 @@ def make_requirements_tools(project_id: int) -> list:
 
     @tool
     async def capture_status() -> dict:
-        """Count existing requirements + grouping plans for THIS project.
+        """Census of THIS project: requirement + grouping plan counts, last
+        code, and by_document — how many LIVE (non soft-deleted) requirements
+        cite each source document. A post-merge item can cite several
+        documents (each one counts); items without source fall under
+        "(sin fuente)". This is the compact scoping view: use it instead of
+        reading documents or counting listings by hand.
 
         Call this BEFORE a capture. If requirements > 0, tell the
         user how many exist and the last code, then ask whether to reset
@@ -571,10 +724,31 @@ def make_requirements_tools(project_id: int) -> list:
                     .order_by(RequirementItem.id.desc())
                     .limit(1)
                 )
+                # GROUP BY documento, empaquetado: conteos por fuente sobre los
+                # items vivos, en una sola llamada diminuta (la alternativa del
+                # agente era volcar 541 statements y contarlos por contexto).
+                live_items = await store.list_requirements(session, project_id)
+                doc_counts: dict[str, int] = {}
+                for it in live_items:
+                    docs = _source_documents(it)
+                    if docs:
+                        for doc in docs:
+                            doc_counts[doc] = doc_counts.get(doc, 0) + 1
+                    else:
+                        doc_counts["(sin fuente)"] = (
+                            doc_counts.get("(sin fuente)", 0) + 1
+                        )
+                by_document = [
+                    {"document": doc, "count": n}
+                    for doc, n in sorted(
+                        doc_counts.items(), key=lambda kv: (-kv[1], kv[0])
+                    )
+                ]
                 return {
                     "requirements": int(req_count or 0),
                     "grouping_plans": int(plan_count or 0),
                     "last_code": last_code,
+                    "by_document": by_document,
                 }
         except Exception as exc:  # noqa: BLE001
             return {"error": f"capture_status failed: {exc}"}
