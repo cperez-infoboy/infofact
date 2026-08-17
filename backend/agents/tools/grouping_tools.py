@@ -79,6 +79,32 @@ def _emit_grouping_ready(result: dict) -> None:
         return
 
 
+def _graph_on_progress():
+    """Callback de progreso que emite ``grouping.progress`` por el canal custom.
+
+    Espejo del patrón de ``_emit_grouping_ready``: ``get_stream_writer`` solo
+    resuelve dentro de un contexto de ejecución del grafo. En la ruta agéntica
+    (tool ``review_grouping`` llamada por el orquestador) el writer existe y el
+    router relayea el evento al SSE, así el banner de progreso también anima
+    por esa vía; fuera del grafo (tests, smokes, invocación directa) devuelve
+    None y el review corre silencioso como siempre.
+    """
+    try:
+        from langgraph.config import get_stream_writer
+
+        writer = get_stream_writer()
+    except Exception:  # noqa: BLE001 — no graph context (tests / smokes)
+        return None
+
+    async def _emit(evt: dict) -> None:
+        try:
+            writer({"event": "grouping.progress", "data": evt})
+        except Exception:  # noqa: BLE001 — never break the review for an event
+            pass
+
+    return _emit
+
+
 async def run_grouping_review(
     session,
     project_id: int,
@@ -198,7 +224,11 @@ def make_grouping_tools(project_id: int) -> list:
         try:
             async with AsyncSessionLocal() as session:
                 return await run_grouping_review(
-                    session, project_id, types=types, documents=documents
+                    session,
+                    project_id,
+                    types=types,
+                    documents=documents,
+                    on_progress=_graph_on_progress(),
                 )
         except Exception as exc:  # noqa: BLE001 -- surface to the model
             return {"error": f"review_grouping failed: {exc}"}

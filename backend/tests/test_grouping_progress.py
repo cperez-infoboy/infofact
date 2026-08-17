@@ -273,3 +273,74 @@ async def test_agrupar_direct_stream_pumps_grouping_progress(monkeypatch):
     first = _frame_data(frames[1])
     assert first["stage"] == "load"
     assert first["phase"] == "start"
+
+
+# --- ruta agentica: progreso por el canal custom del grafo --------------------
+
+
+def test_graph_on_progress_returns_none_outside_graph():
+    """Sin contexto de grafo (tests/smokes) el review corre silencioso."""
+    from backend.agents.tools import grouping_tools
+
+    assert grouping_tools._graph_on_progress() is None
+
+
+@pytest.mark.asyncio
+async def test_graph_on_progress_emits_grouping_progress(monkeypatch):
+    """Dentro del grafo, el callback emite grouping.progress por el writer
+    (mismo canal custom que grouping.ready; el router lo relayea al SSE)."""
+    import langgraph.config as lg_config
+    from backend.agents.tools import grouping_tools
+
+    emitted: list[dict] = []
+
+    def fake_writer(payload):
+        emitted.append(payload)
+
+    monkeypatch.setattr(lg_config, "get_stream_writer", lambda: fake_writer)
+
+    cb = grouping_tools._graph_on_progress()
+    assert cb is not None
+    await cb({"stage": "judge", "message": "lote 1/2", "current": 1, "total": 2})
+
+    assert emitted == [{
+        "event": "grouping.progress",
+        "data": {"stage": "judge", "message": "lote 1/2", "current": 1, "total": 2},
+    }]
+
+
+@pytest.mark.asyncio
+async def test_review_grouping_tool_forwards_on_progress(monkeypatch):
+    """La tool pasa el callback del grafo a run_grouping_review: el banner
+    anima también cuando el agrupamiento corre por la vía agéntica."""
+    from backend.agents.tools import grouping_tools
+
+    async def recorder_evt(evt):
+        pass  # identidad del callback capturado por la fake
+
+    monkeypatch.setattr(
+        grouping_tools, "_graph_on_progress", lambda: recorder_evt
+    )
+    captured: dict = {}
+
+    async def fake_review(session, project_id, **kwargs):
+        captured.update(kwargs)
+        return {"plan_id": 1, "group_count": 0}
+
+    monkeypatch.setattr(grouping_tools, "run_grouping_review", fake_review)
+
+    class _Ctx:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, *exc):
+            return None
+
+    monkeypatch.setattr(grouping_tools, "AsyncSessionLocal", lambda: _Ctx())
+
+    tools = grouping_tools.make_grouping_tools(4)
+    review_tool = next(t for t in tools if t.name == "review_grouping")
+    result = await review_tool.ainvoke({})
+
+    assert result["plan_id"] == 1
+    assert captured.get("on_progress") is recorder_evt
