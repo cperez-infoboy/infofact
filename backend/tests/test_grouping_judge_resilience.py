@@ -29,12 +29,14 @@ import httpx
 import pytest
 from openai import APIConnectionError
 
+from backend.agents.llm import disable_thinking_body
 from backend.agents.pipelines import _resilience, consolidation
 from backend.agents.pipelines.consolidation import (
     DuplicateReport,
     DuplicateVerdict,
 )
 from backend.agents.pipelines.extraction import RawRequirement
+from backend.config import settings
 
 
 class _JudgeStub:
@@ -45,9 +47,11 @@ class _JudgeStub:
     def __init__(self, failures: int = 0):
         self._failures = failures
         self.calls: list[str] = []
+        self.kwargs: list[dict] = []
 
     async def ainvoke(self, messages, config=None, **kwargs):
         self.calls.append(messages[-1][1])
+        self.kwargs.append(dict(kwargs))
         if len(self.calls) <= self._failures:
             raise APIConnectionError(
                 request=httpx.Request("POST", "http://test.local")
@@ -61,10 +65,7 @@ def _report_from_prompt(user: str) -> DuplicateReport:
     pairs = [(ids[k], ids[k + 1]) for k in range(0, len(ids), 2)]
     return DuplicateReport(
         verdicts=[
-            DuplicateVerdict(
-                a_id=a, b_id=b, is_duplicate=True,
-                reason="stub", confidence=0.99,
-            )
+            DuplicateVerdict(a_id=a, b_id=b, is_duplicate=True)
             for a, b in pairs
         ]
     )
@@ -102,7 +103,9 @@ async def test_pairs_are_batched_and_verdicts_aggregated(monkeypatch):
     """45 pares con batch 40 => dos llamadas (40 + 5) y los 45 pares
     confirmados: ningún par se pierde en la frontera del batch."""
     stub = _JudgeStub()
-    monkeypatch.setattr(consolidation, "structured_llm", lambda schema: stub)
+    monkeypatch.setattr(
+        consolidation, "structured_llm", lambda schema, extra_body=None: stub
+    )
 
     items = _items(90)
     candidates = [(i, i + 45) for i in range(45)]
@@ -118,7 +121,9 @@ async def test_pairs_are_batched_and_verdicts_aggregated(monkeypatch):
 @pytest.mark.asyncio
 async def test_small_candidate_sets_stay_single_call(monkeypatch):
     stub = _JudgeStub()
-    monkeypatch.setattr(consolidation, "structured_llm", lambda schema: stub)
+    monkeypatch.setattr(
+        consolidation, "structured_llm", lambda schema, extra_body=None: stub
+    )
 
     confirmed = await consolidation._judge_duplicates(
         _items(4), [(0, 1), (2, 3)]
@@ -135,7 +140,9 @@ async def test_transient_connection_error_is_retried(monkeypatch, no_backoff):
     """El incidente real: la llamada al juez muere con APIConnectionError.
     Con el retry compartido el batch sobrevive fallos transitorios."""
     stub = _JudgeStub(failures=2)
-    monkeypatch.setattr(consolidation, "structured_llm", lambda schema: stub)
+    monkeypatch.setattr(
+        consolidation, "structured_llm", lambda schema, extra_body=None: stub
+    )
 
     confirmed = await consolidation._judge_duplicates(
         _items(4), [(0, 1), (2, 3)]
@@ -149,7 +156,9 @@ async def test_transient_connection_error_is_retried(monkeypatch, no_backoff):
 async def test_transient_exhaustion_propagates(monkeypatch, no_backoff):
     """Agotados los reintentos, la excepción propaga: decide el caller."""
     stub = _JudgeStub(failures=_resilience._TRANSIENT_RETRIES)
-    monkeypatch.setattr(consolidation, "structured_llm", lambda schema: stub)
+    monkeypatch.setattr(
+        consolidation, "structured_llm", lambda schema, extra_body=None: stub
+    )
 
     with pytest.raises(APIConnectionError):
         await consolidation._judge_duplicates(_items(2), [(0, 1)])
@@ -183,3 +192,102 @@ async def test_run_grouping_review_logs_the_traceback(monkeypatch, caplog):
     ]
     assert records, "debe quedar registro del fallo en logs"
     assert records[0].exc_info is not None  # con traceback
+
+
+# --- salida minima: thinking off + techo de tokens -----------------------------
+
+
+@pytest.mark.asyncio
+async def test_invoke_with_retry_forwards_extra_kwargs():
+    """``extra`` llega verbatim a cada ``llm.ainvoke`` (max_tokens /
+    extra_body), y sin ``extra`` la llamada queda exactamente igual que
+    siempre (paridad con las pasadas directas de critique/classification)."""
+    seen: list[dict] = []
+
+    class _Recorder:
+        async def ainvoke(self, messages, **kwargs):
+            seen.append(dict(kwargs))
+            return "ok"
+
+    out = await _resilience._invoke_with_retry(
+        _Recorder(),
+        [("human", "hi")],
+        context_label="test",
+        extra={"max_tokens": 900, "extra_body": {"thinking": {"type": "disabled"}}},
+    )
+    assert out == "ok"
+    assert seen == [
+        {"max_tokens": 900, "extra_body": {"thinking": {"type": "disabled"}}}
+    ]
+
+    seen.clear()
+    await _resilience._invoke_with_retry(
+        _Recorder(), [("human", "x")], context_label="test"
+    )
+    assert seen == [{}]
+
+
+@pytest.mark.parametrize(
+    "env,base_url,expected",
+    [
+        (
+            None,
+            "https://api.z.ai/api/coding/paas/v4",
+            {"thinking": {"type": "disabled"}},
+        ),
+        (None, "https://api.openai.com/v1", None),
+        ("0", "https://api.z.ai/api/coding/paas/v4", None),
+        ("1", "https://api.deepseek.com/v1", {"thinking": {"type": "disabled"}}),
+    ],
+)
+def test_disable_thinking_body_is_scoped_to_zai(
+    monkeypatch, env, base_url, expected
+):
+    """``thinking`` es una extensión propietaria de Z.ai: en modo auto solo
+    viaja a hosts z.ai (un body desconocido puede dar 400 en otros
+    proveedores); el env lo fuerza en cualquier dirección."""
+    monkeypatch.delenv("INFOFACT_JUDGE_DISABLE_THINKING", raising=False)
+    if env is not None:
+        monkeypatch.setenv("INFOFACT_JUDGE_DISABLE_THINKING", env)
+    monkeypatch.setattr(settings, "llm_base_url", base_url)
+    assert disable_thinking_body() == expected
+
+
+@pytest.mark.asyncio
+async def test_judge_sends_max_tokens_only_when_thinking_is_off(monkeypatch):
+    """Con thinking desactivado, cada lote viaja con un techo ``max_tokens``
+    (pares * 50 + 500); con thinking activo no viaja ningún techo, porque
+    truncaría el JSON y quemaría los reintentos de parseo."""
+    stub = _JudgeStub()
+    seen: dict = {}
+
+    def fake_structured(schema, extra_body=None):
+        seen["extra_body"] = extra_body
+        return stub
+
+    monkeypatch.setattr(consolidation, "structured_llm", fake_structured)
+    monkeypatch.setattr(
+        consolidation,
+        "disable_thinking_body",
+        lambda: {"thinking": {"type": "disabled"}},
+    )
+
+    await consolidation._judge_duplicates(_items(4), [(0, 1), (2, 3)])
+
+    assert seen["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert stub.kwargs == [{"max_tokens": 2 * 50 + 500}]
+
+    stub2 = _JudgeStub()
+    seen.clear()
+
+    def fake_structured_none(schema, extra_body=None):
+        seen["extra_body"] = extra_body
+        return stub2
+
+    monkeypatch.setattr(consolidation, "structured_llm", fake_structured_none)
+    monkeypatch.setattr(consolidation, "disable_thinking_body", lambda: None)
+
+    await consolidation._judge_duplicates(_items(4), [(0, 1), (2, 3)])
+
+    assert seen["extra_body"] is None
+    assert stub2.kwargs == [{}]

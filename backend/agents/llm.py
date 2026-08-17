@@ -11,6 +11,7 @@ agent logic (CLAUDE.md architecture).
 """
 from __future__ import annotations
 
+import os
 import re
 
 from langchain_openai import ChatOpenAI
@@ -19,7 +20,12 @@ from langgraph.constants import TAG_NOSTREAM
 from backend.config import settings
 
 
-def build_llm(*, temperature: float = 0.3, streaming: bool = False) -> ChatOpenAI:
+def build_llm(
+    *,
+    temperature: float = 0.3,
+    streaming: bool = False,
+    extra_body: dict | None = None,
+) -> ChatOpenAI:
     """Build the OpenAI-compatible chat client from settings.
 
     Raises RuntimeError at call time if the API key is unset, so the backend can
@@ -43,7 +49,34 @@ def build_llm(*, temperature: float = 0.3, streaming: bool = False) -> ChatOpenA
         # SDK handles 429/5xx backoff natively; critique.py handles parse
         # failures and the last-mile persistent-429 case.
         max_retries=2,
+        # Extensiones de body propietarias del proveedor (p.ej. thinking de
+        # Z.ai). None mantiene el request idéntico para deployments
+        # portables en otros proveedores OpenAI-compatible.
+        extra_body=extra_body,
     )
+
+
+def disable_thinking_body() -> dict | None:
+    """Body que apaga el razonamiento interno (thinking) de GLM en Z.ai.
+
+    ``thinking`` es una extensión propietaria de Z.ai: otros proveedores
+    OpenAI-compatible pueden rechazar con 400 un campo desconocido, así que
+    el parámetro solo viaja cuando el endpoint apunta a Z.ai (o se fuerza
+    explícito desde el entorno).
+
+    ``INFOFACT_JUDGE_DISABLE_THINKING``: ``1`` fuerza enviarlo, ``0`` fuerza
+    no enviarlo; el default ``auto`` lo envía solo si el host de
+    ``settings.llm_base_url`` contiene ``z.ai``.
+    """
+    choice = os.environ.get("INFOFACT_JUDGE_DISABLE_THINKING", "auto")
+    choice = choice.strip().lower()
+    if choice in {"0", "false", "no", "off"}:
+        return None
+    if choice in {"1", "true", "yes", "on"}:
+        return {"thinking": {"type": "disabled"}}
+    if "z.ai" in (settings.llm_base_url or "").lower():
+        return {"thinking": {"type": "disabled"}}
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -172,10 +205,15 @@ class StructuredRunnable:
         return self._parse(resp.content)
 
 
-def structured_llm(schema, *, temperature: float = 0.0) -> StructuredRunnable:
+def structured_llm(
+    schema, *, temperature: float = 0.0, extra_body: dict | None = None
+) -> StructuredRunnable:
     """Return a fence-tolerant LLM->schema runnable.
 
     Drop-in for build_llm(temperature=t).with_structured_output(schema) on
     providers that wrap JSON in code fences or lack native tool calling.
+    ``extra_body`` (opcional) reenvía extensiones propietarias del request.
     """
-    return StructuredRunnable(build_llm(temperature=temperature), schema)
+    return StructuredRunnable(
+        build_llm(temperature=temperature, extra_body=extra_body), schema
+    )

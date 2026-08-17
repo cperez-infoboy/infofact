@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 
 from pydantic import BaseModel, Field
 
-from backend.agents.llm import build_llm, structured_llm
+from backend.agents.llm import build_llm, disable_thinking_body, structured_llm
 from backend.agents.pipelines._resilience import _chunk, _invoke_with_retry
 from backend.agents.pipelines.extraction import RawRequirement
 
@@ -384,12 +384,15 @@ async def _judge_contradictions(
 # Duplicate judgment (LLM, for borderline pairs the embedding can't resolve)
 # ---------------------------------------------------------------------------
 
+# Salida mínima a propósito: la latencia del juez escala con sus tokens de
+# SALIDA, y reason/confidence se descartaban en el consumidor (solo se usa
+# is_duplicate + ids). No volver a agregar campos sin un consumidor real.
 class DuplicateVerdict(BaseModel):
     a_id: str
     b_id: str
-    is_duplicate: bool
-    reason: str
-    confidence: float = Field(ge=0.0, le=1.0)
+    is_duplicate: bool = Field(
+        description="true if both demand the SAME capability (duplicates)"
+    )
 
 
 class DuplicateReport(BaseModel):
@@ -460,10 +463,18 @@ async def _judge_duplicates(
 
     ``on_progress`` (optional, async) receives one event per batch
     (``{stage: "judge", current, total}``) for the /agrupar progress banner;
-    None keeps the historical silent behavior (capture path)."""
+    None keeps the historical silent behavior (capture path).
+
+    Output is kept minimal (ids + boolean): judge latency scales with OUTPUT
+    tokens, and reason/confidence were never consumed downstream. When the
+    provider is Z.ai, chain-of-thought is disabled via ``extra_body``
+    (``disable_thinking_body``; env ``INFOFACT_JUDGE_DISABLE_THINKING``),
+    plus a generous ``max_tokens`` ceiling against runaway generation.
+    """
     if not candidates:
         return []
-    llm = structured_llm(DuplicateReport)
+    extra_body = disable_thinking_body()
+    llm = structured_llm(DuplicateReport, extra_body=extra_body)
     id_to_idx = {items[i].id: i for i in range(len(items))}
     total_batches = -(-len(candidates) // DEFAULT_DUPLICATE_JUDGE_BATCH)
     confirmed: list[tuple[int, int]] = []
@@ -485,10 +496,17 @@ async def _judge_duplicates(
                 f"    B ({items[j].id}): {items[j].statement}"
             )
         user = "Judge each pair below:\n\n" + "\n\n".join(lines)
+        extra: dict = {}
+        if extra_body is not None:
+            # Techo de seguridad SOLO con thinking desactivado: con
+            # razonamiento activo un max_tokens corto truncaría el JSON
+            # y quemaría los reintentos de parseo.
+            extra["max_tokens"] = len(batch) * 50 + 500
         report = await _invoke_with_retry(
             llm,
             [("system", _DUPLICATE_SYSTEM), ("human", user)],
             context_label=f"consolidation.judge_duplicates[{n_batch}]",
+            extra=extra or None,
         )
         for v in report.verdicts:
             if v.is_duplicate and v.a_id in id_to_idx and v.b_id in id_to_idx:

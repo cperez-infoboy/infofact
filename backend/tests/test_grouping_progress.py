@@ -56,10 +56,7 @@ class _JudgeStub:
         pairs = [(ids[k], ids[k + 1]) for k in range(0, len(ids), 2)]
         return consolidation.DuplicateReport(
             verdicts=[
-                consolidation.DuplicateVerdict(
-                    a_id=a, b_id=b, is_duplicate=True,
-                    reason="stub", confidence=0.99,
-                )
+                consolidation.DuplicateVerdict(a_id=a, b_id=b, is_duplicate=True)
                 for a, b in pairs
             ]
         )
@@ -95,7 +92,9 @@ async def test_judge_duplicates_emits_progress_per_batch(monkeypatch):
     """45 pares con batch 40 => dos eventos judge (1/2, 2/2) antes de cada
     llamada, con current/total para la barra del banner."""
     stub = _JudgeStub()
-    monkeypatch.setattr(consolidation, "structured_llm", lambda schema: stub)
+    monkeypatch.setattr(
+        consolidation, "structured_llm", lambda schema, extra_body=None: stub
+    )
     events: list[dict] = []
 
     async def on_progress(evt):

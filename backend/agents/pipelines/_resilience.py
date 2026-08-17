@@ -117,6 +117,7 @@ async def _invoke_with_retry(
     context_label: str = "pipeline",
     max_parse: int = 3,
     max_transient: int | None = None,
+    extra: dict | None = None,
 ):
     """Centralized transient backoff + parse retry. Raises on exhaustion.
 
@@ -125,6 +126,9 @@ async def _invoke_with_retry(
     - Parse errors (truncated/malformed JSON): retried up to ``max_parse``
       times; after that the exception propagates so the caller can apply
       a stage-specific fallback (sentinel, empty list, etc.).
+    - ``extra`` (optional): extra kwargs forwarded verbatim to every
+      ``llm.ainvoke`` call (e.g. ``max_tokens``), same precedent as the
+      direct ``ainvoke(..., max_tokens=...)`` calls in critique/classification.
 
     Imported by every multi-pass pipeline (mer, nfr, adr, process,
     subproject) so retry behaviour stays in sync across stages.
@@ -136,7 +140,7 @@ async def _invoke_with_retry(
 
     while True:
         try:
-            return await llm.ainvoke(msgs)
+            return await llm.ainvoke(msgs, **(extra or {}))
         except Exception as exc:  # noqa: BLE001 — split below
             if is_transient(exc):
                 transient_fails += 1
