@@ -104,6 +104,10 @@ async def run_grouping_review(
         plan_id = await gstore.persist_plan(session, plan, project_id)
         data = await gstore.get_plan(session, plan_id)
     except Exception as exc:  # noqa: BLE001 -- surface to the model
+        # Evidencia en docker logs: el dict de error llega al chat, pero sin
+        # este registro el traceback se pierde (incidente /agrupar con
+        # "Connection error." y logs mudos).
+        logger.exception("review_grouping failed project_id=%s", project_id)
         return {"error": f"review_grouping failed: {exc}"}
     result = {
         "plan_id": plan_id,

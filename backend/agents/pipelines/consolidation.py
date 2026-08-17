@@ -33,6 +33,7 @@ API. Torch is already a dependency. Lazy-imported + singleton.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -40,6 +41,7 @@ from dataclasses import dataclass, field
 from pydantic import BaseModel, Field
 
 from backend.agents.llm import build_llm, structured_llm
+from backend.agents.pipelines._resilience import _chunk, _invoke_with_retry
 from backend.agents.pipelines.extraction import RawRequirement
 
 logger = logging.getLogger(__name__)
@@ -429,29 +431,54 @@ def _duplicate_candidates(items, sim, lo: float, hi: float, cap: int):
     return [(int(i), int(j)) for i, j in zip(ii.tolist(), jj.tolist())]
 
 
+# Pares borderline por llamada al juez. Un único prompt con TODOS los pares
+# produjo uploads gigantes que el proveedor cortó a nivel de conexión
+# ("Connection error." tras agotar los max_retries de la SDK; incidente real
+# de /agrupar). Los batches chicos acotan cada request y aíslan la falla para
+# que el retry compartido de _resilience actúe por llamada.
+# Env-tunable (INFOFACT_DUPLICATE_JUDGE_BATCH) para calibrar sin rebuild.
+DEFAULT_DUPLICATE_JUDGE_BATCH = int(
+    os.environ.get("INFOFACT_DUPLICATE_JUDGE_BATCH", "40")
+)
+
+
 async def _judge_duplicates(
     items: list[RawRequirement],
     candidates: list[tuple[int, int]],
 ) -> list[tuple[int, int]]:
     """Judge borderline duplicate candidates. Returns the index pairs confirmed
     as REAL duplicates (to be unioned). Distinct pairs are left alone so both
-    requirements survive."""
+    requirements survive.
+
+    The pairs are judged in batches of ``DEFAULT_DUPLICATE_JUDGE_BATCH`` and
+    each call goes through the shared ``_invoke_with_retry``: transient
+    failures (connection/429/5xx) back off and retry per batch instead of
+    aborting the whole review, and no single oversized upload reaches the
+    provider. Verdicts from every batch are aggregated; exhaustion after all
+    retries propagates so the caller decides (error dict / sentinel)."""
     if not candidates:
         return []
     llm = structured_llm(DuplicateReport)
-    lines = []
-    for n, (i, j) in enumerate(candidates, start=1):
-        lines.append(
-            f"[{n}] A ({items[i].id}): {items[i].statement}\n"
-            f"    B ({items[j].id}): {items[j].statement}"
-        )
-    user = "Judge each pair below:\n\n" + "\n\n".join(lines)
-    report = await llm.ainvoke([("system", _DUPLICATE_SYSTEM), ("human", user)])
     id_to_idx = {items[i].id: i for i in range(len(items))}
     confirmed: list[tuple[int, int]] = []
-    for v in report.verdicts:
-        if v.is_duplicate and v.a_id in id_to_idx and v.b_id in id_to_idx:
-            confirmed.append((id_to_idx[v.a_id], id_to_idx[v.b_id]))
+    for n_batch, batch in enumerate(
+        _chunk(candidates, DEFAULT_DUPLICATE_JUDGE_BATCH), start=1
+    ):
+        lines = []
+        for n, (i, j) in enumerate(batch, start=1):
+            lines.append(
+                f"[{n}] A ({items[i].id}): {items[i].statement}\n"
+                f"    B ({items[j].id}): {items[j].statement}"
+            )
+        user = "Judge each pair below:\n\n" + "\n\n".join(lines)
+        report = await _invoke_with_retry(
+            llm,
+            [("system", _DUPLICATE_SYSTEM), ("human", user)],
+            context_label=f"consolidation.judge_duplicates[{n_batch}]",
+        )
+        for v in report.verdicts:
+            if v.is_duplicate and v.a_id in id_to_idx and v.b_id in id_to_idx:
+                confirmed.append((id_to_idx[v.a_id], id_to_idx[v.b_id]))
     return confirmed
 
 
