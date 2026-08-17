@@ -15,6 +15,7 @@ Cierre limpio -> completed; excepción -> failed.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import AsyncGenerator
@@ -593,7 +594,8 @@ def _summarize_grouping(result: dict) -> str:
 def _agrupar_direct_stream(session_id: int, project_id: int, key: str):
     """Stream SSE directo para ``/agrupar`` puro (sin rondas del orquestador).
 
-    Secuencia (D2): tool_start -> review_grouping -> tool_end (output
+    Secuencia (D2): tool_start -> grouping.progress* (etapas/lotes via una
+    queue mientras corre run_grouping_review en un task) -> tool_end (output
     truncado) -> token(s) con el resumen (frames acotados por el acumulador)
     -> grouping.ready -> completed. En excepción: tool_end con el error (para
     no dejar el chip de tool vivo en el chat) + failed, sin espejo. El
@@ -608,8 +610,35 @@ def _agrupar_direct_stream(session_id: int, project_id: int, key: str):
         tool_end_sent = False
         try:
             yield _sse("tool_start", {"name": "review_grouping", "input": {}})
+            queue: asyncio.Queue[dict] = asyncio.Queue()
+
+            async def _on_progress(evt: dict) -> None:
+                await queue.put(_safe_json(evt))
+
             async with AsyncSessionLocal() as session:
-                result = await run_grouping_review(session, project_id)
+                task = asyncio.create_task(
+                    run_grouping_review(
+                        session, project_id, on_progress=_on_progress
+                    )
+                )
+                # Bomba de progreso: mientras corre el review en el task, cada
+                # evento que cae en la queue sale como frame SSE inmediato (el
+                # banner del frontend vive de esto; antes la ruta era muda).
+                while True:
+                    getter = asyncio.ensure_future(queue.get())
+                    done, _ = await asyncio.wait(
+                        {task, getter}, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    if getter in done:
+                        yield _sse("grouping.progress", getter.result())
+                    if task in done:
+                        if not getter.done():
+                            getter.cancel()
+                        break
+            # Drenar eventos que quedaron en la cola al terminar el task.
+            while not queue.empty():
+                yield _sse("grouping.progress", queue.get_nowait())
+            result = task.result()
             tool_end_sent = True
             yield _sse(
                 "tool_end",

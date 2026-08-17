@@ -91,7 +91,7 @@ def deterministic(monkeypatch):
         grouping, "embed_texts", lambda texts: np.eye(len(texts))
     )
 
-    async def _no_judge(_reqs, _candidates):
+    async def _no_judge(_reqs, _candidates, on_progress=None):
         return []
 
     monkeypatch.setattr(grouping, "_judge_duplicates", _no_judge)

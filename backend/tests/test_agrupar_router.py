@@ -184,7 +184,7 @@ def _happy_result() -> dict:
 
 @pytest.mark.asyncio
 async def test_agrupar_direct_stream_happy_sequence(monkeypatch):
-    async def fake_review(session, project_id):
+    async def fake_review(session, project_id, *, on_progress=None):
         assert project_id == 42
         return _happy_result()
 
@@ -222,7 +222,7 @@ async def test_agrupar_direct_stream_happy_sequence(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_agrupar_direct_stream_error_sequence(monkeypatch):
-    async def boom(_session, _project_id):
+    async def boom(_session, _project_id, *, on_progress=None):
         raise RuntimeError("DB exploded")
 
     monkeypatch.setattr(chat, "run_grouping_review", boom)
@@ -248,7 +248,7 @@ async def test_agrupar_direct_stream_error_result_no_ready_event(monkeypatch):
     error, completed (no failed) y SIN grouping.ready ni espejo basura... el
     espejo sí persiste (el resumen es la respuesta del turno)."""
 
-    async def error_result(_session, _project_id):
+    async def error_result(_session, _project_id, *, on_progress=None):
         return {"error": "review_grouping failed: algo"}
 
     monkeypatch.setattr(chat, "run_grouping_review", error_result)

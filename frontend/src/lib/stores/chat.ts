@@ -34,6 +34,11 @@ import {
   onAnalysisReady
 } from '$lib/stores/analysis';
 import { onGroupingReady } from '$lib/stores/requirements';
+import {
+  onGroupingProgress,
+  onGroupingDone,
+  endGrouping
+} from '$lib/stores/grouping';
 
 // --- Captura: qué tools abren/cierran el banner vivo --------------------
 // startCapture() resetea el estado del pipeline (wipes conflictos/reportes),
@@ -333,9 +338,15 @@ export async function sendMessage(sessionId: number, content: string): Promise<b
       onAnalysisAdrReady: (e) => onAnalysisAdrReady(e),
       onAnalysisSubProjectReady: (e) => onAnalysisSubProjectReady(e),
       onAnalysisReady: (r) => onAnalysisReady(r),
+      // grouping.progress (/agrupar directo): etapa/lote para el banner vivo.
+      onGroupingProgress: (p) => onGroupingProgress(p),
       // grouping.ready (/agrupar directo o tool): refresca planes + selecciona
-      // el nuevo plan en el panel de agrupamiento (sin abrir la pestaña).
-      onGroupingReady: (e) => onGroupingReady(e),
+      // el nuevo plan en el panel de agrupamiento (sin abrir la pestaña) y
+      // cierra el banner de progreso con el resultado.
+      onGroupingReady: (e) => {
+        onGroupingReady(e);
+        onGroupingDone(e);
+      },
       onCompleted: () => {
         if (currentAssistantId !== null) {
           closeAssistantMessage(currentAssistantId, true);
@@ -344,6 +355,7 @@ export async function sendMessage(sessionId: number, content: string): Promise<b
       },
       onFailed: (err) => {
         chatError.set(err);
+        endGrouping();
         if (currentAssistantId !== null) {
           closeAssistantMessage(currentAssistantId, true);
           currentAssistantId = null;

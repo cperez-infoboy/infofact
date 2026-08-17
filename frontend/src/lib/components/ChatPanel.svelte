@@ -25,6 +25,7 @@
   import ToolIcon from './ToolIcon.svelte';
   import CaptureStatus from './CaptureStatus.svelte';
   import SrsStatus from './SrsStatus.svelte';
+  import GroupingStatus from './GroupingStatus.svelte';
 
   let { } = $props();
 
@@ -252,6 +253,9 @@
 
   <!-- Estado vivo de la generación de SRS (eventos finos SSE) -->
   <SrsStatus />
+
+  <!-- Estado vivo del /agrupar (grouping.progress, ruta directa) -->
+  <GroupingStatus />
 
   <!-- Mensajes -->
   <div class="flex-1 min-h-0 m-2">

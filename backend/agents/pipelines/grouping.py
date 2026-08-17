@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -96,6 +97,9 @@ class GroupingPlan:
     # persisten: persist_plan solo lee .groups.
     considered: int = 0
     scope: str = ""
+    # Wall-clock (ms) per stage when the run carries ``on_progress`` (progress
+    # banner). Informational only: persist_plan reads ``.groups`` alone.
+    timings: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def empty(
@@ -104,12 +108,14 @@ class GroupingPlan:
         project: str = "",
         considered: int = 0,
         scope: str = "",
+        timings: dict[str, int] | None = None,
     ) -> "GroupingPlan":
         return cls(
             generated_at=_now_iso(),
             project=project,
             considered=considered,
             scope=scope,
+            timings=timings or {},
         )
 
 
@@ -250,6 +256,7 @@ async def build_grouping_plan(
     max_duplicate_candidates: int = DEFAULT_MAX_DUPLICATE_CANDIDATES,
     types: list[str] | None = None,
     documents: list[str] | None = None,
+    on_progress=None,
 ) -> GroupingPlan:
     """Detect duplicate groups among the live (non-soft-deleted) requirements.
 
@@ -278,6 +285,33 @@ async def build_grouping_plan(
     Idempotent by construction: it always reads the current store, so after a
     merge the merged rows are excluded and re-running proposes only what's left.
     """
+    timings: dict[str, int] = {}
+    stage_t0: dict[str, float] = {}
+
+    async def _emit_stage(stage: str, message: str) -> None:
+        """phase:'start' + t0 for the stage elapsed (the /agrupar banner)."""
+        if on_progress is None:
+            return
+        stage_t0[stage] = time.monotonic()
+        await on_progress({
+            "stage": stage, "message": message, "phase": "start",
+        })
+
+    async def _end_stage(stage: str) -> None:
+        """phase:'end' with elapsed_ms; accumulates the run's timing."""
+        if on_progress is None:
+            return
+        t0 = stage_t0.pop(stage, None)
+        if t0 is None:
+            return
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        timings[stage] = elapsed_ms
+        await on_progress({
+            "stage": stage, "message": "", "phase": "end",
+            "elapsed_ms": elapsed_ms,
+        })
+
+    await _emit_stage("load", "cargando requerimientos del store…")
     items = await list_requirements(session, project_id)
     type_filter = _normalize_types(types) if types else None
     doc_filter = (
@@ -291,9 +325,11 @@ async def build_grouping_plan(
         items = [it for it in items if _item_in_documents(it, doc_filter)]
     considered = len(items)
     scope = _scope_label(type_filter, doc_filter)
+    await _end_stage("load")
     if considered < 2:
         return GroupingPlan.empty(
-            project=project, considered=considered, scope=scope
+            project=project, considered=considered, scope=scope,
+            timings=timings,
         )
 
     shims = [_to_raw(it) for it in items]
@@ -302,6 +338,7 @@ async def build_grouping_plan(
 
     # (A) verbatim buckets; pick the keeper per bucket by EXPLICIT priority >
     # MoSCoW rank > confidence (was: confidence only).
+    await _emit_stage("dedup", f"{considered} requerimientos · dedup exacto")
     buckets = exact_dedup(shims)
     rep_of: dict[str, list[RawRequirement]] = {}
     reps: list[RawRequirement] = []
@@ -309,15 +346,21 @@ async def build_grouping_plan(
         rep = min(bucket, key=lambda r: _keeper_key(meta[r.id]))
         rep_of[rep.id] = bucket
         reps.append(rep)
+    await _end_stage("dedup")
 
     # (B) semantic clustering over the reps.
+    await _emit_stage("embedding", f"embeddings de {len(reps)} enunciados")
     vectors = embed_texts([r.statement for r in reps])
     sim = vectors @ vectors.T
+    await _end_stage("embedding")
     candidates = _duplicate_candidates(
         reps, sim, duplicate_threshold, strict_duplicate_threshold,
         max_duplicate_candidates,
     )
-    confirmed = await _judge_duplicates(reps, candidates)
+    await _emit_stage("judge", f"juzgando pares borderline ({len(candidates)})")
+    confirmed = await _judge_duplicates(reps, candidates, on_progress=on_progress)
+    await _end_stage("judge")
+    await _emit_stage("cluster", "clustering y armado de grupos")
     clusters = _cluster_duplicates(
         reps, sim, strict_duplicate_threshold, confirmed,
     )
@@ -363,6 +406,7 @@ async def build_grouping_plan(
                 confidence=1.0,
             ))
 
+    await _end_stage("cluster")
     return GroupingPlan(
         groups=groups,
         generated_at=_now_iso(),
@@ -370,6 +414,7 @@ async def build_grouping_plan(
         status="proposed",
         considered=considered,
         scope=scope,
+        timings=timings,
     )
 
 

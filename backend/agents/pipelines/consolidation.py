@@ -445,6 +445,7 @@ DEFAULT_DUPLICATE_JUDGE_BATCH = int(
 async def _judge_duplicates(
     items: list[RawRequirement],
     candidates: list[tuple[int, int]],
+    on_progress=None,
 ) -> list[tuple[int, int]]:
     """Judge borderline duplicate candidates. Returns the index pairs confirmed
     as REAL duplicates (to be unioned). Distinct pairs are left alone so both
@@ -455,15 +456,28 @@ async def _judge_duplicates(
     failures (connection/429/5xx) back off and retry per batch instead of
     aborting the whole review, and no single oversized upload reaches the
     provider. Verdicts from every batch are aggregated; exhaustion after all
-    retries propagates so the caller decides (error dict / sentinel)."""
+    retries propagates so the caller decides (error dict / sentinel).
+
+    ``on_progress`` (optional, async) receives one event per batch
+    (``{stage: "judge", current, total}``) for the /agrupar progress banner;
+    None keeps the historical silent behavior (capture path)."""
     if not candidates:
         return []
     llm = structured_llm(DuplicateReport)
     id_to_idx = {items[i].id: i for i in range(len(items))}
+    total_batches = -(-len(candidates) // DEFAULT_DUPLICATE_JUDGE_BATCH)
     confirmed: list[tuple[int, int]] = []
     for n_batch, batch in enumerate(
         _chunk(candidates, DEFAULT_DUPLICATE_JUDGE_BATCH), start=1
     ):
+        if on_progress is not None:
+            await on_progress({
+                "stage": "judge",
+                "message": f"lote {n_batch}/{total_batches}",
+                "phase": "progress",
+                "current": n_batch,
+                "total": total_batches,
+            })
         lines = []
         for n, (i, j) in enumerate(batch, start=1):
             lines.append(

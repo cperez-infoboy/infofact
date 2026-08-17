@@ -36,6 +36,7 @@ el frontend refresque el panel de agrupamiento sin recarga manual.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Optional
 
 from langchain_core.tools import tool
@@ -84,6 +85,7 @@ async def run_grouping_review(
     *,
     types: Optional[list[str]] = None,
     documents: Optional[list[str]] = None,
+    on_progress=None,
 ) -> dict:
     """Nucleo compartido: build -> persist -> reload de un plan de agrupamiento.
 
@@ -92,6 +94,10 @@ async def run_grouping_review(
     devuelve ``plan_id`` / ``group_count`` / ``considered`` / ``scope`` y los
     grupos resueltos a REQ-codes, y emite ``grouping.ready``; en fallo,
     ``{"error": ...}``.
+
+    ``on_progress`` (opcional, async) recibe los eventos del banner de
+    progreso (etapas de build + persist + done con timings y contadores); la
+    ruta directa del router los convierte a SSE ``grouping.progress``.
     """
     try:
         plan = await build_grouping_plan(
@@ -100,9 +106,31 @@ async def run_grouping_review(
             project=str(project_id),
             types=types,
             documents=documents,
+            on_progress=on_progress,
         )
+        t0 = time.monotonic()
+        if on_progress is not None:
+            await on_progress({
+                "stage": "persist",
+                "message": f"persistiendo plan ({len(plan.groups)} grupos)",
+                "phase": "start",
+            })
         plan_id = await gstore.persist_plan(session, plan, project_id)
         data = await gstore.get_plan(session, plan_id)
+        if on_progress is not None:
+            timings = {
+                **plan.timings,
+                "persist": int((time.monotonic() - t0) * 1000),
+            }
+            await on_progress({
+                "stage": "done",
+                "message": "",
+                "phase": "end",
+                "timings": timings,
+                "total_ms": sum(timings.values()),
+                "group_count": len(plan.groups),
+                "considered": plan.considered,
+            })
     except Exception as exc:  # noqa: BLE001 -- surface to the model
         # Evidencia en docker logs: el dict de error llega al chat, pero sin
         # este registro el traceback se pierde (incidente /agrupar con

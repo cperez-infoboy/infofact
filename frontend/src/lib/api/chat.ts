@@ -25,6 +25,7 @@
 //   event: analysis.subproject_ready\ndata: {sub_projects}
 //   event: analysis.ready\ndata: {version, status, requirement_count, entities, relationships, adrs, sub_projects}
 //   event: grouping.ready\ndata: {plan_id, group_count}
+//   event: grouping.progress\ndata: {"stage": "...", "message": "...", "phase": "start|end|progress", ...}
 
 export interface ToolInput {
   [key: string]: unknown;
@@ -197,7 +198,9 @@ export interface StreamHandlers {
   onAnalysisAdrReady?: (e: AnalysisAdrReadyEvent) => void;
   onAnalysisSubProjectReady?: (e: AnalysisSubProjectReadyEvent) => void;
   onAnalysisReady?: (r: AnalysisReadyEvent) => void;
-  // Fine event del agrupamiento (comando /agrupar, ruta directa o tool).
+  // Fine events del agrupamiento (comando /agrupar): progreso por etapa/lote
+  // (grouping.progress, ruta directa) y plan listo (grouping.ready).
+  onGroupingProgress?: (p: ProgressEvent) => void;
   onGroupingReady?: (g: GroupingReadyEvent) => void;
   onCompleted?: () => void;
   onFailed?: (error: string) => void;
@@ -440,6 +443,25 @@ export function dispatchEvent(ev: ParsedEvent, handlers: StreamHandlers): void {
       handlers.onGroupingReady?.({
         plan_id: Number(payload.plan_id ?? 0),
         group_count: Number(payload.group_count ?? 0),
+      });
+      break;
+    case 'grouping.progress':
+      handlers.onGroupingProgress?.({
+        stage: (payload.stage as string) ?? '',
+        message: (payload.message as string) ?? '',
+        phase: typeof payload.phase === 'string' ? payload.phase : undefined,
+        elapsed_ms:
+          typeof payload.elapsed_ms === 'number' ? payload.elapsed_ms : undefined,
+        timings:
+          payload.timings && typeof payload.timings === 'object'
+            ? (payload.timings as Record<string, number>)
+            : undefined,
+        total_ms:
+          typeof payload.total_ms === 'number' ? payload.total_ms : undefined,
+        current:
+          typeof payload.current === 'number' ? payload.current : undefined,
+        total:
+          typeof payload.total === 'number' ? payload.total : undefined,
       });
       break;
     case 'completed':
