@@ -24,6 +24,10 @@ STAGE_GOALS = "goals"
 STAGE_COVERAGE = "coverage"
 STAGE_NARRATIVE = "narrative"
 STAGE_COMMIT = "commit"
+# No es una etapa del pipeline: es el atajo que siembra el holder desde el
+# ultimo SRS persistido (actualizacion de solo-narrativa) y marca 1-3 como
+# hechas para saltar directo a draft_narrative.
+STAGE_SEED = "seed"
 
 DEFAULT_STAGE_CAP = 3
 

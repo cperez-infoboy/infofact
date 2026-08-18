@@ -28,6 +28,7 @@ from backend.agents.subagents.srs_run_holder import (
     STAGE_GOALS,
     STAGE_NARRATIVE,
     STAGE_QUALITY,
+    STAGE_SEED,
     clear_run,
     get_or_create_run,
     get_run,
@@ -67,6 +68,14 @@ los SINTETIZAS y les aplicas análisis de calidad.
 
 Trabajas por ETAPAS, razonando entre cada una:
 
+0. seed_from_last_srs (CONDICIONAL, va primero) — Si ya existe un SRS y el \
+usuario solo pide revisar o ajustar la NARRATIVA de ese documento (alcance, \
+proposito, terminologia, etc.) sin haber cambiado el store, usa esta tool \
+PRIMERO: reusa los hallazgos, goals y cobertura PERSISTIDOS de la ultima \
+version y sigue directo a draft_narrative + commit_srs (una version nueva \
+en minutos, sin re-juzgar cientos de enunciados). Si devuelve \
+no_previous_srs o stale_store, corre el pipeline completo desde \
+analyze_quality.
 1. analyze_quality  — Analiza la calidad de los requerimientos vivos: \
 pre-checks programáticos (INCOSE, requirement smells, EARS) + evaluación LLM \
 de ambigüedad semántica. Produces hallazgos (RequirementFinding) con severidad \
@@ -95,7 +104,9 @@ revisar los documentos que dieron origen a los requerimientos antes de \
 redactar el SRS.
 3. ORQUESTAR LAS ETAPAS — Ejecuta analyze_quality -> infer_goals -> \
 check_coverage -> draft_narrative -> commit_srs EN ESE ORDEN (cobertura \
-depende de los goals; narrativa usa el contexto acumulado).
+depende de los goals; narrativa usa el contexto acumulado). Excepcion: si \
+la peticion es una actualizacion de solo-narrativa sobre un SRS existente, \
+arranca con seed_from_last_srs (etapa 0) y salta a draft_narrative.
 4. REFINAR — Si analyze_quality halla bloqueantes graves, mencionalo en tu \
 reporte antes de continuar (el usuario decide si corregir los reqs primero).
 5. REPORTAR — Tras commit_srs, resume: versión generada, conteo de reqs, \
@@ -178,6 +189,114 @@ def _make_stage_tools(
     project_description: str = "",
 ) -> list:
     """Construye las 4 herramientas de etapa, cerrando sobre project_id."""
+
+    @tool
+    async def seed_from_last_srs() -> dict:
+        """Atajo: siembra el run desde el ultimo SRS persistido (solo narrativa).
+
+        Usalo cuando el usuario pida REVISAR la narrativa de un SRS ya generado
+        (p. ej. "actualiza el alcance") sin haber cambiado el store: carga los
+        hallazgos, goals y cobertura PERSISTIDOS de la ultima version al holder
+        y marca las etapas 1-3 como hechas, para que sigas directo a
+        draft_narrative + commit_srs (una version nueva en minutos, sin
+        re-juzgar cientos de enunciados). Los hallazgos conservan la curacion
+        de estado hecha en la UI. Guarda de staleness: si el store cambio
+        (conteo de vivos distinto o filas tocadas tras generated_at), rechaza
+        y pide el pipeline completo.
+        """
+        run = get_or_create_run(
+            project_id,
+            project_name=project_name,
+            project_description=project_description,
+        )
+        # La siembra es un punto de arranque: limpia salidas previas del run.
+        run.reset_pipeline_outputs()
+        try:
+            run.bump(STAGE_SEED)
+        except StageLoopExceeded as exc:
+            return _loop_err(exc)
+
+        from sqlalchemy import func, select as sa_select
+
+        from backend.models.requirement import RequirementItem
+
+        async with AsyncSessionLocal() as session:
+            srs = await srs_store.get_latest_srs(session, project_id)
+            if srs is None:
+                return {
+                    "error": "no_previous_srs",
+                    "message": (
+                        "No hay un SRS previo que reutilizar. Corre el pipeline "
+                        "completo: analyze_quality -> infer_goals -> "
+                        "check_coverage -> draft_narrative -> commit_srs."
+                    ),
+                }
+            live_count = await session.scalar(
+                sa_select(func.count())
+                .select_from(RequirementItem)
+                .where(
+                    RequirementItem.project_id == project_id,
+                    RequirementItem.status.in_(_LIVE_STATUSES),
+                )
+            )
+            max_updated = await session.scalar(
+                sa_select(func.max(RequirementItem.updated_at)).where(
+                    RequirementItem.project_id == project_id
+                )
+            )
+
+        stale: list[str] = []
+        if int(live_count or 0) != srs.requirement_count:
+            stale.append(
+                f"requerimientos vivos {int(live_count or 0)} != "
+                f"{srs.requirement_count} de la v{srs.version}"
+            )
+        if (
+            max_updated is not None
+            and srs.generated_at is not None
+            and max_updated > srs.generated_at
+        ):
+            stale.append(
+                "el store fue modificado despues de generar esa version"
+            )
+        if stale:
+            return {
+                "error": "stale_store",
+                "reasons": stale,
+                "message": (
+                    "El store cambio desde el ultimo SRS; los hallazgos y goals "
+                    "previos ya no son validos. Corre el pipeline completo "
+                    "desde analyze_quality."
+                ),
+            }
+
+        # Hallazgos PERSISTIDOS (conservan la curacion de estado de la UI).
+        async with AsyncSessionLocal() as session:
+            findings = await srs_store.list_findings(session, project_id)
+            code_map = await srs_store._req_code_map(session, project_id)
+            finding_dicts = srs_store.findings_to_dicts(findings, code_map)
+
+        # El payload persistio goals_summary anidado bajo quality_summary
+        # (commit_srs lo arma asi); separarlo para el holder.
+        quality_summary = dict(srs.quality_summary or {})
+        goals_summary = quality_summary.pop("goals", None)
+        run.quality_summary = quality_summary or None
+        run.goals_summary = goals_summary
+        run.coverage = srs.coverage
+        run.findings = finding_dicts
+        run.stages_done.update({STAGE_QUALITY, STAGE_GOALS, STAGE_COVERAGE})
+
+        return {
+            "stage": STAGE_SEED,
+            "reused_from_version": srs.version,
+            "findings_reused": len(finding_dicts),
+            "stages_done": sorted(run.stages_done),
+            "message": (
+                f"Run sembrado desde la v{srs.version}: calidad, goals y "
+                "cobertura reutilizados. Continua con draft_narrative y "
+                "commit_srs para persistir la version nueva."
+            ),
+        }
 
     @tool
     async def analyze_quality() -> dict:
@@ -507,7 +626,14 @@ y limpia el holder.
             ),
         }
 
-    return [analyze_quality, infer_goals, check_coverage, draft_narrative, commit_srs]
+    return [
+        seed_from_last_srs,
+        analyze_quality,
+        infer_goals,
+        check_coverage,
+        draft_narrative,
+        commit_srs,
+    ]
 
 
 def make_srs_agent_subagent(
