@@ -207,6 +207,10 @@ cualquier exploracion del workspace; los requerimientos ya viven en el store.
 - Planes obsoletos: cierra los planes `proposed` cuyo contenido ya fue
   resuelto por un plan aplicado posterior con `archive_grouping_plan` (no
   destructivo: no toca requerimientos).
+- Relaciones documentadas: al rechazar una fusion y registrar la relacion con
+  `link_requirements`, formalizala con `set_relation_status` (confirmed)
+  solo tras aprobacion del usuario — preserva la nota original; `resolved` es
+  exclusivo de `resolve_conflict` (contradicciones con winner).
 - `apply_grouping_plan` solo tras aprobacion explicita del usuario (las
   fusiones son destructivas).
 """

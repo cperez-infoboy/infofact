@@ -631,6 +631,41 @@ async def resolve_conflict(
     return relation
 
 
+async def set_relation_status(
+    session: AsyncSession,
+    relation_id: int,
+    status: RelationStatus,
+    *,
+    note: str | None = None,
+) -> RequirementRelation:
+    """Set a relation's status directly (CONFIRMED, or back to PROPOSED).
+
+    A diferencia de ``resolve_conflict`` (especifica de contradicciones:
+    registra winner/loser y REESCRIBE la nota), esta funcion no tiene
+    semantica de ganador y preserva la nota original — el ``note`` opcional
+    se AGREGA al final, nunca pisa. Usala para formalizar relaciones
+    documentadas (depends_on, duplicate) que el humano reviso: CONFIRMED
+    sella la documentacion; PROPOSED reabre la revision. RESOLVED se
+    rechaza: es exclusivo de ``resolve_conflict``.
+    """
+    if status == RelationStatus.RESOLVED:
+        raise ValueError(
+            "RESOLVED es exclusivo de resolve_conflict (registra winner); "
+            "usa confirmed | proposed"
+        )
+    relation = await session.scalar(
+        select(RequirementRelation).where(RequirementRelation.id == relation_id)
+    )
+    if relation is None:
+        raise KeyError(f"relation {relation_id} not found")
+    relation.status = status
+    if note:
+        relation.note = f"{relation.note}; {note}" if relation.note else note
+    await session.commit()
+    await session.refresh(relation)
+    return relation
+
+
 # --- reads ------------------------------------------------------------------
 
 

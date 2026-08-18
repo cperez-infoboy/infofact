@@ -28,6 +28,7 @@ from backend.database import AsyncSessionLocal
 from backend.models.requirement import (
     Priority,
     RelationKind,
+    RelationStatus,
     ReqStatus,
     ReqType,
     RequirementItem,
@@ -514,6 +515,42 @@ def make_requirements_tools(project_id: int) -> list:
             return {"error": f"resolve_conflict failed: {exc}"}
 
     @tool
+    async def set_relation_status(
+        relation_id: int, status: str, note: str | None = None
+    ) -> dict:
+        """Confirm a documented relation (or re-open it) — no winner semantics.
+
+        status is 'confirmed' (the human approved a documented link:
+        depends_on, duplicate) or 'proposed' (re-open for review). The
+        original note is PRESERVED — the optional note is appended, never
+        overwritten. 'resolved' is NOT accepted here: it belongs to
+        resolve_conflict, which records a winner (contradiction semantics
+        that would distort the audit of a depends_on link).
+        """
+        if status not in ("confirmed", "proposed"):
+            return {
+                "error": (
+                    f"status invalido: {status!r} (usá confirmed | proposed; "
+                    "resolved es exclusivo de resolve_conflict)"
+                )
+            }
+        try:
+            async with AsyncSessionLocal() as session:
+                rel = await store.set_relation_status(
+                    session,
+                    relation_id,
+                    RelationStatus(status),
+                    note=note,
+                )
+                return {
+                    "relation_id": rel.id,
+                    "status": rel.status.value,
+                    "note": rel.note,
+                }
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"set_relation_status failed: {exc}"}
+
+    @tool
     async def list_requirements(
         status: StatusValue | None = None,
         type: ReqTypeValue | None = None,
@@ -781,6 +818,7 @@ def make_requirements_tools(project_id: int) -> list:
         split_requirement,
         link_requirements,
         resolve_conflict,
+        set_relation_status,
         list_requirements,
         get_requirement,
         approve_requirement,
