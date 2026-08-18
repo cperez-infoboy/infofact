@@ -36,6 +36,7 @@ from backend.agents.subagents.srs_run_holder import (
 from backend.agents.no_fs_tools import NoFilesystemToolsMiddleware
 from backend.agents.size_guard import SizeGuardMiddleware
 from backend.agents.tools.documents_tools import make_document_read_tools
+from backend.agents.tools.srs_tools import make_srs_read_tools
 from backend.database import AsyncSessionLocal
 from backend.models.requirement import ReqStatus
 from backend.services import goals_engine, srs_coverage, srs_quality, srs_store
@@ -75,7 +76,8 @@ PRIMERO: reusa los hallazgos, goals y cobertura PERSISTIDOS de la ultima \
 version y sigue directo a draft_narrative + commit_srs (una version nueva \
 en minutos, sin re-juzgar cientos de enunciados). Si devuelve \
 no_previous_srs o stale_store, corre el pipeline completo desde \
-analyze_quality.
+analyze_quality. En ese flujo, pasa las indicaciones narrativas del \
+usuario al parametro `instructions` de `draft_narrative`.
 1. analyze_quality  — Analiza la calidad de los requerimientos vivos: \
 pre-checks programáticos (INCOSE, requirement smells, EARS) + evaluación LLM \
 de ambigüedad semántica. Produces hallazgos (RequirementFinding) con severidad \
@@ -91,7 +93,10 @@ cobertura de goals (goals sin reqs que los realicen = gap).
 (propósito, alcance, definiciones, referencias, perspectiva, usuarios, entorno \
 y supuestos) usando contexto RAG de los documentos fuente de captura. Puedes \
 consultar los documentos con search_documents / get_document_passage antes de \
-redactar.
+redactar. IMPORTANTE: si el usuario dio indicaciones narrativas, pasalas \
+SIEMPRE al parametro `instructions` — es el UNICO canal que llega al \
+redactor (el contexto se arma desde el store + RAG; tu conversacion NO se \
+le pasa). Cargar citas a tu propio contexto NO basta.
 5. commit_srs       — Persiste el SrsDocument CANDIDATE: combina narrativa \
 + secciones proyectadas + hallazgos + goals + cobertura + matriz de \
 trazabilidad. Solo esta etapa escribe la DB.
@@ -110,7 +115,10 @@ arranca con seed_from_last_srs (etapa 0) y salta a draft_narrative.
 4. REFINAR — Si analyze_quality halla bloqueantes graves, mencionalo en tu \
 reporte antes de continuar (el usuario decide si corregir los reqs primero).
 5. REPORTAR — Tras commit_srs, resume: versión generada, conteo de reqs, \
-hallazgos por severidad, gaps de cobertura y goals inferidos.
+hallazgos por severidad, gaps de cobertura y goals inferidos. ANTES de \
+reportar exito sobre un ajuste pedido, VERIFICA con `read_srs_section` que \
+las secciones objetivo contienen lo pedido: nunca afirmes contenido que no \
+leiste de vuelta del SRS persistido.
 
 Reglas estrictas:
 - NO inventes requerimientos ni goals. Los goals se infieren SOLO de los \
@@ -439,7 +447,7 @@ Acumula hallazgos de cobertura en el holder. Emite ``coverage.report``.
         }
 
     @tool
-    async def draft_narrative() -> dict:
+    async def draft_narrative(instructions: str | None = None) -> dict:
         """Etapa 4/5: redacta con LLM las 8 subsecciones authored del SRS.
 
         Genera prosa para propósito, alcance, definiciones, referencias, \
@@ -447,6 +455,14 @@ perspectiva, usuarios, entorno operativo y supuestos, usando contexto RAG \
 de los documentos fuente de captura. Preserva las secciones deterministas \
 (overview, features) y reapende el bloque de conteos a la perspectiva. \
 Emite ``narrative.drafted`` al terminar.
+
+        Args:
+            instructions: indicaciones narrativas del usuario (p. ej. \
+"incorporar el carácter multi-industria en propósito y alcance, con los \
+ejemplos de la visión"). Es el UNICO canal por el que las indicaciones \
+conversacionales llegan al redactor: el contexto se arma desde el store + \
+RAG, tu conversacion NO se le pasa. Pasa aca, verbatim, lo que el usuario \
+pidio ajustar.
         """
         run = get_run(project_id)
         if run is None:
@@ -497,6 +513,7 @@ Emite ``narrative.drafted`` al terminar.
                 quality_summary=run.quality_summary or {},
                 coverage=run.coverage or {},
                 goals_summary=run.goals_summary or {},
+                instructions=instructions,
             )
         except Exception as exc:  # noqa: BLE001 — surface al modelo
             logger.exception("draft_narrative failed")
@@ -519,6 +536,7 @@ Emite ``narrative.drafted`` al terminar.
             "stage": STAGE_NARRATIVE,
             "subsections": 8,
             "remaining_placeholders": placeholders,
+            "instructions_received": bool(instructions),
             "stages_done": sorted(run.stages_done),
         }
 
@@ -651,7 +669,8 @@ def make_srs_agent_subagent(
     """
     stage_tools = _make_stage_tools(project_id, project_name, project_description)
     doc_tools = make_document_read_tools(project_id)
-    tools = stage_tools + doc_tools
+    srs_read_tools = make_srs_read_tools(project_id)
+    tools = stage_tools + doc_tools + srs_read_tools
     return {
         "name": "srs-agent",
         "description": (

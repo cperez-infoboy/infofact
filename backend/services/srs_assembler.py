@@ -366,6 +366,7 @@ async def draft_narrative_llm(
     quality_summary: dict[str, Any],
     coverage: dict[str, Any],
     goals_summary: dict[str, Any],
+    instructions: str | None = None,
 ) -> dict[str, str]:
     """Enriquece la narrativa determinista con prosa generada por LLM.
 
@@ -374,6 +375,11 @@ async def draft_narrative_llm(
     LLM, preservando las claves deterministas (``intro.overview`` y
     ``overall.features``). El bloque de conteos de ``overall.perspective``
     se reapende después del texto del LLM para mantener el resumen de alcance.
+
+    ``instructions`` (opcional) son indicaciones narrativas del usuario
+    (p. ej. "incorporar el carácter multi-industria en propósito y alcance").
+    Sin este canal las indicaciones conversacionales NUNCA llegan al
+    redactor: el prompt se arma solo desde store + RAG.
 
     Si la llamada LLM falla, devuelve ``narrative`` sin cambios (fallback
     determinista).
@@ -388,6 +394,15 @@ async def draft_narrative_llm(
             coverage,
             goals_summary,
         )
+        if instructions:
+            user_msg += (
+                "\n\n## INDICACIONES DEL USUARIO SOBRE LA NARRATIVA "
+                "(prioridad maxima)\n"
+                + instructions.strip()
+                + "\n\nIncorpora estas indicaciones en las subsecciones que "
+                "correspondan, respetando el resto del contexto y sin inventar "
+                "hechos sin respaldo."
+            )
         runner = structured_llm(SrsNarrativeDraft)
         draft = await runner.ainvoke(
             [("system", _NARRATIVE_SYSTEM), ("user", user_msg)]
