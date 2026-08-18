@@ -198,23 +198,43 @@ async def get_plan(session: AsyncSession, plan_id: int) -> dict | None:
     }
 
 
+def _item_brief(it: RequirementItem | None) -> dict:
+    """Campos relevantes para curar UN requerimiento (keeper o miembro).
+
+    El payload del grupo debe bastar para curar sin llamadas extra: los
+    criterios de curacion usan statement (especificidad), priority (gana la
+    mas restrictiva), explicit_priority (keeper explícito del cliente) y las
+    fuentes (desempate por documento). ``get_requirement`` queda para el
+    detalle completo de UN item cuando el usuario lo pide.
+    """
+    if it is None:
+        return {
+            "id": None, "code": None, "statement": None, "type": None,
+            "priority": None, "explicit_priority": None, "status": None,
+            "source_documents": [],
+        }
+    docs: list[str] = []
+    for entry in store._source_list(it):
+        doc_id = entry.get("document_id") if isinstance(entry, dict) else None
+        if isinstance(doc_id, str) and doc_id and doc_id not in docs:
+            docs.append(doc_id)
+    return {
+        "id": it.id,
+        "code": it.code,
+        "statement": it.statement,
+        "type": it.type.value if it.type else None,
+        "priority": it.priority.value if it.priority else None,
+        "explicit_priority": bool(it.explicit_priority),
+        "status": it.status.value if it.status else None,
+        "source_documents": docs,
+    }
+
+
 def _group_dict(g: GroupingGroup, items: dict[int, RequirementItem]) -> dict:
-    keeper = items.get(g.keeper_id)
     return {
         "id": g.id,
-        "keeper": {
-            "id": g.keeper_id,
-            "code": keeper.code if keeper else None,
-            "statement": keeper.statement if keeper else None,
-        },
-        "members": [
-            {
-                "id": mid,
-                "code": items[mid].code if mid in items else None,
-                "statement": items[mid].statement if mid in items else None,
-            }
-            for mid in g.member_ids
-        ],
+        "keeper": _item_brief(items.get(g.keeper_id)),
+        "members": [_item_brief(items.get(mid)) for mid in g.member_ids],
         "reason": g.reason,
         "confidence": g.confidence,
         "decision": g.decision.value,
@@ -258,6 +278,35 @@ async def update_group(
         g.reason = reason
     await session.commit()
     return {"id": g.id, "keeper_id": g.keeper_id, "member_ids": g.member_ids}
+
+
+# ---------------------------------------------------------------------------
+# Archive (close stale plans without applying)
+# ---------------------------------------------------------------------------
+
+async def archive_plan(session: AsyncSession, plan_id: int) -> dict | None:
+    """Close a plan as ``ARCHIVED`` (stale/noise cleanup; items untouched).
+
+    Para planes ``proposed`` obsoletos (p. ej. codigos ya resueltos por un plan
+    posterior aplicado) que de otro modo se acumulan como ruido. Idempotente
+    sobre ``ARCHIVED``; los ``applied`` son historial de auditoria y no se
+    archivan. Devuelve None si el plan no existe.
+    """
+    plan = await session.get(GroupingPlan, plan_id)
+    if plan is None:
+        return None
+    if plan.status == PlanStatus.APPLIED:
+        return {
+            "error": (
+                f"plan {plan_id} ya esta aplicado; los planes aplicados son "
+                "historial y no se archivan"
+            )
+        }
+    if plan.status == PlanStatus.ARCHIVED:
+        return {"id": plan.id, "status": plan.status.value, "already_archived": True}
+    plan.status = PlanStatus.ARCHIVED
+    await session.commit()
+    return {"id": plan.id, "status": plan.status.value}
 
 
 # ---------------------------------------------------------------------------

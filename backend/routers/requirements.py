@@ -297,6 +297,20 @@ async def apply_grouping_plan(
     return result
 
 
+@router.post("/projects/{project_id}/grouping-plans/{plan_id}/archive")
+async def archive_grouping_plan(
+    project_id: int,
+    plan_id: int,
+    user: User = Depends(get_current_user),
+) -> dict:
+    """Archiva un plan obsoleto: cierra sin aplicar (no toca requerimientos)."""
+    async with AsyncSessionLocal() as db:
+        await _load_owned_project(db, project_id, user)
+        await _load_plan_or_404(db, project_id, plan_id)
+        result = await gstore.archive_plan(db, plan_id)
+    return result
+
+
 @router.get(
     "/projects/{project_id}/grouping-plans/{plan_id}/export.md",
     response_class=Response,

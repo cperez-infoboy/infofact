@@ -36,7 +36,21 @@ def test_prompt_grouping_section_covers_curation():
     p = REQUIREMENTS_CAPTURE_AGENT_PROMPT
     assert "curacion de planes" in p
     assert "set_group_decision" in p and "edit_group" in p
-    assert "Nunca re-extraigas ni re-captures" in p
+    assert "re-extraigas ni re-captures" in p
+
+
+def test_prompt_grouping_section_reads_plans_without_n_plus_1():
+    """Curar con el payload del plan, sin get_requirement por item ni regenerar.
+
+    El payload de get_grouping_plan ya trae enunciados/prioridades/fuentes;
+    sin este pin el agente re-llama get_requirement por codigo (N+1) o
+    regenera el plan con review_grouping solo para volver a verlo.
+    """
+    p = REQUIREMENTS_CAPTURE_AGENT_PROMPT
+    assert "get_grouping_plan(plan_id)" in p
+    assert "sin llamar `get_requirement` por item" in p
+    assert "regeneres un plan" in p
+    assert "archive_grouping_plan" in p
 
 
 def test_spec_description_delegates_curation_without_capture():

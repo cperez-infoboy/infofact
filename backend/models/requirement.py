@@ -223,6 +223,10 @@ class PlanStatus(str, Enum):
     PROPOSED = "proposed"
     APPLIED = "applied"
     PARTIALLY_APPLIED = "partially-applied"
+    # Plan cerrado sin aplicar: ruido historico (codigos ya resueltos por un
+    # plan posterior). No toca requerimientos; los APPLIED son historial y no
+    # se archivan.
+    ARCHIVED = "archived"
 
 
 class GroupDecision(str, Enum):

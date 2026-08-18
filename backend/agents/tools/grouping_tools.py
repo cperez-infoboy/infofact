@@ -9,6 +9,11 @@ edit_group          — change a group's keeper and/or members (REQ-codes
                       resolved to ids against the live store).
 apply_grouping_plan — merge every 'accept' group idempotently, set plan status.
 list_grouping_plans — list persisted plans so a previous review can resume.
+get_grouping_plan   — full detail of ONE persisted plan (groups with
+                      statements, priorities, types and sources) so curation
+                      never re-runs review_grouping just to see a plan again.
+archive_grouping_plan — close a stale proposed plan as archived (no items
+                      are touched; applied plans are audit history).
 
 All tools close over ``project_id``; each opens a fresh DB session. The plan is
 a DB row (shared source of truth): the agent and the requirements UI curate the
@@ -217,9 +222,13 @@ def make_grouping_tools(project_id: int) -> list:
         seguridad" -> types=["security"]; "solo los de spec.pdf" ->
         documents=["spec.pdf"]).
 
-        Does NOT merge anything. After the user curates the plan conversationally
-        -- accept/reject groups with set_group_decision, change a keeper or
-        members with edit_group -- call apply_grouping_plan.
+        Does NOT merge anything. The returned groups are self-sufficient for
+        curation — each keeper/member carries code, statement, type, priority,
+        explicit_priority, status and source documents — so you can reason
+        about accept/reject WITHOUT extra get_requirement calls. After the
+        user curates the plan conversationally -- accept/reject groups with
+        set_group_decision, change a keeper or members with edit_group --
+        call apply_grouping_plan.
         """
         try:
             async with AsyncSessionLocal() as session:
@@ -330,13 +339,45 @@ def make_grouping_tools(project_id: int) -> list:
     async def list_grouping_plans() -> dict:
         """List persisted grouping plans for the project (newest first).
 
-        Each entry: id, status (proposed/applied/partially-applied),
-        generated_at, applied_at, total groups and accepted count. Use to resume
-        a review or audit what was applied.
+        Each entry: id, status (proposed/applied/partially-applied/archived),
+        generated_at, applied_at, total groups and accepted count. Summaries
+        only — fetch `get_grouping_plan(plan_id)` for the groups themselves.
         """
         async with AsyncSessionLocal() as session:
             plans = await gstore.list_plans(session, project_id)
         return {"plans": plans}
+
+    @tool
+    async def get_grouping_plan(plan_id: int) -> dict:
+        """Full detail of ONE persisted grouping plan (groups with statements).
+
+        Each group carries keeper and members with code, statement, type,
+        priority, explicit_priority, status and source documents, plus reason,
+        confidence and the current decision. Use this to curate an EXISTING
+        plan (list_grouping_plans gives only counts) and to re-read a plan
+        generated earlier in the conversation — never re-run review_grouping
+        just to see a plan again.
+        """
+        async with AsyncSessionLocal() as session:
+            data = await gstore.get_plan(session, plan_id)
+        if data is None:
+            return {"error": f"plan {plan_id} no existe"}
+        return data
+
+    @tool
+    async def archive_grouping_plan(plan_id: int) -> dict:
+        """Close a stale grouping plan as archived (no requirements touched).
+
+        Use for leftover 'proposed' plans whose codes were already resolved by
+        a later applied plan — they otherwise pile up as noise in
+        list_grouping_plans. Applied plans are audit history and cannot be
+        archived. Idempotent.
+        """
+        async with AsyncSessionLocal() as session:
+            result = await gstore.archive_plan(session, plan_id)
+        if result is None:
+            return {"error": f"plan {plan_id} no existe"}
+        return result
 
     return [
         review_grouping,
@@ -344,4 +385,6 @@ def make_grouping_tools(project_id: int) -> list:
         edit_group,
         apply_grouping_plan,
         list_grouping_plans,
+        get_grouping_plan,
+        archive_grouping_plan,
     ]

@@ -198,9 +198,15 @@ cualquier exploracion del workspace; los requerimientos ya viven en el store.
   el store vivo, juzga duplicados y persiste el plan). Reporta plan_id,
   cantidad de grupos y alcance aplicado.
 - Curacion de planes existentes: `list_grouping_plans` para ubicar el plan
-  pendiente, luego `set_group_decision` / `edit_group` sobre los grupos que
-  el usuario quiere resolver. Nunca re-extraigas ni re-captures para
-  resolver agrupamientos pendientes.
+  pendiente y `get_grouping_plan(plan_id)` para ver sus grupos completos
+  (enunciados, prioridades, tipos y fuentes incluidos: cura con ese payload,
+  sin llamar `get_requirement` por item); luego `set_group_decision` /
+  `edit_group` sobre los grupos que el usuario quiere resolver. Nunca
+  re-extraigas ni re-captures para resolver agrupamientos pendientes, ni
+  regeneres un plan (`review_grouping`) solo para volver a verlo.
+- Planes obsoletos: cierra los planes `proposed` cuyo contenido ya fue
+  resuelto por un plan aplicado posterior con `archive_grouping_plan` (no
+  destructivo: no toca requerimientos).
 - `apply_grouping_plan` solo tras aprobacion explicita del usuario (las
   fusiones son destructivas).
 """
