@@ -188,14 +188,21 @@ saltear):
   nunca los busques en archivos del workspace (no hay .db ni .sqlite
   accesibles) — el workspace solo contiene los documentos fuente del proyecto.
 
-AGRUPAMIENTO (/agrupar): NO es una captura. Omite la orientacion,
-check_capture_health y cualquier exploracion del workspace: mapea el alcance
-pedido por el usuario a los argumentos `types`/`documents` y llama a
-`review_grouping` DIRECTAMENTE (la tool lee el store vivo, juzga duplicados y
-persiste el plan). Reporta plan_id, cantidad de grupos y alcance aplicado.
-`list_grouping_plans` solo si el usuario pidio ver planes existentes;
-`apply_grouping_plan` solo tras aprobacion explicita (las fusiones son
-destructivas).
+AGRUPAMIENTO (/agrupar y curacion de planes): NO es una captura. Ninguna
+tarea de agrupamiento (detectar duplicados, revisar planes pendientes,
+aceptar/rechazar grupos, cambiar keeper, aplicar fusiones) ejecuta etapas de
+captura ni preambulo alguno: omite la orientacion, check_capture_health y
+cualquier exploracion del workspace; los requerimientos ya viven en el store.
+- Nuevo plan: mapea el alcance pedido por el usuario a los argumentos
+  `types`/`documents` y llama a `review_grouping` DIRECTAMENTE (la tool lee
+  el store vivo, juzga duplicados y persiste el plan). Reporta plan_id,
+  cantidad de grupos y alcance aplicado.
+- Curacion de planes existentes: `list_grouping_plans` para ubicar el plan
+  pendiente, luego `set_group_decision` / `edit_group` sobre los grupos que
+  el usuario quiere resolver. Nunca re-extraigas ni re-captures para
+  resolver agrupamientos pendientes.
+- `apply_grouping_plan` solo tras aprobacion explicita del usuario (las
+  fusiones son destructivas).
 """
 
 
@@ -1057,9 +1064,13 @@ def make_requirements_capture_agent_subagent(
             "por etapa (orienta los documentos, planifica, orquesta las siete "
             "etapas del pipeline y refina) en lugar de disparar una sola tool. "
             "Usalo cuando el usuario use el comando /captura o pida una captura "
-            "guiada con instrucciones de steering. Tambien cubre la edicion, el "
-            "agrupamiento de duplicados y la vision de documentos del store. Los "
-            "guardrails viven dentro de las tools, no en el prompt."
+            "guiada con instrucciones de steering. Tambien es el encargado del "
+            "store de requerimientos: edicion de items, agrupamiento de "
+            "duplicados (revisar planes pendientes, aceptar/rechazar grupos, "
+            "cambiar keeper, aplicar fusiones) y vision de documentos. Las "
+            "tareas de agrupamiento NO ejecutan captura: delega solo la "
+            "curacion, sin re-extraer. Los guardrails viven dentro de las "
+            "tools, no en el prompt."
         ),
         "system_prompt": REQUIREMENTS_CAPTURE_AGENT_PROMPT,
         "tools": [

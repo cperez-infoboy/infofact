@@ -26,6 +26,33 @@ def test_prompt_grouping_section_goes_straight_to_review():
     assert "check_capture_health" in p  # lo que debe OMITIR para agrupar
 
 
+def test_prompt_grouping_section_covers_curation():
+    """Curacion de planes pendientes: tambien es agrupamiento, sin captura.
+
+    Una delegacion libre ("resuelve los agrupamientos pendientes") no tiene
+    forma de /agrupar; sin esta seccion el subagente improvisaba preambulo
+    de captura (orientacion, check_capture_health).
+    """
+    p = REQUIREMENTS_CAPTURE_AGENT_PROMPT
+    assert "curacion de planes" in p
+    assert "set_group_decision" in p and "edit_group" in p
+    assert "Nunca re-extraigas ni re-captures" in p
+
+
+def test_spec_description_delegates_curation_without_capture():
+    """La description guia la prosa del orquestador al delegar.
+
+    Antes decia solo "Tambien cubre la edicion, el agrupamiento..." y el
+    orquestador narraba "lanzo el subagente de captura" para curar planes.
+    """
+    spec = make_requirements_capture_agent_subagent(
+        project_id=1, profile="p", project_slug="demo"
+    )
+    d = spec["description"]
+    assert "revisar planes pendientes" in d
+    assert "NO ejecutan captura" in d
+
+
 def test_capture_spec_hides_filesystem_tools():
     spec = make_requirements_capture_agent_subagent(
         project_id=1, profile="p", project_slug="demo"
