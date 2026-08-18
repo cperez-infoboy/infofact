@@ -185,14 +185,21 @@ async def embed_texts_cached(session, texts: list[str]):
     Codifica SOLO los enunciados sin fila en ``requirement_embeddings``; el
     resto sale del cache. La clave es el CONTENIDO, no el item: un enunciado
     editado cambia de hash y se re-codifica, y enunciados repetidos entre
-    proyectos comparten fila. La escritura va en la session del llamador
-    (commitea su dueno); un rollback simplemente repuebla el cache despues.
+    proyectos comparten fila.
+
+    Las ESCRITURAS van por una conexion propia y efímera (commit inmediato),
+    NUNCA por la session del llamador: ``build_grouping_plan`` corre minutos
+    (juez LLM) y un flush a mitad de camino convertiria su transaccion de
+    lectura en una transaccion de ESCRITURA sostenida — SQLite bloquearia a
+    todos los demas lectores de la app por todo el resto del run (incidente
+    real: ``GET /api/workspaces/tree`` en 500 ``database is locked``).
     """
     import hashlib
 
     import numpy as np
     from sqlalchemy import select
 
+    from backend.database import AsyncSessionLocal
     from backend.models.requirement_embedding import RequirementEmbedding
 
     model = DEFAULT_EMBEDDING_MODEL
@@ -214,16 +221,19 @@ async def embed_texts_cached(session, texts: list[str]):
         idx_by_hash = {h: i for i, h in enumerate(hashes)}
         fresh = embed_texts([texts[idx_by_hash[h]] for h in unique_hashes])
         vec_by_hash = dict(zip(unique_hashes, fresh))
-        session.add_all(
-            RequirementEmbedding(
-                model_name=model,
-                stmt_hash=h,
-                dim=int(vec_by_hash[h].shape[0]),
-                vector=vec_by_hash[h].astype("float32").tobytes(),
+        # Conexion propia + commit inmediato: la ventana de lock de escritura
+        # dura milisegundos y la session del llamador queda solo-lectura.
+        async with AsyncSessionLocal() as writer:
+            writer.add_all(
+                RequirementEmbedding(
+                    model_name=model,
+                    stmt_hash=h,
+                    dim=int(vec_by_hash[h].shape[0]),
+                    vector=vec_by_hash[h].astype("float32").tobytes(),
+                )
+                for h in unique_hashes
             )
-            for h in unique_hashes
-        )
-        await session.flush()
+            await writer.commit()
         for i in missing:
             out[i] = vec_by_hash[hashes[i]]
     for i, h in enumerate(hashes):

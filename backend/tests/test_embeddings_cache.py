@@ -37,13 +37,15 @@ async def test_cache_encodes_only_missing_statements(monkeypatch):
 
     encoded: list[list[str]] = []
     monkeypatch.setattr(consolidation, "embed_texts", _fake_embed_factory(encoded))
+    # Las escrituras del cache van por una conexion propia: apuntarla al
+    # engine de test para no tocar la DB real.
+    monkeypatch.setattr("backend.database.AsyncSessionLocal", maker)
 
     # Primera corrida: todo es miss.
     async with maker() as s:
         out = await consolidation.embed_texts_cached(s, ["alpha", "beta"])
         assert out.shape == (2, 8)
         assert encoded == [["alpha", "beta"]]
-        await s.commit()
 
     # Segunda corrida: alpha/beta salen del cache; solo gamma se codifica.
     async with maker() as s:
@@ -54,7 +56,6 @@ async def test_cache_encodes_only_missing_statements(monkeypatch):
         assert encoded == [["alpha", "beta"], ["gamma"]]
         rows = (await s.scalars(select(RequirementEmbedding))).all()
         assert len(rows) == 3
-        await s.commit()
 
     # El vector cacheado es el mismo que el fresco (roundtrip BLOB).
     assert np.allclose(out2[0], out[0])
@@ -71,6 +72,7 @@ async def test_cached_rows_shared_across_statements(monkeypatch):
 
     encoded: list[list[str]] = []
     monkeypatch.setattr(consolidation, "embed_texts", _fake_embed_factory(encoded))
+    monkeypatch.setattr("backend.database.AsyncSessionLocal", maker)
 
     async with maker() as s:
         out = await consolidation.embed_texts_cached(s, ["repetido", "repetido"])
@@ -78,6 +80,5 @@ async def test_cached_rows_shared_across_statements(monkeypatch):
         assert encoded == [["repetido"]]  # dedup por hash antes de encodear
         rows = (await s.scalars(select(RequirementEmbedding))).all()
         assert len(rows) == 1
-        await s.commit()
 
     await engine.dispose()

@@ -86,9 +86,10 @@ async def _seed(session) -> int:
 
 @pytest.fixture
 def deterministic(monkeypatch):
-    """Embeddings one-hot + judge vacío: solo buckets verbatim, sin LLM."""
+    """Embeddings one-hot + juez vacío: solo buckets verbatim, sin LLM."""
     monkeypatch.setattr(
-        grouping, "embed_texts", lambda texts: np.eye(len(texts))
+        "backend.agents.pipelines.consolidation.embed_texts",
+        lambda texts: np.eye(len(texts), dtype="float32"),
     )
 
     async def _no_judge(_reqs, _candidates, on_progress=None):
@@ -109,11 +110,20 @@ async def _build(**kwargs) -> grouping.GroupingPlan:
             sm = async_sessionmaker(
                 engine, class_=AsyncSession, expire_on_commit=False
             )
-            async with sm() as session:
-                pid = await _seed(session)
-                return await grouping.build_grouping_plan(
-                    session, pid, project="filtros", **kwargs
-                )
+            # El cache de embeddings escribe por su propia conexion: apuntarla
+            # a la DB temporal para no tocar la real.
+            import backend.database as _db
+
+            orig_local = _db.AsyncSessionLocal
+            _db.AsyncSessionLocal = sm
+            try:
+                async with sm() as session:
+                    pid = await _seed(session)
+                    return await grouping.build_grouping_plan(
+                        session, pid, project="filtros", **kwargs
+                    )
+            finally:
+                _db.AsyncSessionLocal = orig_local
         finally:
             await engine.dispose()
 

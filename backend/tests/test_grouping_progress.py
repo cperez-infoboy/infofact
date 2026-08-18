@@ -120,7 +120,10 @@ async def test_judge_duplicates_emits_progress_per_batch(monkeypatch):
 async def test_build_grouping_plan_emits_stage_sequence(monkeypatch, tmp_path):
     """El orden de etapas es el contrato del banner: load -> dedup ->
     embedding -> judge -> cluster, cada una con start y end+elapsed_ms."""
-    monkeypatch.setattr(grouping, "embed_texts", lambda texts: np.eye(len(texts)))
+    monkeypatch.setattr(
+        "backend.agents.pipelines.consolidation.embed_texts",
+        lambda texts: np.eye(len(texts), dtype="float32"),
+    )
 
     async def _no_judge(_reqs, _cands, on_progress=None):
         return []
@@ -155,6 +158,9 @@ async def test_build_grouping_plan_emits_stage_sequence(monkeypatch, tmp_path):
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
         sm = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        # El cache de embeddings escribe por su propia conexion: apuntarla a
+        # la DB de test para no tocar la real.
+        monkeypatch.setattr("backend.database.AsyncSessionLocal", sm)
         async with sm() as session:
             pid = await _seed(session)
             plan = await grouping.build_grouping_plan(
