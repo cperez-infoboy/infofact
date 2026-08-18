@@ -21,6 +21,7 @@ from backend.models.requirement import (
     RequirementRelation,
     RequirementRevision,
 )
+from backend.models.requirement_embedding import RequirementEmbedding
 from backend.models.srs import (
     FindingDimension,
     FindingScope,
@@ -60,6 +61,7 @@ __all__ = [
     "ChatSession",
     "ChatMessage",
     "RequirementItem",
+    "RequirementEmbedding",
     "RequirementRelation",
     "RequirementRevision",
     "GroupingPlan",

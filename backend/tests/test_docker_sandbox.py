@@ -121,3 +121,41 @@ def test_aglob_same_workspace_bound(monkeypatch):
     res_bad = asyncio.run(sbx.aglob("**/*.pdf", path="/"))
     assert res_bad.error
     assert len(calls) == 1
+
+
+def test_ls_rejects_escape_paths_without_executing(monkeypatch):
+    """`BaseSandbox.ls` no pasa por _safe_path: un path absoluto fuera del
+    workspace listaba proyectos hermanos. Misma guardia que glob."""
+    calls = _capture_exec(monkeypatch)
+    sbx = _make_sandbox()
+
+    for escape in ("/workspaces", "/workspaces/otro-proyecto", "/etc"):
+        res = sbx.ls(escape)
+        assert res.error, f"esperaba error para {escape!r}"
+        # El error nombra el root valido para que el modelo se corrija.
+        assert "/workspaces/planitrack2-0" in res.error
+
+    # Ningún path escapado debe llegar a ejecutar nada en el container.
+    assert calls == []
+
+
+def test_ls_accepts_workspace_relative_path(monkeypatch):
+    calls = _capture_exec(monkeypatch)
+    sbx = _make_sandbox()
+
+    res = sbx.ls("docs")
+
+    assert res.error is None
+    assert _decoded_search_path(calls[0]) == "docs"
+
+
+def test_bound_error_names_valid_root(monkeypatch):
+    """El mensaje de rechazo incluye el root valido (autocorreccion en un
+    turno, no iteracion a ciegas)."""
+    _capture_exec(monkeypatch)
+    sbx = _make_sandbox()
+
+    res = sbx.glob("**/*.md", path="/etc")
+
+    assert "path escapes project workspace" in res.error
+    assert "/workspaces/planitrack2-0" in res.error

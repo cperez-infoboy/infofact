@@ -32,6 +32,7 @@ API. Torch is already a dependency. Lazy-imported + singleton.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -176,6 +177,59 @@ def embed_texts(texts: list[str]):
     model = _get_embedder()
     vecs = model.encode(texts, normalize_embeddings=True, convert_to_numpy=True)
     return np.asarray(vecs, dtype="float32")
+
+
+async def embed_texts_cached(session, texts: list[str]):
+    """``embed_texts`` con cache persistente por (modelo, sha256 del enunciado).
+
+    Codifica SOLO los enunciados sin fila en ``requirement_embeddings``; el
+    resto sale del cache. La clave es el CONTENIDO, no el item: un enunciado
+    editado cambia de hash y se re-codifica, y enunciados repetidos entre
+    proyectos comparten fila. La escritura va en la session del llamador
+    (commitea su dueno); un rollback simplemente repuebla el cache despues.
+    """
+    import hashlib
+
+    import numpy as np
+    from sqlalchemy import select
+
+    from backend.models.requirement_embedding import RequirementEmbedding
+
+    model = DEFAULT_EMBEDDING_MODEL
+    hashes = [hashlib.sha256(t.encode("utf-8")).hexdigest() for t in texts]
+    rows = (
+        await session.scalars(
+            select(RequirementEmbedding).where(
+                RequirementEmbedding.model_name == model
+            )
+        )
+    ).all()
+    cache = {r.stmt_hash: r for r in rows}
+    out: list = [None] * len(texts)
+    missing = [i for i, h in enumerate(hashes) if h not in cache]
+    if missing:
+        # Dedup por hash ANTES de encodear: enunciados repetidos (mismo texto)
+        # comparten una sola codificacion y una sola fila.
+        unique_hashes = sorted({hashes[i] for i in missing})
+        idx_by_hash = {h: i for i, h in enumerate(hashes)}
+        fresh = embed_texts([texts[idx_by_hash[h]] for h in unique_hashes])
+        vec_by_hash = dict(zip(unique_hashes, fresh))
+        session.add_all(
+            RequirementEmbedding(
+                model_name=model,
+                stmt_hash=h,
+                dim=int(vec_by_hash[h].shape[0]),
+                vector=vec_by_hash[h].astype("float32").tobytes(),
+            )
+            for h in unique_hashes
+        )
+        await session.flush()
+        for i in missing:
+            out[i] = vec_by_hash[hashes[i]]
+    for i, h in enumerate(hashes):
+        if out[i] is None:
+            out[i] = np.frombuffer(cache[h].vector, dtype="float32")
+    return np.stack(out).astype("float32", copy=False)
 
 
 # ---------------------------------------------------------------------------
@@ -444,6 +498,15 @@ DEFAULT_DUPLICATE_JUDGE_BATCH = int(
     os.environ.get("INFOFACT_DUPLICATE_JUDGE_BATCH", "40")
 )
 
+# Lotes de juez en vuelo simultaneamente. Los lotes son independientes entre
+# si (cada uno arma su prompt y agrega sus veredictos), asi que el fan-out
+# solo acorta el wall-clock del stage. Conservador frente a la concurrencia 4
+# ya probada en critique; el backoff con jitter de _invoke_with_retry absorbe
+# los 429 transitorios. Env-tunable (INFOFACT_JUDGE_CONCURRENCY).
+DEFAULT_JUDGE_CONCURRENCY = int(
+    os.environ.get("INFOFACT_JUDGE_CONCURRENCY", "3")
+)
+
 
 async def _judge_duplicates(
     items: list[RawRequirement],
@@ -477,40 +540,58 @@ async def _judge_duplicates(
     llm = structured_llm(DuplicateReport, extra_body=extra_body)
     id_to_idx = {items[i].id: i for i in range(len(items))}
     total_batches = -(-len(candidates) // DEFAULT_DUPLICATE_JUDGE_BATCH)
-    confirmed: list[tuple[int, int]] = []
-    for n_batch, batch in enumerate(
-        _chunk(candidates, DEFAULT_DUPLICATE_JUDGE_BATCH), start=1
-    ):
-        if on_progress is not None:
-            await on_progress({
-                "stage": "judge",
-                "message": f"lote {n_batch}/{total_batches}",
-                "phase": "progress",
-                "current": n_batch,
-                "total": total_batches,
-            })
-        lines = []
-        for n, (i, j) in enumerate(batch, start=1):
-            lines.append(
-                f"[{n}] A ({items[i].id}): {items[i].statement}\n"
-                f"    B ({items[j].id}): {items[j].statement}"
+    batches = list(
+        enumerate(_chunk(candidates, DEFAULT_DUPLICATE_JUDGE_BATCH), start=1)
+    )
+    sem = asyncio.Semaphore(max(1, DEFAULT_JUDGE_CONCURRENCY))
+
+    async def _judge_batch(
+        n_batch: int, batch: list[tuple[int, int]]
+    ) -> list[tuple[int, int]]:
+        async with sem:
+            if on_progress is not None:
+                await on_progress({
+                    "stage": "judge",
+                    "message": f"lote {n_batch}/{total_batches}",
+                    "phase": "progress",
+                    "current": n_batch,
+                    "total": total_batches,
+                })
+            lines = []
+            for n, (i, j) in enumerate(batch, start=1):
+                lines.append(
+                    f"[{n}] A ({items[i].id}): {items[i].statement}\n"
+                    f"    B ({items[j].id}): {items[j].statement}"
+                )
+            user = "Judge each pair below:\n\n" + "\n\n".join(lines)
+            extra: dict = {}
+            if extra_body is not None:
+                # Techo de seguridad SOLO con thinking desactivado: con
+                # razonamiento activo un max_tokens corto truncaría el JSON
+                # y quemaría los reintentos de parseo.
+                extra["max_tokens"] = len(batch) * 50 + 500
+            report = await _invoke_with_retry(
+                llm,
+                [("system", _DUPLICATE_SYSTEM), ("human", user)],
+                context_label=f"consolidation.judge_duplicates[{n_batch}]",
+                extra=extra or None,
             )
-        user = "Judge each pair below:\n\n" + "\n\n".join(lines)
-        extra: dict = {}
-        if extra_body is not None:
-            # Techo de seguridad SOLO con thinking desactivado: con
-            # razonamiento activo un max_tokens corto truncaría el JSON
-            # y quemaría los reintentos de parseo.
-            extra["max_tokens"] = len(batch) * 50 + 500
-        report = await _invoke_with_retry(
-            llm,
-            [("system", _DUPLICATE_SYSTEM), ("human", user)],
-            context_label=f"consolidation.judge_duplicates[{n_batch}]",
-            extra=extra or None,
-        )
-        for v in report.verdicts:
-            if v.is_duplicate and v.a_id in id_to_idx and v.b_id in id_to_idx:
-                confirmed.append((id_to_idx[v.a_id], id_to_idx[v.b_id]))
+            pairs: list[tuple[int, int]] = []
+            for v in report.verdicts:
+                if v.is_duplicate and v.a_id in id_to_idx and v.b_id in id_to_idx:
+                    pairs.append((id_to_idx[v.a_id], id_to_idx[v.b_id]))
+            return pairs
+
+    # Fan-out acotado: los lotes son independientes y el orden de agregacion
+    # es irrelevante (lista plana de pares confirmados). El dispatch es FIFO
+    # (asyncio.Semaphore), asi que los eventos de progreso siguen saliendo en
+    # orden de lote.
+    batch_results = await asyncio.gather(
+        *(_judge_batch(n, b) for n, b in batches)
+    )
+    confirmed: list[tuple[int, int]] = [
+        pair for result in batch_results for pair in result
+    ]
     return confirmed
 
 

@@ -21,6 +21,62 @@ from backend.services.agent_service import build_checkpointer, close_checkpointe
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
 
+async def migrate_requirement_document_ids() -> None:
+    """Rebasea los ``source["document_id"]`` legacy (path del host) a la
+    convencion del contenedor ``/workspaces/{slug}/{rel}``.
+
+    Las filas escritas antes del rebase en ``_source_from_raw`` guardan el
+    path absoluto del host; el agente los veia como su workspace y salia a
+    explorarlos con el shell. Idempotente: solo hace UPDATE de las filas que
+    cambian, asi que en el segundo arranque es un no-op (SELECT ~600 filas).
+    """
+    import json
+    import logging as _logging
+
+    from sqlalchemy import text
+
+    from backend.services.doc_id import rebase_document_id
+
+    log = _logging.getLogger(__name__)
+    changed = 0
+    async with engine.begin() as conn:
+        rows = (
+            await conn.execute(text("SELECT id, source FROM requirement_items"))
+        ).all()
+        for row_id, source in rows:
+            if not source:
+                continue
+            try:
+                data = json.loads(source)
+            except (TypeError, ValueError):
+                continue
+            entries = data if isinstance(data, list) else [data]
+            touched = False
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                doc_id = entry.get("document_id")
+                if isinstance(doc_id, str) and doc_id:
+                    new_id = rebase_document_id(doc_id)
+                    if new_id != doc_id:
+                        entry["document_id"] = new_id
+                        touched = True
+            if touched:
+                await conn.execute(
+                    text(
+                        "UPDATE requirement_items SET source = :src WHERE id = :rid"
+                    ),
+                    {"src": json.dumps(data, ensure_ascii=False), "rid": row_id},
+                )
+                changed += 1
+    if changed:
+        log.info(
+            "migrate_requirement_document_ids: %d fila(s) rebasada(s) a path "
+            "de contenedor",
+            changed,
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Migra el esquema existente (idempotente) y luego crea tablas nuevas.
@@ -35,6 +91,9 @@ async def lifespan(app: FastAPI):
     await migrate_subproject_project_code()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    # Data migration (post-create_all: la tabla ya existe aunque sea un boot
+    # nuevo). Idempotente: en el segundo arranque es un no-op.
+    await migrate_requirement_document_ids()
 
     # Inicializa el checkpointer AsyncSqliteSaver (único para toda la app).
     # setup() crea las tablas que necesita; es idempotente.

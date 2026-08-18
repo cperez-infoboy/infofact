@@ -33,6 +33,7 @@ from backend.models.requirement import (
     RequirementItem,
 )
 from backend.services._req_codes import gen_opaque_code
+from backend.services.doc_id import rebase_document_id
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +51,7 @@ def _source_from_raw(it: RawRequirement) -> dict:
     jump-to-source handle for the frontend (DocViewer, Paso 9).
     """
     return {
-        "document_id": it.document_id,
+        "document_id": rebase_document_id(it.document_id),
         "section": it.section,
         "page": it.page,
         "quote": it.source_span,

@@ -291,3 +291,43 @@ async def test_judge_sends_max_tokens_only_when_thinking_is_off(monkeypatch):
 
     assert seen["extra_body"] is None
     assert stub2.kwargs == [{}]
+
+
+# --- concurrencia acotada -------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_judge_batches_run_concurrently_bounded(monkeypatch):
+    """Fan-out acotado: con concurrencia 2 y lotes que duermen, el in-flight
+    nunca supera el tope y los veredictos llegan completos sin importar el
+    orden de completitud."""
+    import asyncio
+
+    in_flight = 0
+    peak = 0
+
+    class _SlowStub:
+        async def ainvoke(self, messages, config=None, **kwargs):
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0.01)
+            in_flight -= 1
+            return _report_from_prompt(messages[-1][1])
+
+    monkeypatch.setattr(
+        consolidation,
+        "structured_llm",
+        lambda schema, extra_body=None: _SlowStub(),
+    )
+    monkeypatch.setattr(consolidation, "DEFAULT_JUDGE_CONCURRENCY", 2)
+    monkeypatch.setattr(consolidation, "DEFAULT_DUPLICATE_JUDGE_BATCH", 2)
+
+    items = _items(10)
+    candidates = [(i, i + 5) for i in range(5)] + [
+        (i, i + 2) for i in range(5)
+    ]  # 10 pares -> 5 lotes de 2
+    confirmed = await consolidation._judge_duplicates(items, candidates)
+
+    assert len(confirmed) == 10  # ningun par se pierde con el fan-out
+    assert peak == 2  # acotado por el semaforo

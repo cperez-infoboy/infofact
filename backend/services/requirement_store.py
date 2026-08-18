@@ -37,6 +37,8 @@ from backend.models.requirement import (
 )
 from backend.services._req_codes import gen_opaque_code
 
+from backend.services.doc_id import rebase_document_id
+
 logger = logging.getLogger(__name__)
 
 _SOFT_DELETED = frozenset(
@@ -118,13 +120,37 @@ async def _get_item(
 def _source_list(item: RequirementItem) -> list[dict[str, Any]]:
     """Source is stored as a single dict OR a list of dicts after a merge;
     normalize to a list so unions are straightforward.
+
+    Cada ``document_id`` se devuelve REBASADO a la convencion del contenedor
+    (``/workspaces/{slug}/{rel}``): las filas legacy guardan el path absoluto
+    del host, que no existe dentro del sandbox del agente. Copias — el JSON
+    almacenado en ``item.source`` no se muta en lectura.
     """
     src = item.source
     if src is None:
         return []
-    if isinstance(src, list):
-        return list(src)
-    return [src]
+    raw = src if isinstance(src, list) else [src]
+    out: list[dict[str, Any]] = []
+    for entry in raw:
+        if isinstance(entry, dict) and entry.get("document_id"):
+            out.append(
+                {**entry, "document_id": rebase_document_id(entry["document_id"])}
+            )
+        else:
+            out.append(entry)
+    return out
+
+
+def _source_out(item: RequirementItem) -> dict | list | None:
+    """``item.source`` rebasado a la convencion del contenedor, preservando la
+    forma (dict | list | None) que dejaron las capturas y los merges."""
+    src = item.source
+    if src is None:
+        return None
+    rebased = _source_list(item)
+    if isinstance(src, dict):
+        return rebased[0] if rebased else None
+    return rebased
 
 
 # --- create / update --------------------------------------------------------
@@ -722,7 +748,7 @@ async def get_requirement(
         "type": item.type.value,
         "priority": item.priority.value,
         "status": item.status.value,
-        "source": item.source,
+        "source": _source_out(item),
         "explicit": item.explicit,
         "derived": item.derived,
         "parent_id": item.parent_id,

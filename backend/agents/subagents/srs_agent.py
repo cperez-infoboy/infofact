@@ -32,6 +32,7 @@ from backend.agents.subagents.srs_run_holder import (
     get_or_create_run,
     get_run,
 )
+from backend.agents.no_fs_tools import NoFilesystemToolsMiddleware
 from backend.agents.size_guard import SizeGuardMiddleware
 from backend.agents.tools.documents_tools import make_document_read_tools
 from backend.database import AsyncSessionLocal
@@ -538,6 +539,7 @@ def make_srs_agent_subagent(
         "system_prompt": SRS_AGENT_PROMPT,
         "tools": tools,
         # deepagents NO propaga el middleware del orquestador a los
-        # subagentes: cada spec necesita su propia guarda de tamaño.
-        "middleware": [SizeGuardMiddleware()],
+        # subagentes (pero SI les inyecta FilesystemMiddleware): cada spec
+        # necesita su guarda de tamaño y su filtro de tools de filesystem.
+        "middleware": [SizeGuardMiddleware(), NoFilesystemToolsMiddleware()],
     }

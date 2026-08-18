@@ -40,7 +40,9 @@ from sqlalchemy import select
 from backend.agents.pipelines.extraction import RawRequirement
 from backend.models.project_document import ProjectDocument
 from backend.models.requirement import ReqType
-from backend.services.requirement_store import list_requirements
+from backend.agents.pipelines.consolidation import embed_texts_cached
+from backend.services.doc_id import rebase_document_id
+from backend.services.requirement_store import _source_list, list_requirements
 
 logger = logging.getLogger(__name__)
 
@@ -218,16 +220,21 @@ async def _resolve_document_filter(
 def _item_in_documents(item, allowed: set[str]) -> bool:
     """True si el item proviene de alguno de los rel_paths permitidos.
 
-    ``source["document_id"]`` es el path absoluto en el container; el join es
-    por sufijo ``"/" + rel_path``. Items manuales (``source`` vacio) quedan
-    FUERA cuando hay filtro de documento activo.
+    ``document_id`` viene rebasado a la convencion del container
+    (``/workspaces/{slug}/{rel_path}``) via ``_source_list``, asi que el join
+    por sufijo ``"/" + rel_path`` tambien matchea filas legacy (host path).
+    Items manuales (``source`` vacio) quedan FUERA cuando hay filtro de
+    documento activo. Los sources en LISTA (post-merge) tambien participan:
+    antes solo el dict single matcheaba y los items fusionados quedaban fuera
+    del scope sin avisar.
     """
-    if not isinstance(item.source, dict):
-        return False
-    doc_id = item.source.get("document_id")
-    if not isinstance(doc_id, str):
-        return False
-    return any(doc_id.endswith("/" + rel) for rel in allowed)
+    for src in _source_list(item):
+        doc_id = src.get("document_id")
+        if isinstance(doc_id, str) and any(
+            doc_id.endswith("/" + rel) for rel in allowed
+        ):
+            return True
+    return False
 
 
 def _scope_label(
@@ -350,7 +357,7 @@ async def build_grouping_plan(
 
     # (B) semantic clustering over the reps.
     await _emit_stage("embedding", f"embeddings de {len(reps)} enunciados")
-    vectors = embed_texts([r.statement for r in reps])
+    vectors = await embed_texts_cached(session, [r.statement for r in reps])
     sim = vectors @ vectors.T
     await _end_stage("embedding")
     candidates = _duplicate_candidates(

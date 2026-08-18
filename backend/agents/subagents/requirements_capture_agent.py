@@ -22,9 +22,10 @@ bypass them. ``commit_capture`` is the ONLY writer to the DB and reads ONLY
 from the holder (populated by ``extract_requirements`` -> verify_spans) -- no
 tool can inject items, so every persisted requirement is span-verified.
 
-This subagent has NO ``backend``/sandbox: it cannot execute code, so it cannot
-improvise PDF parsing with python. Registered in ``agent_service.build_agent``
-when ``phase == "requirements"``.
+deepagents injects filesystem tools into every subagent spec; the
+``NoFilesystemToolsMiddleware`` in the spec hides them from the model, keeping
+the subagent on its domain tools (no shell improvisation). Registered in
+``agent_service.build_agent`` when ``phase == "requirements"``.
 
 Dispatched by the ``/captura`` command (see ``chat.py::_rewrite_command``),
 which embeds free-form user steering (text after the command) as
@@ -41,6 +42,7 @@ from typing import Any
 from langchain_core.tools import tool
 
 from backend.agents.pipelines.classification import classify_all
+from backend.agents.no_fs_tools import NoFilesystemToolsMiddleware
 from backend.agents.pipelines.consolidation import consolidate, drop_duplicit_implicit
 from backend.agents.pipelines.critique import critique_all
 from backend.agents.pipelines.extraction import (
@@ -182,6 +184,18 @@ saltear):
   reporta y espera al usuario en vez de iterar en vano.
 - Habla en espanol neutro. Se conciso y tecnico. Narra tu razonamiento en 1-3
   frases entre llamadas a tools.
+- Los requerimientos viven en la base de datos del backend, fuera del sandbox:
+  nunca los busques en archivos del workspace (no hay .db ni .sqlite
+  accesibles) — el workspace solo contiene los documentos fuente del proyecto.
+
+AGRUPAMIENTO (/agrupar): NO es una captura. Omite la orientacion,
+check_capture_health y cualquier exploracion del workspace: mapea el alcance
+pedido por el usuario a los argumentos `types`/`documents` y llama a
+`review_grouping` DIRECTAMENTE (la tool lee el store vivo, juzga duplicados y
+persiste el plan). Reporta plan_id, cantidad de grupos y alcance aplicado.
+`list_grouping_plans` solo si el usuario pidio ver planes existentes;
+`apply_grouping_plan` solo tras aprobacion explicita (las fusiones son
+destructivas).
 """
 
 
@@ -199,7 +213,7 @@ def _resolve_target(host_workspace: Path, subpath: str) -> Path:
             f"target '{subpath}' escapes the project workspace"
         )
     if not target.exists():
-        raise ValueError(f"target '{target}' does not exist")
+        raise ValueError(f"target '{subpath or '.'}' does not exist")
     return target
 
 
@@ -1014,9 +1028,10 @@ def make_requirements_capture_agent_subagent(
     -> critique -> classify -> commit) backed by a stateful run-holder, so the
     agent reasons BETWEEN stages instead of firing one atomic tool. Plus
     orient_documents, the health pre-flight, and the shared
-    editing/grouping/vision tools. NO ``backend``/sandbox: the subagent cannot
-    execute code, so it is forced to use ingest_documents (Docling) for
-    ingestion instead of improvising manual parsing. ``commit_capture`` is the
+    editing/grouping/vision tools. deepagents injects FilesystemMiddleware
+    into every subagent spec; ``NoFilesystemToolsMiddleware`` hides those
+    tools from the model so ingestion goes through ingest_documents (Docling)
+    instead of improvised parsing. ``commit_capture`` is the
     only DB writer and reads only from the holder (span-verified items from
     extract_requirements).
     """
@@ -1056,6 +1071,7 @@ def make_requirements_capture_agent_subagent(
             *vision_tools,
         ],
         # deepagents NO propaga el middleware del orquestador a los
-        # subagentes: cada spec necesita su propia guarda de tamaño.
-        "middleware": [SizeGuardMiddleware()],
+        # subagentes (pero SI les inyecta FilesystemMiddleware): cada spec
+        # necesita su guarda de tamaño y su filtro de tools de filesystem.
+        "middleware": [SizeGuardMiddleware(), NoFilesystemToolsMiddleware()],
     }

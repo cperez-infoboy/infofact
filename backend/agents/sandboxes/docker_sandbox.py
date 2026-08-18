@@ -46,6 +46,7 @@ from deepagents.backends.protocol import (
     FileDownloadResponse,
     FileUploadResponse,
     GlobResult,
+    LsResult,
     WriteResult,
 )
 from deepagents.backends.sandbox import BaseSandbox
@@ -132,7 +133,7 @@ class DockerSandbox(BaseSandbox):
         try:
             search = self._glob_search_path(path)
         except ValueError as exc:
-            return GlobResult(error=str(exc))
+            return GlobResult(error=self._bound_error(exc))
         return super().glob(pattern, search)
 
     async def aglob(self, pattern: str, path: str | None = None) -> GlobResult:
@@ -140,8 +141,38 @@ class DockerSandbox(BaseSandbox):
         try:
             search = self._glob_search_path(path)
         except ValueError as exc:
-            return GlobResult(error=str(exc))
+            return GlobResult(error=self._bound_error(exc))
         return await super().aglob(pattern, search)
+
+    def _bound_error(self, exc: ValueError) -> str:
+        """Error que nombra el root valido, para que el modelo se corrija en
+        un turno en vez de iterar paths a ciegas."""
+        return (
+            f"{exc} Use paths relative to the project workspace or absolute "
+            f"under {self.workspace_root}."
+        )
+
+    def ls(self, path: str) -> LsResult:
+        """Ls bounded to this project's workspace.
+
+        ``BaseSandbox.ls`` corre el path CRUDO via ``execute`` sin pasar por
+        ``_safe_path``, asi que un path absoluto fuera del workspace (p.ej.
+        ``/workspaces`` — proyectos hermanos) listaba bien dentro del
+        container. Misma guardia que ``glob``.
+        """
+        try:
+            safe = self._safe_path(path)
+        except ValueError as exc:
+            return LsResult(entries=None, error=self._bound_error(exc))
+        return super().ls(safe)
+
+    async def als(self, path: str) -> LsResult:
+        """Async version of `ls`, same workspace bound."""
+        try:
+            safe = self._safe_path(path)
+        except ValueError as exc:
+            return LsResult(entries=None, error=self._bound_error(exc))
+        return await super().als(safe)
 
     # --- core exec ---------------------------------------------------------
 

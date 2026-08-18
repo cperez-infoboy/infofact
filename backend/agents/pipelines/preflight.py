@@ -115,13 +115,21 @@ def _probe_workspace() -> ProbeResult:
         fd, tmp = tempfile.mkstemp(dir=root, suffix=".preflight")
         os.close(fd)
         os.unlink(tmp)
-        return ProbeResult(name="workspace_writable", ok=True, detail=f"{root} escribible")
+        # Sin el path absoluto: el destinatario es el LLM y el path del host
+        # no existe dentro del sandbox del agente (solo invita a explorarlo).
+        return ProbeResult(
+            name="workspace_writable", ok=True, detail="workspace escribible"
+        )
     except Exception as exc:  # noqa: BLE001
         return ProbeResult(
-            name="workspace_writable", ok=False, detail=f"{type(exc).__name__}: {exc}",
+            name="workspace_writable",
+            ok=False,
+            # Sin str(exc): los mensajes de PermissionError embeben el path
+            # absoluto del host.
+            detail=type(exc).__name__,
             hint=(
-                f"WORKSPACES_HOST_ROOT ({root}) no es escribible. Verificar "
-                "permisos y el montaje HA/NFS."
+                "WORKSPACES_HOST_ROOT no es escribible. Verificar permisos y "
+                "el montaje HA/NFS."
             ),
         )
 
