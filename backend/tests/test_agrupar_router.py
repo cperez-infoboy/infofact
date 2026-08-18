@@ -16,6 +16,7 @@ import json
 import pytest
 
 from backend.routers import chat
+from backend.services import agent_service
 
 
 # --- _is_pure_agrupar ------------------------------------------------------
@@ -67,6 +68,34 @@ def test_rewrite_command_agrupar_with_steering():
 def test_rewrite_command_other_commands_untouched():
     assert chat._rewrite_command("hola") == "hola"
     assert chat._rewrite_command("/srs etc").startswith("[DIRECTIVE]")
+
+
+# --- guardrails de exploración ---------------------------------------------
+
+def test_agrupar_directive_has_anti_exploration_guard():
+    d = chat._agrupar_directive("")
+    # Paridad con _captura/_srs/_analysis: prohibición explícita de explorar.
+    assert "NO explores el sistema de archivos" in d
+    assert "sin ls, glob, read_file ni execute" in d
+    # El dato que faltaba: dónde viven los requerimientos.
+    assert "base de datos del backend" in d
+    assert "NO en archivos del sandbox" in d
+
+
+def test_agrupar_directive_attributes_review_grouping_to_subagent():
+    d = chat._agrupar_directive("")
+    # review_grouping vive en el subagente: la directiva no puede ordenar
+    # al orquestador invocar una tool que no tiene.
+    assert "es el subagente quien invoca `review_grouping`" in d
+    assert "no es una tool tuya" in d
+    assert "Invoca la tool" not in d
+
+
+def test_phase_prompt_states_data_location():
+    prompt = agent_service.PHASE_PROMPTS["requirements"]
+    assert "fuera del sandbox" in prompt
+    assert ".db" in prompt and ".sqlite" in prompt
+    assert "no uses execute para salir del directorio del proyecto" in prompt
 
 
 # --- _summarize_grouping ---------------------------------------------------
