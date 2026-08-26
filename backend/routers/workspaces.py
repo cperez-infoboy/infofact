@@ -7,6 +7,7 @@ Endpoints:
   PUT  /api/workspaces/file?project_id=...&path=... escribe un archivo
   POST /api/workspaces/fs/mkdir|file|move|copy          gestión (explorador)
   DELETE /api/workspaces/fs/entry?project_id=...&path=...  borrar archivo/carpeta
+  GET  /api/workspaces/search?project_id=...&q=...      búsqueda plana (chat @)
   GET  /api/workspaces/download?project_id=...&path=...  descarga binaria
 
 El profile sale del usuario autenticado (Depends(get_current_user)); el
@@ -111,6 +112,28 @@ async def get_tree(
     except ValueError:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid_path")
     return tree
+
+
+@router.get("/search")
+async def search_workspace(
+    project_id: int = Query(..., description="Proyecto dueño del workspace"),
+    q: str = Query("", max_length=256, description="Substring a buscar (vacío = listar)"),
+    limit: int = Query(50, ge=1, le=200, description="Techo de resultados"),
+    user: User = Depends(get_current_user),
+) -> dict:
+    """Busca archivos/carpetas por substring del path relativo.
+
+    Alimenta el autocompletado "@" del chat: ranking basename-prefix >
+    basename > resto del path; con q vacía lista shallow-first. Carpetas
+    incluidas con type="dir".
+    """
+    project = await _resolve_owned_project(project_id, user)
+    try:
+        return await file_service.search_paths(
+            user.profile, project.slug, query=q, limit=limit
+        )
+    except ValueError:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid_path")
 
 
 @router.get("/file", response_model=FileReadOut)

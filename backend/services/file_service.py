@@ -28,6 +28,11 @@ from backend.services.container_service import ensure_container
 
 # Script Python embebido. Recorre `root` con os.walk hasta `max_depth` y emite
 # JSON estable: {name, path, type: "file"|"dir", size, children?}.
+#
+# CONTRATO DE PATHS: todo `path` es relativo a la RAÍZ DEL WORKSPACE, nunca
+# al directorio listado. Así el listado inicial (root=".") y los listados de
+# subdirectorios (loadChildren del explorador) devuelven la misma forma y el
+# frontend puede armar clicks y drags con node.path tal cual.
 # Se ejecuta con `python3 -c "<script>" <root> <max_depth>` dentro del
 # container, working dir = workspace_root del proyecto. Esto evita acoplar la
 # salida a `eza` (que en la imagen actual no soporta --json) o a `ls -la`
@@ -42,7 +47,7 @@ _TREE_SCRIPT = (
     "        return []\n"
     "    out=[]\n"
     "    for e in entries:\n"
-    "        rel=os.path.relpath(e.path,root)\n"
+    "        rel=os.path.normpath(os.path.join(root,os.path.relpath(e.path,root)))\n"
     "        if e.is_dir(follow_symlinks=False):\n"
     "            node={'name':e.name,'path':rel,'type':'dir','size':0}\n"
     "            if depth<max_depth:\n"
@@ -99,6 +104,82 @@ async def list_tree(
     except json.JSONDecodeError as exc:
         # No debería ocurrir: el script siempre print un JSON válido o nada.
         raise RuntimeError(f"tree listing returned non-JSON: {exc}") from exc
+
+
+# Script Python embebido para la búsqueda plana del autocompletado "@" del
+# chat. Recorre el workspace con os.walk (saltando entradas ocultas y con un
+# techo de nodos visitados para acotar workspaces patológicos) y rankea las
+# coincidencias por substring contra el path relativo:
+#   score 0 = el nombre empieza con la consulta
+#   score 1 = la consulta aparece en el nombre
+#   score 2 = la consulta aparece en otra parte del path
+# Desempates: menor profundidad, luego nombre más corto (matche "más justo"),
+# luego alfabético.
+# Con query vacía devuelve todo el árbol plano shallow-first (menor profundidad
+# primero). Se ejecuta igual que _TREE_SCRIPT: `python3 -c <script> <q> <limit>`
+# dentro del container, cwd = raíz del workspace del proyecto.
+_SEARCH_SCRIPT = """
+import json,os,sys
+q=sys.argv[1].strip().lower()
+limit=int(sys.argv[2])
+WALK_CAP=10000
+matches=[]
+seen=0
+stop=False
+for dirpath,dirnames,filenames in os.walk("."):
+    if stop:break
+    dirnames[:]=[d for d in dirnames if not d.startswith(".")]
+    for name,kind in [(d,"dir") for d in dirnames]+[(f,"file") for f in filenames]:
+        if name.startswith("."):continue
+        seen+=1
+        if seen>WALK_CAP:stop=True;break
+        rel=os.path.relpath(os.path.join(dirpath,name))
+        base=name.lower()
+        if q:
+            if base.startswith(q):score=0
+            elif q in base:score=1
+            elif q in rel.lower():score=2
+            else:continue
+            key=(score,rel.count("/"),len(base),base)
+        else:
+            key=(rel.count("/"),base)
+        matches.append((key,{"name":name,"path":rel,"type":kind}))
+matches.sort(key=lambda m:m[0])
+print(json.dumps({
+    "entries":[node for _,node in matches[:limit]],
+    "truncated":stop
+}))
+"""
+
+
+async def search_paths(
+    profile: str,
+    project_slug: str,
+    query: str = "",
+    limit: int = 50,
+) -> dict[str, Any]:
+    """Busca archivos/carpetas del workspace por substring del path relativo.
+
+    Devuelve ``{"entries": [{name, path, type}], "truncated": bool}`` con hasta
+    ``limit`` resultados (ranking basename-prefix > basename > resto del path;
+    con query vacía, listado shallow-first de todo el workspace). Punto de
+    entrada del autocompletado "@" del chat.
+
+    La consulta es dato del script (argv quotado), nunca una ruta, así que no
+    pasa por ``_safe_path``: se recorre siempre desde la raíz del proyecto.
+    """
+    sandbox = await _sandbox(profile, project_slug)
+    result = sandbox.execute(
+        f"python3 -c {shlex.quote(_SEARCH_SCRIPT)} "
+        f"{shlex.quote(query)} {int(limit)}",
+        timeout=15,
+    )
+    if result.exit_code != 0:
+        raise RuntimeError(f"search failed: {result.output.strip()}")
+    try:
+        return json.loads(result.output)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"search returned non-JSON: {exc}") from exc
 
 
 async def read_bytes(profile: str, project_slug: str, path: str) -> bytes:

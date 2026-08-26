@@ -4,7 +4,8 @@
   // colapsables con output truncado.
   //
   // Runes OK (.svelte).
-  import { onMount, onDestroy } from 'svelte';
+  import { onMount, onDestroy, tick } from 'svelte';
+  import { get } from 'svelte/store';
   import {
     messages,
     isStreaming,
@@ -14,7 +15,7 @@
     loadHistoryFromDetail,
     setMessages
   } from '$lib/stores/chat';
-  import { currentSession } from '$lib/stores/project';
+  import { currentSession, currentProjectId } from '$lib/stores/project';
   import type {
     Message,
     UserMessage,
@@ -22,6 +23,14 @@
     ToolMessage
   } from '$lib/stores/chat';
   import { renderMarkdown } from '$lib/utils/markdown';
+  import { searchFiles, type SearchEntry } from '$lib/api/workspaces';
+  import {
+    parseAtTrigger,
+    applySelection,
+    parseMentionSegments,
+    type AtTrigger
+  } from '$lib/utils/atMention';
+  import ChatFilePicker from './ChatFilePicker.svelte';
   import ToolIcon from './ToolIcon.svelte';
   import CaptureStatus from './CaptureStatus.svelte';
   import SrsStatus from './SrsStatus.svelte';
@@ -31,6 +40,28 @@
 
   let input = $state('');
   let container: HTMLDivElement | null = $state(null);
+
+  // --- Mención de archivos con "@" (autocompletado del workspace) --------
+  // Al teclear '@' seguido de texto se abre ChatFilePicker sobre el input:
+  // lista plana filtrada por substring (backend /api/workspaces/search).
+  // Teclado: ↑↓ navegan, Enter/Tab insertan, Esc cierra.
+  const MENTION_LIMIT = 50;
+
+  let textareaEl: HTMLTextAreaElement | null = $state(null);
+  let mention: AtTrigger | null = $state(null);
+  let mentionItems: SearchEntry[] = $state([]);
+  let mentionIndex = $state(0);
+  let mentionLoading = $state(false);
+
+  // Capa espejo del resaltado de menciones (ver markup del input): un div
+  // absoluto DETRÁS del textarea que repinta el texto con los tokens @ruta
+  // enmarcados. El texto de la capa va transparente; los glifos reales
+  // siempre los dibuja el textarea, la espejo solo aporta el resaltado.
+  let mirrorEl: HTMLDivElement | null = $state(null);
+  const mentionSegments = $derived(parseMentionSegments(input));
+  let mentionTimer: ReturnType<typeof setTimeout> | null = null;
+  let mentionSeq = 0;
+
   // Track si el usuario está en el fondo para evitar scroll-fighting.
   let isAtBottom = $state(true);
 
@@ -131,12 +162,136 @@
     if (!text || $isStreaming) return;
     const s = $currentSession;
     if (!s) return;
+    closeMention();
     input = '';
     isAtBottom = true;
     await sendMessage(s.id, text);
   }
 
+  // --- Mención "@": sync del trigger, búsqueda debounced y teclado -------
+
+  /** Recalcula si hay mención activa según el texto y el caret actuales. */
+  function syncMention() {
+    const caret = textareaEl?.selectionStart ?? input.length;
+    mention = parseAtTrigger(input, caret);
+    mentionIndex = 0;
+  }
+
+  /** Programa la búsqueda con debounce corto (una request por pausa tipeo). */
+  function scheduleMentionSearch() {
+    if (mentionTimer !== null) clearTimeout(mentionTimer);
+    if (!mention) return;
+    const query = mention.query;
+    mentionTimer = setTimeout(() => {
+      mentionTimer = null;
+      runMentionSearch(query);
+    }, 150);
+  }
+
+  async function runMentionSearch(query: string) {
+    const projectId = get(currentProjectId);
+    if (!mention || projectId === null) return;
+    const seq = ++mentionSeq; // respuestas viejas no pisan las nuevas
+    mentionLoading = true;
+    try {
+      const res = await searchFiles(projectId, query, MENTION_LIMIT);
+      if (seq !== mentionSeq) return;
+      mentionItems = res.entries;
+    } catch {
+      // Error de red → "sin coincidencias"; el próximo tecleo reintenta.
+      if (seq === mentionSeq) mentionItems = [];
+    } finally {
+      if (seq === mentionSeq) mentionLoading = false;
+    }
+  }
+
+  /** Cierra el popup e invalida cualquier búsqueda en vuelo. */
+  function closeMention() {
+    if (mentionTimer !== null) {
+      clearTimeout(mentionTimer);
+      mentionTimer = null;
+    }
+    mentionSeq++;
+    mention = null;
+    mentionItems = [];
+    mentionLoading = false;
+  }
+
+  function cycleMention(delta: number) {
+    const n = mentionItems.length;
+    if (n === 0) return;
+    mentionIndex = (mentionIndex + delta + n) % n;
+  }
+
+  /** Inserta `@ruta ` en el mensaje y devuelve el focus al textarea. */
+  async function pickMention(item: SearchEntry) {
+    if (!mention || !textareaEl) return;
+    const applied = applySelection(input, mention, item.path);
+    input = applied.text;
+    closeMention();
+    await tick();
+    textareaEl.focus();
+    textareaEl.setSelectionRange(applied.caret, applied.caret);
+  }
+
+  function handleInput() {
+    syncMention();
+    scheduleMentionSearch();
+  }
+
+  /** Alinea la capa espejo cuando el textarea scrollea internamente (texto
+   *  más largo que las filas visibles); si no, el resaltado se desfasa. */
+  function syncMirrorScroll() {
+    if (mirrorEl && textareaEl) {
+      mirrorEl.scrollTop = textareaEl.scrollTop;
+      mirrorEl.scrollLeft = textareaEl.scrollLeft;
+    }
+  }
+
+  /**
+   * Re-sync del trigger al soltar una tecla (mueve el caret sin editar).
+   * Las teclas que maneja el popup NO re-sincronizan: preventDefault evita
+   * que el caret se mueva, pero el keyup igual dispara, y un sync acá
+   * pisa mentionIndex volviendo a la primera fila (navegación imposible).
+   */
+  function handleKeyup(e: KeyboardEvent) {
+    if (
+      e.key === 'ArrowUp' ||
+      e.key === 'ArrowDown' ||
+      e.key === 'Enter' ||
+      e.key === 'Tab' ||
+      e.key === 'Escape'
+    ) {
+      return;
+    }
+    syncMention();
+  }
+
   function handleKeydown(e: KeyboardEvent) {
+    // Precedencia del popup: mientras hay mención activa, el teclado navega
+    // la lista antes de cualquier acción de envío.
+    if (mention) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        cycleMention(1);
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        cycleMention(-1);
+        return;
+      }
+      if ((e.key === 'Enter' || e.key === 'Tab') && mentionItems.length > 0) {
+        e.preventDefault();
+        void pickMention(mentionItems[mentionIndex]);
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        closeMention();
+        return;
+      }
+    }
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleSend();
@@ -240,6 +395,9 @@
   }
 
   let renderItems = $derived(toRenderItems($messages));
+
+  // Al desmontar el panel, limpiar timer/búsquedas pendientes del picker.
+  onDestroy(() => closeMention());
 </script>
 
 <section
@@ -312,9 +470,23 @@
   <div class="p-2 border-t border-border">
     <div class="flex items-stretch gap-2">
       <div class="flex-1 relative">
+        {#if mention}
+          <ChatFilePicker
+            items={mentionItems}
+            activeIndex={mentionIndex}
+            loading={mentionLoading}
+            onpick={(item) => pickMention(item)}
+            onhover={(i) => (mentionIndex = i)}
+          />
+        {/if}
         <textarea
+          bind:this={textareaEl}
           bind:value={input}
           onkeydown={handleKeydown}
+          oninput={handleInput}
+          onclick={syncMention}
+          onkeyup={handleKeyup}
+          onscroll={syncMirrorScroll}
           placeholder={$currentSession
             ? 'escribe un mensaje… (Enter=enviar, Shift+Enter=salto)'
             : 'selecciona una sesión…'}
@@ -322,6 +494,22 @@
           rows="2"
           class="resize-none w-full bg-surface-2 border border-border-strong text-text text-sm px-2 py-1 pl-3 rounded-lg focus:outline-none focus:border-accent focus:shadow-[0_0_0_3px_rgba(247,248,248,0.10)] disabled:opacity-50"
         ></textarea>
+        {#if $currentSession && !$isStreaming && mentionSegments.length > 0}
+          <!-- Capa espejo de menciones: repinta el texto del textarea glifo a
+               glifo (mismas métricas: font/padding/borde) sobre él, con el
+               texto en transparente (los glifos visibles siguen siendo los
+               del textarea de abajo) y cada @ruta enmarcada. No captura
+               eventos (pointer-events-none); absoluto sobre el estático. -->
+          <div
+            bind:this={mirrorEl}
+            aria-hidden="true"
+            class="pointer-events-none absolute inset-0 rounded-lg border border-transparent text-sm px-2 py-1 pl-3 pr-2 text-transparent whitespace-pre-wrap break-words overflow-hidden"
+          >
+            {#each mentionSegments as seg, i (i)}{#if seg.kind === 'mention'}<span
+                class="-mx-px rounded-[3px] bg-accent/15 ring-1 ring-inset ring-accent/60 px-px">{seg.value}</span
+              >{:else}{seg.value}{/if}{/each}
+          </div>
+        {/if}
       </div>
       {#if $isStreaming}
         <button

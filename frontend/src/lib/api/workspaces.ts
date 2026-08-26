@@ -36,6 +36,33 @@ export function getTree(
   return apiFetch<TreeNode>(`/api/workspaces/tree?${qs.toString()}`);
 }
 
+export interface SearchEntry {
+  name: string;
+  path: string;
+  type: 'file' | 'dir';
+}
+
+export interface SearchResults {
+  entries: SearchEntry[];
+  /** true si el walk del workspace llegó a su techo interno de nodos. */
+  truncated?: boolean;
+}
+
+/** Busca archivos/carpetas por substring del path relativo (autocomplete @).
+ *  Con q vacía lista todo shallow-first. Espeja GET /api/workspaces/search. */
+export function searchFiles(
+  projectId: number,
+  q: string,
+  limit: number = 50
+): Promise<SearchResults> {
+  const qs = new URLSearchParams({
+    project_id: String(projectId),
+    q,
+    limit: String(limit)
+  });
+  return apiFetch<SearchResults>(`/api/workspaces/search?${qs.toString()}`);
+}
+
 /** Lee un archivo del workspace como texto UTF-8. */
 export function getFile(projectId: number, path: string): Promise<FileContent> {
   const qs = new URLSearchParams({

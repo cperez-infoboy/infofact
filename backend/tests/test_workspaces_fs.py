@@ -118,6 +118,136 @@ def test_unknown_op(ws):
     assert run_op(ws, "nonsense", "x")["error"] == "unknown_op"
 
 
+# --- 1b. Contrato de paths del script de árbol ----------------------------
+
+
+def run_tree(tmp_path, root: str, max_depth: int = 2) -> dict:
+    """Corre _TREE_SCRIPT como lo hace list_tree (cwd = raíz del workspace)."""
+    res = subprocess.run(
+        [sys.executable, "-c", file_service._TREE_SCRIPT, root, str(max_depth)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert res.returncode == 0, res.stderr
+    return json.loads(res.stdout)
+
+
+def test_tree_paths_are_workspace_relative(ws):
+    """Los `path` del árbol son relativos a la raíz del workspace, TAMBIÉN
+    cuando se lista un subdirectorio (así lo consume loadChildren).
+
+    Regresión: el script devolvía paths relativos al directorio listado y el
+    árbol lazy quedaba con nodos sin el prefijo de su carpeta; los clicks y
+    drags del explorador apuntaban a rutas inexistentes (404 file_not_found
+    al abrir, moves que no movían el archivo indicado).
+    """
+    raiz = run_tree(ws, ".")
+    assert raiz["path"] == "."
+    paths = {c["path"] for c in raiz["children"]}
+    assert "docs" in paths and "img" in paths
+    # Nietos del listado raíz: cadena completa desde la raíz del workspace.
+    docs_node = next(c for c in raiz["children"] if c["path"] == "docs")
+    assert {c["path"] for c in docs_node["children"]} == {
+        "docs/notas.md",
+        "docs/plani.xlsx",
+    }
+
+    # Listado de un subdirectorio: misma forma que el listado raíz.
+    sub = run_tree(ws, "docs")
+    assert sub["path"] == "."
+    assert {c["path"] for c in sub["children"]} == {
+        "docs/notas.md",
+        "docs/plani.xlsx",
+    }
+
+    # Subdirectorio con anidación: el nieto conserva la cadena completa.
+    (ws / "docs" / "sub").mkdir()
+    (ws / "docs" / "sub" / "manual.md").write_text("x")
+    anidado = run_tree(ws, "docs", 2)
+    sub_node = next(c for c in anidado["children"] if c["path"] == "docs/sub")
+    assert sub_node["children"] is not None
+    assert {c["path"] for c in sub_node["children"]} == {"docs/sub/manual.md"}
+    assert {c["path"] for c in run_tree(ws, "img")["children"]} == {"img/logo.png"}
+
+
+# --- 1c. Contrato del script de búsqueda (autocompletado @ del chat) -----
+
+
+def run_search(tmp_path, q: str = "", limit: int = 50) -> dict:
+    """Corre _SEARCH_SCRIPT como lo hace search_paths (cwd = raíz)."""
+    res = subprocess.run(
+        [sys.executable, "-c", file_service._SEARCH_SCRIPT, q, str(limit)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert res.returncode == 0, res.stderr
+    return json.loads(res.stdout)
+
+
+def test_search_ranks_basename_prefix_then_substring(ws):
+    """Ranking: prefix-de-basename > substring-de-basename > resto-del-path."""
+    (ws / "docs" / "notas-final.md").write_text("x")
+    # prefix de basename (score 0) va primero; empate → menor profundidad.
+    out = run_search(ws, "nota")
+    paths = [e["path"] for e in out["entries"]]
+    assert paths[0] == "docs/notas.md"
+    assert set(paths) >= {"docs/notas.md", "docs/notas-final.md"}
+    # substring de path (score 2): 'png' solo aparece en img/logo.png.
+    assert [e["path"] for e in run_search(ws, "png")["entries"]] == ["img/logo.png"]
+
+
+def test_search_is_case_insensitive_and_returns_types(ws):
+    # Case-insensitive sobre el nombre del archivo.
+    entry = next(
+        e for e in run_search(ws, "PNG")["entries"] if e["path"] == "img/logo.png"
+    )
+    assert entry["type"] == "file"
+    # El directorio se reporta cuando SU nombre matchea (para poder
+    # seleccionar carpetas con @), con type dir.
+    dir_entry = next(
+        e for e in run_search(ws, "IMG")["entries"] if e["path"] == "img"
+    )
+    assert dir_entry["type"] == "dir"
+
+
+def test_search_empty_query_lists_shallow_first_with_cap(ws):
+    (ws / "raiz.md").write_text("x")
+    out = run_search(ws, "", limit=100)
+    depths = {e["path"]: e["path"].count("/") for e in out["entries"]}
+    ordered = [e["path"] for e in out["entries"]]
+    listed = sorted(ordered)
+    assert listed == ["docs", "docs/notas.md", "docs/plani.xlsx", "img", "img/logo.png", "raiz.md"]
+    # Shallow-first: ningún depth-1 antes de que terminen los depth-0.
+    seen_depth_one = False
+    for p in ordered:
+        if depths[p] >= 1:
+            seen_depth_one = True
+        elif seen_depth_one:
+            raise AssertionError(f"depth-0 fuera de orden: {p}")
+    # Cap respetado.
+    capped = run_search(ws, "", limit=3)
+    assert len(capped["entries"]) == 3
+    assert set(capped) == {"entries", "truncated"}
+
+
+def test_search_skips_hidden_entries(ws):
+    (ws / ".git").mkdir()
+    (ws / ".git" / "config").write_text("x")
+    (ws / ".secret").write_text("x")
+    for q in ("config", "secret", ""):
+        paths = [e["path"] for e in run_search(ws, q)["entries"]]
+        assert not any(p.startswith(".git") or "/.git" in p for p in paths), q
+        assert not any(p.startswith(".") or "/." in p for p in paths), q
+
+
+def test_search_no_match_returns_empty_list(ws):
+    assert run_search(ws, "zzz-inexistente") == {"entries": [], "truncated": False}
+
+
 # --- 2. Router: mapeo de errores -----------------------------------------
 
 
@@ -238,6 +368,25 @@ def test_download_maps_not_found(monkeypatch, owned):
         workspaces.download_file, project_id=1, path="docs/x.pdf", user=_FakeUser()
     )
     assert code == "file_not_found"
+
+
+def test_search_endpoint_forwards_query_and_limit(monkeypatch, owned):
+    captured: dict = {}
+
+    async def fake_search(profile, slug, *, query, limit):
+        captured["args"] = (profile, slug, query, limit)
+        return {"entries": [{"name": "srs.md", "path": "docs/srs.md", "type": "file"}], "truncated": False}
+
+    monkeypatch.setattr(file_service, "search_paths", fake_search)
+
+    out = asyncio.run(
+        workspaces.search_workspace(project_id=1, q="srs", limit=10, user=_FakeUser())
+    )
+    assert out == {
+        "entries": [{"name": "srs.md", "path": "docs/srs.md", "type": "file"}],
+        "truncated": False,
+    }
+    assert captured["args"] == ("tester", "mi-proyecto", "srs", 10)
 
 
 def test_download_response_headers(monkeypatch, owned):
