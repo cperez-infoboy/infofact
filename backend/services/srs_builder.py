@@ -334,7 +334,11 @@ def _render_single_item(it: RequirementItem) -> list[str]:
     """Render a single requirement item as Markdown lines."""
     lines: list[str] = [f"#### `{it.code}`", ""]
     lines.append(it.statement)
-    lines.append("")
+    meta_bits = [
+        f"**Prioridad:** {_PRIORITY_LABELS[it.priority]}",
+        f"**Tipo:** {_TYPE_LABELS[it.type]}",
+    ]
+    lines += ["", " · ".join(meta_bits), ""]
     src = _fmt_source(it)
     if src:
         lines += [src, ""]

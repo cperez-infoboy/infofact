@@ -80,7 +80,7 @@ def test_draft_narrative_features_from_live_items():
 
 
 def test_draft_narrative_features_truncates_long_statements():
-    long_stmt = "El sistema debe " + "x" * 100
+    long_stmt = "El sistema debe " + "x" * 200
     mock_item = SimpleNamespace(
         code="REQ-CD34",
         statement=long_stmt,
@@ -88,13 +88,61 @@ def test_draft_narrative_features_truncates_long_statements():
         status=ReqStatus.VALIDATED,
     )
     n = _draft_narrative("Test", "", {}, {}, {}, 1, live_items=[mock_item])
-    # Each bullet line should be truncated to ~80 chars + ellipsis.
+    # Each bullet line should be truncated to ~120 chars + ellipsis.
     for line in n["overall.features"].split("\n"):
         if "REQ-CD34" in line:
             assert "…" in line
             # statement portion after "— " should be short.
             stmt_part = line.split("— ", 1)[1] if "— " in line else ""
-            assert len(stmt_part) <= 85
+            assert len(stmt_part) <= 125
+
+
+def test_draft_narrative_features_grouped_by_goal():
+    mock_item = SimpleNamespace(
+        code="REQ-AB12",
+        statement="El sistema debe permitir registrar usuarios vía Google OAuth.",
+        type=SimpleNamespace(value="functional"),
+        status=ReqStatus.VALIDATED,
+    )
+    goal_groups = [("GOAL-F1", "Autenticación del sistema", [mock_item])]
+    n = _draft_narrative(
+        "Test", "", {}, {}, {}, 1,
+        live_items=[mock_item],
+        goal_groups=goal_groups,
+    )
+    features = n["overall.features"]
+    assert "**`GOAL-F1`** — Autenticación del sistema" in features
+    assert "REQ-AB12" in features
+    assert "Sin goal asociado" not in features
+
+
+def test_draft_narrative_features_unlinked_bucket():
+    mock_item = SimpleNamespace(
+        code="REQ-AB12",
+        statement="El sistema debe permitir registrar usuarios.",
+        type=SimpleNamespace(value="functional"),
+        status=ReqStatus.VALIDATED,
+    )
+    n = _draft_narrative(
+        "Test", "", {}, {}, {}, 1,
+        live_items=[mock_item],
+        goal_groups=[],
+    )
+    assert "Sin goal asociado" in n["overall.features"]
+    assert "REQ-AB12" in n["overall.features"]
+
+
+def test_draft_narrative_features_shows_moscow_and_type():
+    mock_item = SimpleNamespace(
+        code="REQ-AB12",
+        statement="El sistema debe hacer X.",
+        type=SimpleNamespace(value="functional"),
+        priority=SimpleNamespace(value="must"),
+        status=ReqStatus.VALIDATED,
+    )
+    n = _draft_narrative("Test", "", {}, {}, {}, 1, live_items=[mock_item])
+    features = n["overall.features"]
+    assert "(MUST · Requerimientos funcionales)" in features
 
 
 # ---------------------------------------------------------------------------
@@ -309,6 +357,18 @@ def test_render_single_item_basic():
     md = "\n".join(lines)
     assert "#### `REQ-01`" in md
     assert "El sistema debe hacer X." in md
+
+
+def test_render_single_item_shows_priority_and_type():
+    it = _mock_item(
+        "REQ-01",
+        "El sistema debe hacer X.",
+        rtype=ReqType.SECURITY,
+        priority=Priority.SHOULD,
+    )
+    md = "\n".join(_render_single_item(it))
+    assert "**Prioridad:** Should (deseable)" in md
+    assert "**Tipo:** Seguridad" in md
 
 
 def test_render_single_item_with_acceptance_criteria():

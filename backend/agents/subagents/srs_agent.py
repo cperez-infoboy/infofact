@@ -44,6 +44,7 @@ from backend.services.requirement_store import list_requirements
 from backend.services.srs_assembler import (
     SRS_STRUCTURE,
     _draft_narrative,
+    _functional_goal_groups,
     draft_narrative_llm,
 )
 from backend.services.srs_builder import build_srs
@@ -492,6 +493,9 @@ pidio ajustar.
                     session, project_id, include_deleted=True
                 )
             live = [it for it in items if it.status in _LIVE_STATUSES]
+            goal_groups = await _functional_goal_groups(
+                session, project_id, live
+            )
 
             # Narrativa determinista como base/fallback.
             det_narrative = _draft_narrative(
@@ -502,6 +506,7 @@ pidio ajustar.
                 run.goals_summary or {},
                 len(live),
                 live_items=live,
+                goal_groups=goal_groups,
             )
             # Enriquecer con LLM (fallback determinista on failure).
             narrative = await draft_narrative_llm(
@@ -591,6 +596,9 @@ y limpia el holder.
                         run.goals_summary or {},
                         len(live),
                         live_items=live,
+                        goal_groups=await _functional_goal_groups(
+                            session, project_id, live
+                        ),
                     )
                 # Proyeccion Markdown (con narrative + structure 29148).
                 built = await build_srs(

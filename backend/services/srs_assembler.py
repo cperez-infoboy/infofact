@@ -22,8 +22,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.agents.llm import structured_llm
 from backend.agents.retrieval import store as retrieval
 from backend.services.goals_engine import infer_goals
+from sqlalchemy import select
+
+from backend.models.srs import Goal, GoalLink
 from backend.services.requirement_store import list_requirements
-from backend.services.srs_builder import SRS_STRUCTURE, build_srs
+from backend.services.srs_builder import (
+    _TYPE_LABELS,
+    SRS_STRUCTURE,
+    build_srs,
+)
 from backend.services.srs_coverage import compute_coverage
 from backend.services.srs_quality import analyze_quality
 from backend.services.srs_store import build_traceability, replace_findings
@@ -117,6 +124,18 @@ _NARRATIVE_SYSTEM = (
 )
 
 
+def _feature_line(it: Any) -> str:
+    """Línea de requerimiento para la sección 2.2: MoSCoW + tipo + resumen."""
+    stmt = it.statement or ""
+    # Truncate to ~120 chars at word boundary (overview, no catálogo completo).
+    if len(stmt) > 120:
+        stmt = stmt[:117].rsplit(" ", 1)[0] + "…"
+    prio = getattr(getattr(it, "priority", None), "value", "?").upper()
+    type_val = getattr(getattr(it, "type", None), "value", "?")
+    type_label = _TYPE_LABELS.get(type_val, type_val)
+    return f"- `{it.code}` ({prio} · {type_label}) — {stmt}"
+
+
 def _draft_narrative(
     project_name: str,
     project_description: str,
@@ -125,6 +144,7 @@ def _draft_narrative(
     goals_summary: dict[str, Any],
     live_count: int,
     live_items: list | None = None,
+    goal_groups: list[tuple[str, str, list]] | None = None,
 ) -> dict[str, str]:
     """Borrador de la prosa editable por subsection.
 
@@ -183,21 +203,30 @@ def _draft_narrative(
     )
     overall_perspective = "\n\n".join(overall_perspective_parts)
 
-    # Deterministic: bullet list from functional items.
+    # Deterministic: funcionalidades agrupadas por goal funcional (sección 2.2).
+    # Cada ítem muestra MoSCoW + tipo; el catálogo formal vive en secciones 4-8.
     if live_items:
         func_items = [
             it for it in live_items
             if it.type.value == "functional" and it.status in _LIVE_STATUSES
         ]
         if func_items:
-            features_lines = []
-            for it in func_items:
-                stmt = it.statement or ""
-                # Truncate to ~80 chars at word boundary.
-                if len(stmt) > 80:
-                    stmt = stmt[:77].rsplit(" ", 1)[0] + "…"
-                features_lines.append(f"- `{it.code}` — {stmt}")
-            overall_features = "\n".join(features_lines)
+            linked: set[int] = set()
+            features_lines: list[str] = []
+            for goal_code, goal_stmt, gitems in goal_groups or []:
+                features_lines.append(f"**`{goal_code}`** — {goal_stmt}")
+                features_lines.append("")
+                for it in gitems:
+                    linked.add(id(it))
+                    features_lines.append(_feature_line(it))
+                features_lines.append("")
+            unlinked = [it for it in func_items if id(it) not in linked]
+            if unlinked:
+                features_lines.append("**Sin goal asociado**")
+                features_lines.append("")
+                for it in unlinked:
+                    features_lines.append(_feature_line(it))
+            overall_features = "\n".join(features_lines).strip()
         else:
             overall_features = "_Sin requerimientos funcionales para listar._"
     else:
@@ -460,6 +489,53 @@ async def draft_narrative_llm(
     return updated
 
 
+async def _functional_goal_groups(
+    session: AsyncSession,
+    project_id: int,
+    live_items: list,
+) -> list[tuple[str, str, list]]:
+    """Agrupa requerimientos funcionales vivos bajo su goal funcional.
+
+    Devuelve ``(goal_code, goal_statement, items)`` para cada goal funcional
+    que tenga al menos un requerimiento funcional vivo enlazado (relación
+    ``realizes``/``contributes``). Los ítems sin goal quedan fuera; la sección
+    2.2 los lista bajo "Sin goal asociado" en ``_draft_narrative``.
+    """
+    goals = list(
+        await session.scalars(
+            select(Goal).where(
+                Goal.project_id == project_id,
+                Goal.kind == "functional_goal",
+            )
+        )
+    )
+    if not goals:
+        return []
+    links = list(
+        await session.scalars(
+            select(GoalLink).where(
+                GoalLink.goal_id.in_([g.id for g in goals])
+            )
+        )
+    )
+    live_by_id = {it.id: it for it in live_items if it.id is not None}
+    groups: list[tuple[str, str, list]] = []
+    for g in goals:
+        gitems = []
+        for gl in links:
+            if gl.goal_id != g.id:
+                continue
+            it = live_by_id.get(gl.req_id)
+            if it is None:
+                continue
+            if it.type.value != "functional" or it.status not in _LIVE_STATUSES:
+                continue
+            gitems.append(it)
+        if gitems:
+            groups.append((g.code, g.statement, gitems))
+    return groups
+
+
 async def assemble_srs(
     session: AsyncSession,
     project_id: int,
@@ -494,6 +570,9 @@ async def assemble_srs(
     codes = [it.code for it in live]
 
     # 7. Narrativa editable (borrador con subsections).
+    # Agrupación de funcionales por goal para la sección 2.2 (overview).
+    goal_groups = await _functional_goal_groups(session, project_id, live)
+
     narrative = _draft_narrative(
         project_name,
         project_description,
@@ -502,6 +581,7 @@ async def assemble_srs(
         goals_summary,
         len(live),
         live_items=live,
+        goal_groups=goal_groups,
     )
 
     # 8. Cuerpo Markdown (proyección con narrative + structure).
