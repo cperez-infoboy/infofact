@@ -24,6 +24,7 @@ path. See the plan at ~/.claude/plans/quiero-explorar-una-nueva-purring-swing.md
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -48,7 +49,18 @@ STAGE_COMMIT = "commit"
 # Default per-stage loop cap. An agent re-running one stage more than this many
 # times is almost certainly stuck; the stage tool refuses past the cap and asks
 # the model to surface the problem to the user instead.
+#
+# Env-tunable (``INFOFACT_STAGE_CAP``): un cap fijo de 3 resultó demasiado
+# chico cuando cada intento ya consumió 3 parse-retries internos contra un
+# proveedor caído (incidente stage_loop_exceeded de Planitrack2.0) — con la
+# degradación grácil de los jueces el cap casi no se alcanza, pero poder
+# subirlo sin rebuild permite calibrar contra un proveedor inestable.
 DEFAULT_STAGE_CAP = 3
+
+
+def stage_cap() -> int:
+    """Resolve the per-stage loop cap from the environment at call time."""
+    return int(os.environ.get("INFOFACT_STAGE_CAP", str(DEFAULT_STAGE_CAP)))
 
 _REQUIRED_BEFORE_COMMIT = (
     STAGE_INGEST,
@@ -114,13 +126,16 @@ class CaptureRun:
     calls: dict[str, int] = field(default_factory=dict)
     stages_done: set[str] = field(default_factory=set)
 
-    def bump(self, stage: str, cap: int = DEFAULT_STAGE_CAP) -> int:
+    def bump(self, stage: str, cap: int | None = None) -> int:
         """Count one call of ``stage``; raise past ``cap``.
 
         Returns the new call count. Caps are PER STAGE and PERSIST across a
         re-ingest (the counters are not cleared when the ingest fields are
         reset), so re-ingesting cannot dodge the loop cap on later stages.
+        ``cap`` defaults to ``stage_cap()`` (env ``INFOFACT_STAGE_CAP``).
         """
+        if cap is None:
+            cap = stage_cap()
         n = self.calls.get(stage, 0) + 1
         self.calls[stage] = n
         if n > cap:

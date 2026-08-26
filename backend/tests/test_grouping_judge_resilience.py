@@ -11,8 +11,10 @@ Pines de esta suite:
   veredictos de todos los batches se agregan sin perder pares.
 - Cada llamada pasa por ``_invoke_with_retry``: un error transitorio
   (``APIConnectionError``) reintenta con backoff en vez de abortar.
-- Agotados los reintentos transitorios, la excepción propaga: abortar o
-  aplicar un sentinel es decisión del caller, no del retry.
+- Agotados los reintentos, el lote degrada (``([], failed>=1)``) en vez de
+  propagar: la etapa sigue y el caller reporta la degradación (incidente
+  Planitrack2.0 sesion 47 — proveedor devolviendo content='' abortaba la
+  captura entera vía stage_loop_exceeded).
 - ``run_grouping_review`` registra el traceback (``logger.exception``) para
   que ``docker logs`` tenga la evidencia que antes se perdía.
 
@@ -109,8 +111,9 @@ async def test_pairs_are_batched_and_verdicts_aggregated(monkeypatch):
 
     items = _items(90)
     candidates = [(i, i + 45) for i in range(45)]
-    confirmed = await consolidation._judge_duplicates(items, candidates)
+    confirmed, failed = await consolidation._judge_duplicates(items, candidates)
 
+    assert failed == 0
     assert len(stub.calls) == 2
     assert [_pairs_per_call(c) for c in stub.calls] == [40, 5]
     assert len(confirmed) == 45
@@ -125,10 +128,11 @@ async def test_small_candidate_sets_stay_single_call(monkeypatch):
         consolidation, "structured_llm", lambda schema, extra_body=None: stub
     )
 
-    confirmed = await consolidation._judge_duplicates(
+    confirmed, failed = await consolidation._judge_duplicates(
         _items(4), [(0, 1), (2, 3)]
     )
 
+    assert failed == 0
     assert len(stub.calls) == 1
     assert sorted(confirmed) == [(0, 1), (2, 3)]
 
@@ -144,25 +148,33 @@ async def test_transient_connection_error_is_retried(monkeypatch, no_backoff):
         consolidation, "structured_llm", lambda schema, extra_body=None: stub
     )
 
-    confirmed = await consolidation._judge_duplicates(
+    confirmed, failed = await consolidation._judge_duplicates(
         _items(4), [(0, 1), (2, 3)]
     )
 
+    assert failed == 0
     assert len(stub.calls) == 3  # 2 fallos + 1 éxito
     assert sorted(confirmed) == [(0, 1), (2, 3)]
 
 
 @pytest.mark.asyncio
-async def test_transient_exhaustion_propagates(monkeypatch, no_backoff):
-    """Agotados los reintentos, la excepción propaga: decide el caller."""
+async def test_transient_exhaustion_degrades_instead_of_raising(
+    monkeypatch, no_backoff
+):
+    """Agotados los reintentos, el lote degrada conservadoramente: cero pares
+    confirmados + failed=1 — nunca revienta la etapa (contrato nuevo tras el
+    incidente stage_loop_exceeded de Planitrack2.0)."""
     stub = _JudgeStub(failures=_resilience._TRANSIENT_RETRIES)
     monkeypatch.setattr(
         consolidation, "structured_llm", lambda schema, extra_body=None: stub
     )
 
-    with pytest.raises(APIConnectionError):
-        await consolidation._judge_duplicates(_items(2), [(0, 1)])
+    confirmed, failed = await consolidation._judge_duplicates(
+        _items(2), [(0, 1)]
+    )
 
+    assert confirmed == []
+    assert failed == 1
     assert len(stub.calls) == _resilience._TRANSIENT_RETRIES
 
 
@@ -327,7 +339,9 @@ async def test_judge_batches_run_concurrently_bounded(monkeypatch):
     candidates = [(i, i + 5) for i in range(5)] + [
         (i, i + 2) for i in range(5)
     ]  # 10 pares -> 5 lotes de 2
-    confirmed = await consolidation._judge_duplicates(items, candidates)
+    confirmed, failed = await consolidation._judge_duplicates(items, candidates)
+
+    assert failed == 0
 
     assert len(confirmed) == 10  # ningun par se pierde con el fan-out
     assert peak == 2  # acotado por el semaforo

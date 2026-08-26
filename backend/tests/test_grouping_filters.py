@@ -93,7 +93,7 @@ def deterministic(monkeypatch):
     )
 
     async def _no_judge(_reqs, _candidates, on_progress=None):
-        return []
+        return [], 0
 
     monkeypatch.setattr(grouping, "_judge_duplicates", _no_judge)
 

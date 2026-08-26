@@ -102,6 +102,10 @@ class GroupingPlan:
     # Wall-clock (ms) per stage when the run carries ``on_progress`` (progress
     # banner). Informational only: persist_plan reads ``.groups`` alone.
     timings: dict[str, int] = field(default_factory=dict)
+    # Lotes del juez LLM que agotaron sus reintentos (proveedor caído): sus
+    # pares quedaron sin confirmar y NO se fusionaron. Informativo — permite
+    # que /agrupar avise que el plan puede tener menos grupos de los esperables.
+    judge_failed_batches: int = 0
 
     @classmethod
     def empty(
@@ -365,7 +369,15 @@ async def build_grouping_plan(
         max_duplicate_candidates,
     )
     await _emit_stage("judge", f"juzgando pares borderline ({len(candidates)})")
-    confirmed = await _judge_duplicates(reps, candidates, on_progress=on_progress)
+    confirmed, judge_failed_batches = await _judge_duplicates(
+        reps, candidates, on_progress=on_progress
+    )
+    if judge_failed_batches:
+        logger.warning(
+            "build_grouping_plan: %d lote(s) del juez agotaron sus reintentos; "
+            "esos pares quedan sin fusionar (conservador)",
+            judge_failed_batches,
+        )
     await _end_stage("judge")
     await _emit_stage("cluster", "clustering y armado de grupos")
     clusters = _cluster_duplicates(
@@ -422,6 +434,7 @@ async def build_grouping_plan(
         considered=considered,
         scope=scope,
         timings=timings,
+        judge_failed_batches=judge_failed_batches,
     )
 
 

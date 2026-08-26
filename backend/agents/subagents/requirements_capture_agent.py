@@ -145,6 +145,10 @@ Flujo:
      item nace aca, verificado por source_span. No inventes items.
    - consolidate_requirements: detecta duplicados y contradicciones y los
      propone (eventos conflict.found en vivo). No los resuelvas solo.
+     * Si devuelve judge_degraded=true, el juez LLM fallo para algunos lotes:
+     la etapa igual COMPLETO (conservador: esos pares quedaron distintos),
+     pero avisa al usuario que los duplicados/contradicciones reportados
+     pueden estar incompletos y se pueden cubrir despues con /agrupar.
    - critique_requirements: filtra leyendas/boilerplate/meta-instrucciones y
      marca items para revision. Si el rechazo parece alto, comenta el
      inventario vs los extraidos (posible sub-extraccion o mucho ruido).
@@ -848,12 +852,23 @@ def _make_stage_tools(
             STAGE_CONSOLIDATE, "consolidación lista",
             {"phase": "end", "elapsed_ms": round(run.timings[STAGE_CONSOLIDATE])},
         )
-        return {
+        failed_batches = cons.stats.get("dup_judge_failed_batches", 0)
+        contradict_failed = cons.stats.get("contradict_judge_failed", 0)
+        out = {
             "items": len(cons.items),
             "duplicates": len(cons.duplicates),
             "contradictions": len(cons.contradictions),
             "stages_done": sorted(run.stages_done),
         }
+        if failed_batches or contradict_failed:
+            # Degradación grácil: el/los jueces LLM agotaron sus reintentos
+            # (p.ej. proveedor devolviendo respuestas vacías). La etapa
+            # COMPLETÓ igual (los pares afectados quedaron DISTINCT, nunca se
+            # fusiona sin confirmación) — avisar para que el usuario sepa que
+            # la señal de duplicados/contradicciones puede estar incompleta.
+            out["judge_degraded"] = True
+            out["judge_failed_batches"] = failed_batches + contradict_failed
+        return out
 
     @tool
     async def critique_requirements() -> dict:

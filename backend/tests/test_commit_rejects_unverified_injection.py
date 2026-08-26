@@ -103,7 +103,7 @@ def _stub_pipeline(monkeypatch) -> None:
     async def _consolidate(extracted):
         items = [types.SimpleNamespace(id="r1"), types.SimpleNamespace(id="r2")]
         return types.SimpleNamespace(
-            items=items, duplicates=[], contradictions=[])
+            items=items, duplicates=[], contradictions=[], stats={})
     monkeypatch.setattr(mod, "consolidate", _consolidate)
 
     async def _critique_all(items, **kw):

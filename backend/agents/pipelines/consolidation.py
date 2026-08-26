@@ -423,9 +423,16 @@ def _contradiction_candidates(items, sim, threshold: float, cap: int):
 async def _judge_contradictions(
     items: list[RawRequirement],
     candidates: list[tuple[int, int]],
-) -> list[ContradictionPair]:
+) -> tuple[list[ContradictionPair], bool]:
+    """Judge contradiction candidates. Returns ``(pairs, judge_failed)``.
+
+    A judge that exhausts its retries (transient or parse — incidente real:
+    proveedor devolviendo content='') NO revienta la etapa: se devuelve
+    ``([], True)`` y la degradacion se reporta via stats. Proponer cero
+    contradicciones es conservador — no se pierden items, solo signal.
+    """
     if not candidates:
-        return []
+        return [], False
     llm = structured_llm(ContradictionReport)
     lines = []
     for n, (i, j) in enumerate(candidates, start=1):
@@ -434,14 +441,26 @@ async def _judge_contradictions(
             f"    B ({items[j].id}): {items[j].statement}"
         )
     user = "Judge each pair below:\n\n" + "\n\n".join(lines)
-    report = await llm.ainvoke([("system", _CONTRADICTION_SYSTEM), ("human", user)])
+    try:
+        report = await _invoke_with_retry(
+            llm,
+            [("system", _CONTRADICTION_SYSTEM), ("human", user)],
+            context_label="consolidation.judge_contradictions",
+        )
+    except Exception as exc:  # noqa: BLE001 — degrade, never abort the stage
+        logger.warning(
+            "judge_contradictions: exhausted retries (%s); degrading to zero "
+            "proposed contradictions",
+            type(exc).__name__,
+        )
+        return [], True
     out: list[ContradictionPair] = []
     for v in report.verdicts:
         if v.contradicts:
             out.append(ContradictionPair(
                 a_id=v.a_id, b_id=v.b_id, reason=v.reason, confidence=v.confidence,
             ))
-    return out
+    return out, False
 
 
 # ---------------------------------------------------------------------------
@@ -522,17 +541,20 @@ async def _judge_duplicates(
     items: list[RawRequirement],
     candidates: list[tuple[int, int]],
     on_progress=None,
-) -> list[tuple[int, int]]:
-    """Judge borderline duplicate candidates. Returns the index pairs confirmed
-    as REAL duplicates (to be unioned). Distinct pairs are left alone so both
-    requirements survive.
+) -> tuple[list[tuple[int, int]], int]:
+    """Judge borderline duplicate candidates.
 
-    The pairs are judged in batches of ``DEFAULT_DUPLICATE_JUDGE_BATCH`` and
-    each call goes through the shared ``_invoke_with_retry``: transient
-    failures (connection/429/5xx) back off and retry per batch instead of
-    aborting the whole review, and no single oversized upload reaches the
-    provider. Verdicts from every batch are aggregated; exhaustion after all
-    retries propagates so the caller decides (error dict / sentinel).
+    Returns ``(confirmed_pairs, failed_batches)``. Confirmed pairs are index
+    pairs judged as REAL duplicates (to be unioned). Distinct pairs are left
+    alone so both requirements survive.
+
+    A batch that exhausts its retries (transient or parse) does NOT propagate
+    — incidente real (Planitrack2.0 sesion 47): el proveedor devolvia content='',
+    ``model_validate_json('')`` escapaba de la tool, el agente re-llamaba la
+    etapa y ``stage_loop_exceeded`` abortaba la captura entera. Ahora el lote
+    fallido se descarta de forma CONSERVADORA: sus pares quedan DISTINCT (nunca
+    se fusiona sin confirmacion del juez) y se cuenta en ``failed_batches``
+    para que la etapa reporte la degradacion al usuario.
 
     ``on_progress`` (optional, async) receives one event per batch
     (``{stage: "judge", current, total}``) for the /agrupar progress banner;
@@ -545,7 +567,7 @@ async def _judge_duplicates(
     plus a generous ``max_tokens`` ceiling against runaway generation.
     """
     if not candidates:
-        return []
+        return [], 0
     extra_body = disable_thinking_body()
     llm = structured_llm(DuplicateReport, extra_body=extra_body)
     id_to_idx = {items[i].id: i for i in range(len(items))}
@@ -557,7 +579,7 @@ async def _judge_duplicates(
 
     async def _judge_batch(
         n_batch: int, batch: list[tuple[int, int]]
-    ) -> list[tuple[int, int]]:
+    ) -> tuple[list[tuple[int, int]], bool]:
         async with sem:
             if on_progress is not None:
                 await on_progress({
@@ -580,17 +602,25 @@ async def _judge_duplicates(
                 # razonamiento activo un max_tokens corto truncaría el JSON
                 # y quemaría los reintentos de parseo.
                 extra["max_tokens"] = len(batch) * 50 + 500
-            report = await _invoke_with_retry(
-                llm,
-                [("system", _DUPLICATE_SYSTEM), ("human", user)],
-                context_label=f"consolidation.judge_duplicates[{n_batch}]",
-                extra=extra or None,
-            )
+            try:
+                report = await _invoke_with_retry(
+                    llm,
+                    [("system", _DUPLICATE_SYSTEM), ("human", user)],
+                    context_label=f"consolidation.judge_duplicates[{n_batch}]",
+                    extra=extra or None,
+                )
+            except Exception as exc:  # noqa: BLE001 — lote degradado, no abortar
+                logger.warning(
+                    "judge_duplicates[%d/%d]: exhausted retries (%s); batch "
+                    "degrades to zero confirmed pairs",
+                    n_batch, total_batches, type(exc).__name__,
+                )
+                return [], True
             pairs: list[tuple[int, int]] = []
             for v in report.verdicts:
                 if v.is_duplicate and v.a_id in id_to_idx and v.b_id in id_to_idx:
                     pairs.append((id_to_idx[v.a_id], id_to_idx[v.b_id]))
-            return pairs
+            return pairs, False
 
     # Fan-out acotado: los lotes son independientes y el orden de agregacion
     # es irrelevante (lista plana de pares confirmados). El dispatch es FIFO
@@ -600,9 +630,10 @@ async def _judge_duplicates(
         *(_judge_batch(n, b) for n, b in batches)
     )
     confirmed: list[tuple[int, int]] = [
-        pair for result in batch_results for pair in result
+        pair for pairs, _failed in batch_results for pair in pairs
     ]
-    return confirmed
+    failed_batches = sum(1 for _pairs, failed in batch_results if failed)
+    return confirmed, failed_batches
 
 
 # ---------------------------------------------------------------------------
@@ -651,7 +682,9 @@ async def consolidate(
         reps, sim, duplicate_threshold, strict_duplicate_threshold,
         max_duplicate_candidates,
     )
-    confirmed_dup_pairs = await _judge_duplicates(reps, dup_candidates)
+    confirmed_dup_pairs, dup_judge_failed = await _judge_duplicates(
+        reps, dup_candidates
+    )
     clusters = _cluster_duplicates(
         reps, sim, strict_duplicate_threshold, confirmed_dup_pairs,
     )
@@ -668,6 +701,7 @@ async def consolidate(
             ))
     stats["dup_candidates_borderline"] = len(dup_candidates)
     stats["dup_confirmed"] = len(confirmed_dup_pairs)
+    stats["dup_judge_failed_batches"] = dup_judge_failed
     stats["after_semantic"] = len(kept)
     stats["duplicate_groups"] = len(duplicates)
 
@@ -675,9 +709,12 @@ async def consolidate(
     candidates = _contradiction_candidates(
         reps, sim, contradict_threshold, max_contradict_candidates,
     )
-    contradictions = await _judge_contradictions(reps, candidates)
+    contradictions, contradict_judge_failed = await _judge_contradictions(
+        reps, candidates
+    )
     stats["contradict_candidates"] = len(candidates)
     stats["contradictions"] = len(contradictions)
+    stats["contradict_judge_failed"] = int(contradict_judge_failed)
 
     logger.info(
         "consolidate: %d in -> %d after exact -> %d after semantic, "

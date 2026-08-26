@@ -102,7 +102,7 @@ async def test_judge_duplicates_emits_progress_per_batch(monkeypatch):
 
     items = _items(90)
     candidates = [(i, i + 45) for i in range(45)]
-    confirmed = await consolidation._judge_duplicates(
+    confirmed, _failed = await consolidation._judge_duplicates(
         items, candidates, on_progress=on_progress
     )
 
@@ -126,7 +126,7 @@ async def test_build_grouping_plan_emits_stage_sequence(monkeypatch, tmp_path):
     )
 
     async def _no_judge(_reqs, _cands, on_progress=None):
-        return []
+        return [], 0
 
     monkeypatch.setattr(grouping, "_judge_duplicates", _no_judge)
 

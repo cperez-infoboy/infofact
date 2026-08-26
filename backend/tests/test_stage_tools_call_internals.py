@@ -96,6 +96,7 @@ def _stub_pipeline(monkeypatch, calls: dict) -> None:
                 kept_id="r1", member_ids=["r2"], kept_statement="x")],
             contradictions=[types.SimpleNamespace(
                 a_id="r1", b_id="r2", reason="conflict", confidence=0.9)],
+            stats={},
         )
 
     async def fake_critique_all(items, **kw):
