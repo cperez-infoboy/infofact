@@ -2,6 +2,71 @@
 import { describe, it, expect } from 'vitest';
 import { normalizeNode, parentOf, humanizeWorkspaceError } from './workspace';
 
+// --- refreshTree(silent): el polling no debe borrar errores visibles ------
+// (bug de visibilidad: el poll borraba workspaceError cada 5s, ocultando
+// errores de operaciones tras máximo 5 segundos.)
+import { vi } from 'vitest';
+
+vi.mock('$lib/api/workspaces', () => ({
+  getTree: vi.fn(),
+  createFolder: vi.fn(),
+  createFile: vi.fn(),
+  moveEntry: vi.fn(),
+  copyEntry: vi.fn(),
+  deleteEntry: vi.fn(),
+  downloadFile: vi.fn()
+}));
+vi.mock('$lib/stores/tabs', () => ({
+  closeTabsUnderPath: vi.fn(),
+  retargetTabsUnderPath: vi.fn()
+}));
+vi.mock('$lib/stores/project', () => ({
+  currentProjectId: { subscribe: (fn: (v: number | null) => void) => { fn(1); return () => {}; } }
+}));
+
+import { getTree, type TreeNode } from '$lib/api/workspaces';
+import {
+  workspaceError,
+  refreshTree
+} from './workspace';
+
+describe('refreshTree silent (polling)', () => {
+  it('silent=true no setea ni borra workspaceError (ni en éxito ni en fallo)', async () => {
+    workspaceError.set('target_exists'); // error visible de una operación
+    (getTree as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('network'));
+
+    await refreshTree('.', false, true);
+    // fallo silencioso: el error de la operación sigue visible
+    let err: string | null = null;
+    workspaceError.subscribe((v) => (err = v))();
+    expect(err).toBe('target_exists');
+
+    (getTree as ReturnType<typeof vi.fn>).mockResolvedValue({
+      name: '.', path: '.', type: 'dir', children: []
+    } as unknown as TreeNode);
+    await refreshTree('.', false, true);
+    // éxito silencioso: tampoco lo borra
+    workspaceError.subscribe((v) => (err = v))();
+    expect(err).toBe('target_exists');
+  });
+
+  it('refresh sin silent limpia el error en éxito y lo setea en fallo', async () => {
+    workspaceError.set('target_exists');
+    (getTree as ReturnType<typeof vi.fn>).mockResolvedValue({
+      name: '.', path: '.', type: 'dir', children: []
+    } as unknown as TreeNode);
+    await refreshTree();
+    let err: string | null = 'x';
+    workspaceError.subscribe((v) => (err = v))();
+    expect(err).toBeNull();
+
+    (getTree as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('boom'));
+    await refreshTree();
+    workspaceError.subscribe((v) => (err = v))();
+    expect(err).toBe('boom');
+  });
+});
+
 describe('workspace store - normalizeNode', () => {
   it('file node sin children', () => {
     const r = normalizeNode({ name: 'a.md', path: 'docs/a.md', type: 'file' });

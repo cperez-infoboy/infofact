@@ -304,11 +304,14 @@ function setChildren(
 /**
  * Recarga el árbol. Por defecto mergea con lo existente (preserva
  * subárboles lazy cargados). Con `force=true` reemplaza por completo
- * (botón ↻ o cambio de proyecto).
+ * (botón ↻ o cambio de proyecto). Con `silent=true` (polling) no toca
+ * workspaceError: un error de una operación previa debe seguir visible
+ * hasta la próxima acción explícita del usuario, no borrarse 5s después.
  */
 export async function refreshTree(
   path: string = '.',
-  force: boolean = false
+  force: boolean = false,
+  silent: boolean = false
 ): Promise<void> {
   const projectId = get(currentProjectId);
   if (projectId === null) {
@@ -316,7 +319,7 @@ export async function refreshTree(
     return;
   }
   workspaceLoading.set(true);
-  workspaceError.set(null);
+  if (!silent) workspaceError.set(null);
   try {
     const raw = await getTree(projectId, path, 2);
     const fresh = normalizeNode(raw);
@@ -324,7 +327,7 @@ export async function refreshTree(
       path === '.' && !force ? mergeTree(existing, fresh) : fresh
     );
   } catch (e) {
-    workspaceError.set((e as Error).message);
+    if (!silent) workspaceError.set((e as Error).message);
   } finally {
     workspaceLoading.set(false);
   }
@@ -360,11 +363,11 @@ export async function loadChildren(nodePath: string): Promise<void> {
   }
 }
 
-/** Arranca polling del árbol (mergea, no pisa lazy). No-stack si ya hay uno. */
+/** Arranca polling del árbol (mergea, no pisa lazy, no borra errores). */
 export function startPolling(intervalMs: number = 5000): void {
   if (pollTimer !== null) return;
   pollTimer = setInterval(() => {
-    refreshTree().catch(() => {
+    refreshTree('.', false, true).catch(() => {
       // Error de polling no rompe la UI; la próxima tick reintenta.
     });
   }, intervalMs);
