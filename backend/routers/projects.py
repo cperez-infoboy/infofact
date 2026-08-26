@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import os
 from datetime import datetime
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
@@ -127,6 +128,9 @@ class MessageOut(BaseModel):
     tool_call_id: str | None = None
     tool_args: dict | None = None
     status: str | None = None
+    # Foto de sesión: presente en filas de la línea de tiempo persistida;
+    # None en la ruta legacy de reconstrucción.
+    is_intermediate: bool | None = None
 
 
 class SessionOut(BaseModel):
@@ -407,6 +411,141 @@ async def list_sessions(
 # ---------------------------------------------------------------------------
 
 
+def _content_matches(item_text: str, row_text: str) -> bool:
+    """True si el contenido del item y el de la fila corresponden al mismo
+    mensaje (iguales, o uno prefijo del otro: recapitulado por _cap_history_text
+    o whitespace final)."""
+    return (
+        item_text == row_text
+        or item_text.startswith(row_text)
+        or row_text.startswith(item_text)
+    )
+
+
+def _restore_user_content(items: list[dict], user_rows) -> None:
+    """Superpone el contenido original del usuario sobre los items 'user'
+    reconstruidos desde el checkpointer.
+
+    Estrategia, en orden:
+    1. Ligadura exacta por ``chat_row_id`` (el relay inyecta el id de la fila
+       en ``additional_kwargs`` del HumanMessage; ``reconstruct_history`` lo
+       propaga). Camino autoritativo para turnos nuevos.
+    2. Para datos previos a la ligadura: apareo greedy por contenido (igual o
+       prefijo en cualquier dirección).
+    3. Si el item es una directiva reescrita ("[DIRECTIVE] …") y la fila no es
+       un comando de ruta directa, corresponden al mismo turno: ligar.
+    4. Una fila sin match es un turno de ruta directa (sin HumanMessage):
+       queda para ``_merge_direct_route_turns``, que la reinserta en la
+       timeline.
+
+    Limitación conocida del paso 3: asume que la única ruta directa es
+    ``/agrupar`` puro. Si se agregan más rutas directas, los datos viejos
+    pueden quedar mal apareados (los nuevos siempre van por chat_row_id).
+
+    Devuelve el set de ids de filas user ligadas a un item.
+    """
+    bound_ids: set[int] = set()
+    # 1) Ligadura exacta por chat_row_id.
+    by_row_id = {
+        it["chat_row_id"]: it
+        for it in items
+        if it.get("role") == "user" and it.get("chat_row_id") is not None
+    }
+    for row in user_rows:
+        it = by_row_id.get(row.id)
+        if it is not None:
+            it["content"] = row.content
+            bound_ids.add(row.id)
+
+    # 2-3) Apareo greedy por contenido para items sin ligadura.
+    pool = [
+        it
+        for it in items
+        if it.get("role") == "user" and it.get("chat_row_id") is None
+    ]
+    pi = 0
+    for row in user_rows:
+        if row.id in bound_ids or pi >= len(pool):
+            continue
+        item = pool[pi]
+        item_text = item.get("content") or ""
+        if _content_matches(item_text, row.content) or (
+            item_text.startswith("[DIRECTIVE]")
+            and not row.content.lstrip().startswith("/agrupar")
+        ):
+            # Match por contenido, o directiva reescrita cuya fila es el texto
+            # original de este turno. Se estampa el row_id para que el merge de
+            # rutas directas pueda posicionar inserciones también en datos
+            # viejos.
+            item["content"] = row.content
+            item["chat_row_id"] = row.id
+            bound_ids.add(row.id)
+            pi += 1
+        # else: fila de ruta directa (o sin item) -> queda para el merge.
+    return bound_ids
+
+
+def _merge_direct_route_turns(items: list[dict], all_rows, bound_ids: set[int]) -> None:
+    """Reinserta en la timeline los turnos que nunca entraron al grafo (rutas
+    directas del router: /agrupar puro, gate de captura con respuesta
+    inmediata). Cada turno directo = una fila user sin ligar + las filas
+    assistant consecutivas hasta la próxima fila user.
+
+    Posicionamiento: antes del item 'user' ligado a la siguiente fila user
+    conocida (por row id); si no hay, al final. Insertar de atrás hacia
+    adelante para no invalidar índices.
+    """
+    runs: list[tuple[Any, list[Any]]] = []
+    i = 0
+    while i < len(all_rows):
+        r = all_rows[i]
+        if r.role == "user" and r.id not in bound_ids:
+            assistants = []
+            j = i + 1
+            while j < len(all_rows) and all_rows[j].role == "assistant":
+                assistants.append(all_rows[j])
+                j += 1
+            runs.append((r, assistants))
+            i = j
+        else:
+            i += 1
+    if not runs:
+        return
+
+    # row_id del item 'user' ligado -> índice en items (para posicionar).
+    row_id_to_idx: dict[int, int] = {}
+    for idx, it in enumerate(items):
+        rid = it.get("chat_row_id")
+        if it.get("role") == "user" and rid is not None:
+            row_id_to_idx[rid] = idx
+
+    placements: list[tuple[int, list[dict]]] = []
+    for user_row, assistants in runs:
+        synthetic: list[dict] = [
+            {
+                "id": f"db-{user_row.id}",
+                "role": "user",
+                "content": user_row.content,
+                "created_at": user_row.created_at,
+            }
+        ]
+        synthetic += [
+            {
+                "id": f"db-{a.id}",
+                "role": "assistant",
+                "content": a.content,
+                "created_at": a.created_at,
+            }
+            for a in assistants
+        ]
+        later = [idx for rid, idx in row_id_to_idx.items() if rid > user_row.id]
+        pos = min(later) if later else len(items)
+        placements.append((pos, synthetic))
+
+    for pos, synthetic in sorted(placements, key=lambda p: -p[0]):
+        items[pos:pos] = synthetic
+
+
 @session_router.get("/sessions/{session_id}", response_model=SessionDetail)
 async def get_session_detail(
     session_id: int,
@@ -448,41 +587,56 @@ async def get_session_detail(
                 session_id,
             )
 
-    # Restaurar el contenido original del usuario: el checkpointer guarda el
-    # mensaje reescrito por _rewrite_command (directiva), no el texto original
-    # (e.g. /captura). Superponemos el contenido de ChatMessage posicionalmente:
-    # cada HumanMessage en el checkpointer viene de un POST que persistió en
-    # ChatMessage antes del stream, así que el match posicional es 1:1.
-    if items:
-        async with AsyncSessionLocal() as db:
-            user_rows = (
-                await db.execute(
-                    select(ChatMessage)
-                    .where(
-                        ChatMessage.session_id == session_id,
-                        ChatMessage.role == "user",
-                    )
-                    .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+    # Filas persistidas del chat (user + assistant), una sola query.
+    async with AsyncSessionLocal() as db:
+        rows = (
+            await db.execute(
+                select(ChatMessage)
+                .where(ChatMessage.session_id == session_id)
+                .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+            )
+        ).scalars().all()
+
+    # Foto de sesión: si hay filas con kind, la línea de tiempo fue persistida
+    # por el relay mientras streameaba -> redespliegue directo (1:1 con lo que
+    # el usuario vio en vivo, sin reconstrucción). Filas NULL-kind = sesión
+    # legacy -> ruta de reconstrucción desde el checkpointer.
+    if any(r.kind for r in rows):
+        return SessionDetail(
+            id=session.id,
+            project_id=session.project_id,
+            title=session.title,
+            phase=session.phase,
+            created_at=session.created_at,
+            messages=[
+                MessageOut(
+                    id=m.id,
+                    role=m.role,
+                    content=m.content,
+                    created_at=m.created_at,
+                    tool_name=m.tool_name,
+                    tool_args=m.tool_args,
+                    is_intermediate=m.is_intermediate,
                 )
-            ).scalars().all()
-        user_idx = 0
-        for item in items:
-            if item.get("role") == "user" and user_idx < len(user_rows):
-                item["content"] = user_rows[user_idx].content
-                user_idx += 1
+                for m in rows
+            ],
+        )
+
+    if items:
+        # Restaurar el contenido original del usuario: el checkpointer guarda
+        # el mensaje reescrito por _rewrite_command (directiva), no el texto
+        # original (e.g. /captura). El match NO puede ser posicional puro: los
+        # turnos de ruta directa (p.ej. /agrupar puro, gate de captura)
+        # persisten fila pero nunca crean HumanMessage. Estrategia y merge de
+        # turnos directos: ver _restore_user_content / _merge_direct_route_turns.
+        user_rows = [r for r in rows if r.role == "user"]
+        bound_ids = _restore_user_content(items, user_rows)
+        _merge_direct_route_turns(items, rows, bound_ids)
 
     # Fallback: thread inexistente (sesión nueva sin turnos del agente) o
     # fallo de reconstrucción. Conserva compatibilidad con sesiones que solo
     # tienen prompts de usuario persistidos.
     if not items:
-        async with AsyncSessionLocal() as db:
-            rows = (
-                await db.execute(
-                    select(ChatMessage)
-                    .where(ChatMessage.session_id == session_id)
-                    .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
-                )
-            ).scalars().all()
         items = [
             {
                 "id": m.id,

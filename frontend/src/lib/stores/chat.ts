@@ -68,6 +68,10 @@ export interface AssistantMessage {
   /** Aviso cuando el relay descartó texto por los topes anti-veneno
    *  (evento SSE relay.truncated, sesión 44). */
   truncated?: RelayTruncatedEvent | null;
+  /** Foto de sesión: flag persistido por el relay al cerrarse el segmento
+   *  (true = razonamiento intermedio). undefined = inferir posicionalmente
+   *  (ruta legacy). */
+  isIntermediate?: boolean;
 }
 
 export interface ToolMessage {
@@ -419,7 +423,8 @@ export function loadHistoryFromDetail(msgs: MessageOut[]): Message[] {
         id: `a-${m.id}`,
         content: m.content,
         streaming: false,
-        created_at: m.created_at
+        created_at: m.created_at,
+        ...(m.is_intermediate != null ? { isIntermediate: m.is_intermediate } : {})
       });
     }
   }

@@ -89,6 +89,7 @@ async def lifespan(app: FastAPI):
     await migrate_analysis_diagram_descriptions()
     await migrate_analysis_architecture_diagrams()
     await migrate_subproject_project_code()
+    await migrate_chat_messages_timeline()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     # Data migration (post-create_all: la tabla ya existe aunque sea un boot
@@ -230,6 +231,54 @@ async def migrate_project_documents_parser_hint() -> None:
             text(
                 "ALTER TABLE project_documents "
                 "ADD COLUMN parser_hint VARCHAR(16) DEFAULT 'auto'"
+            )
+        )
+
+
+async def migrate_chat_messages_timeline() -> None:
+    """Add the photo-of-session columns to ``chat_messages`` if missing.
+
+    ``kind`` ('text' | 'tool'), ``tool_name``, ``tool_args`` and
+    ``is_intermediate`` turn the table into the persisted display timeline
+    the relay writes while streaming (docs/planeaciones/2026-08-19). Rows
+    left NULL are legacy (pre-migration) and keep being served through the
+    checkpointer reconstruction path.
+
+    Idempotent: no-op when the columns exist. Runs before ``create_all``.
+    """
+    from sqlalchemy import inspect, text
+
+    log = logging.getLogger(__name__)
+
+    async with engine.begin() as conn:
+        def _columns(sync_conn):
+            inspector = inspect(sync_conn)
+            if "chat_messages" not in inspector.get_table_names():
+                return None
+            return {c["name"] for c in inspector.get_columns("chat_messages")}
+
+        columns = await conn.run_sync(_columns)
+        if columns is None or "kind" in columns:
+            if columns is not None:
+                log.info(
+                    "migrate_chat_messages_timeline: columns already present, skipping"
+                )
+            return
+        log.info("migrate_chat_messages_timeline: adding timeline columns")
+        await conn.execute(
+            text(
+                "ALTER TABLE chat_messages ADD COLUMN kind VARCHAR(8)"
+            )
+        )
+        await conn.execute(
+            text("ALTER TABLE chat_messages ADD COLUMN tool_name VARCHAR(128)")
+        )
+        await conn.execute(
+            text("ALTER TABLE chat_messages ADD COLUMN tool_args JSON")
+        )
+        await conn.execute(
+            text(
+                "ALTER TABLE chat_messages ADD COLUMN is_intermediate BOOLEAN"
             )
         )
 

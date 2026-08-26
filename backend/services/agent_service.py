@@ -328,11 +328,14 @@ async def reconstruct_history(
 
     Mapping (chronological, as stored by the checkpointer):
       - HumanMessage  -> {role:'user', content}
-      - AIMessage     -> {role:'assistant', content} (if non-empty text), plus
-                         one {role:'tool', tool_name, tool_call_id, tool_args}
-                         per tool_call (output filled later by its ToolMessage).
-                         Skipped entirely if empty and tool-less (streaming
-                         artefact that would render an invisible bubble).
+      - AIMessage     -> {role:'assistant', content} (if non-empty text AND no
+                         tool_calls: text travelling with tool calls is
+                         pre-delegation reasoning the live relay never shows),
+                         plus one {role:'tool', tool_name, tool_call_id,
+                         tool_args} per tool_call (output filled later by its
+                         ToolMessage). Skipped entirely if empty and tool-less
+                         (streaming artefact that would render an invisible
+                         bubble).
       - ToolMessage   -> back-fills content (output) on the matching
                          role:'tool' item by tool_call_id.
       - SystemMessage -> skipped.
@@ -362,15 +365,23 @@ async def reconstruct_history(
 
     for msg in messages:
         if isinstance(msg, HumanMessage):
+            # chat_row_id liga el item a su fila en chat_messages (inyectado por
+            # el relay en additional_kwargs): permite restaurar el contenido
+            # original del usuario sin depender de alineamiento posicional.
             out.append({
                 "id": f"u-{len(out)}",
                 "role": "user",
                 "content": _cap_history_text(_coerce_text(msg.content)),
                 "created_at": None,
+                "chat_row_id": (msg.additional_kwargs or {}).get("chat_row_id"),
             })
         elif isinstance(msg, AIMessage):
             text = _cap_history_text(_coerce_text(msg.content))
-            if text:
+            # Igual semántica que el relay en vivo: el texto que viaja en el
+            # mismo AIMessage que sus tool_calls nunca se mostró al usuario
+            # (razonamiento previo a delegar), así que al recargar no debe
+            # resurgir como mensaje "assistant".
+            if text and not (msg.tool_calls):
                 out.append({
                     "id": f"a-{len(out)}",
                     "role": "assistant",

@@ -223,10 +223,16 @@
         // respuesta final del turno. Dos assistants consecutivos (subagente →
         // orquestador tras delegación via task) hacen que el primero sea
         // intermedio; sólo el último assistant del turno se renderiza completo.
+        // Foto de sesión: si el relay persistió el flag isIntermediate, es
+        // autoritativo (override de la inferencia posicional).
         const next = list[i + 1];
         const nextIsToolOrAssistant =
           next !== undefined && (next.kind === 'tool' || next.kind === 'assistant');
-        items.push({ type: 'assistant', msg: m, isFinal: !nextIsToolOrAssistant });
+        const isFinal =
+          m.isIntermediate !== undefined
+            ? !m.isIntermediate
+            : !nextIsToolOrAssistant;
+        items.push({ type: 'assistant', msg: m, isFinal });
         i++;
       }
     }
@@ -337,50 +343,13 @@
 
 {#snippet assistantBlock(msg: AssistantMessage, isFinal: boolean)}
   <div class="flex flex-col gap-1">
-    {#if msg.content}
-      {@const showFull = !msg.streaming && (isFinal || expandedTexts[msg.id])}
-      {#if showFull}
-        <div
-          class="md-body max-w-[95%] border border-border-strong bg-surface px-3 py-2 text-sm text-text-muted"
-        >
-          {@html renderMarkdown(msg.content)}{#if msg.streaming}<span
-            class="animate-pulse ml-0.5 text-text-faint"
-            aria-label="escribiendo">▋</span
-          >{/if}
-        </div>
-        {#if !msg.streaming && !isFinal && expandedTexts[msg.id]}
-          <button
-            type="button"
-            class="self-start text-xs text-text-dim hover:underline ml-1"
-            onclick={() => toggleText(msg.id)}>mostrar menos</button
-          >
-        {/if}
-      {:else}
-        {@const preview = cleanPreview(msg.content)}
-        {#if preview || msg.streaming}
-          <div
-            class="max-w-[95%] border border-border-strong bg-surface px-3 py-2 text-sm text-text-muted"
-          >
-            {#if preview}
-              <span class="whitespace-pre-wrap break-words">{preview}</span>
-            {/if}
-            {#if msg.streaming}<span
-              class="animate-pulse ml-0.5 text-text-faint"
-              aria-label="escribiendo">▋</span
-            >{/if}
-            {#if !msg.streaming && preview}
-              <button
-                type="button"
-                class="ml-1 text-xs text-text hover:underline"
-                onclick={() => toggleText(msg.id)}>mostrar más</button
-              >
-            {/if}
-          </div>
-        {/if}
-      {/if}
-    {:else if msg.streaming}
-      <div class="text-xs text-text-faint italic font-mono">
-        pensando…
+    {#if msg.streaming || !isFinal}
+      {@render reasoningBlock(msg)}
+    {:else if msg.content}
+      <div
+        class="md-body max-w-[95%] border border-border-strong bg-surface px-3 py-2 text-sm text-text-muted"
+      >
+        {@html renderMarkdown(msg.content)}
       </div>
     {/if}
     {#if msg.truncated}
@@ -391,6 +360,52 @@
       </div>
     {/if}
   </div>
+{/snippet}
+
+<!-- Razonamiento intermedio del agente (o texto aún en streaming, que aún no
+     se sabe si será respuesta final): estilo atenuado con barra lateral y
+     etiqueta, deliberadamente distinto de la caja de respuesta final para que
+     no se confunda con ella. Expandir muestra texto plano crudo, nunca
+     markdown. -->
+{#snippet reasoningBlock(msg: AssistantMessage)}
+  {@const preview = cleanPreview(msg.content)}
+  {#if !msg.streaming && expandedTexts[msg.id]}
+    <div class="max-w-[95%] border-l-2 border-border pl-3 py-0.5">
+      <div class="text-[10px] uppercase tracking-wider text-text-faint mb-0.5">
+        Razonamiento del agente
+      </div>
+      <div class="text-xs text-text-muted italic whitespace-pre-wrap break-words">
+        {msg.content}
+      </div>
+      <button
+        type="button"
+        class="text-xs text-text-dim hover:underline"
+        onclick={() => toggleText(msg.id)}>mostrar menos</button
+      >
+    </div>
+  {:else if msg.streaming && !preview}
+    <div class="text-xs text-text-faint italic font-mono">pensando…</div>
+  {:else if preview}
+    <div class="max-w-[95%] border-l-2 border-border pl-3 py-0.5">
+      <div class="text-[10px] uppercase tracking-wider text-text-faint mb-0.5">
+        Razonamiento del agente
+      </div>
+      <div class="text-xs text-text-muted italic">
+        <span class="whitespace-pre-wrap break-words">{preview}</span>
+        {#if msg.streaming}<span
+          class="animate-pulse ml-0.5 text-text-faint"
+          aria-label="escribiendo">▋</span
+        >{/if}
+        {#if !msg.streaming}
+          <button
+            type="button"
+            class="ml-1 text-xs text-text hover:underline"
+            onclick={() => toggleText(msg.id)}>mostrar más</button
+          >
+        {/if}
+      </div>
+    </div>
+  {/if}
 {/snippet}
 
 {#snippet toolGroupBlock(tools: ToolMessage[])}

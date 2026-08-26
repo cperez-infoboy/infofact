@@ -27,6 +27,8 @@ export interface MessageOut {
   tool_call_id?: string | null;
   tool_args?: Record<string, unknown> | null;
   status?: string | null;
+  /** Foto de sesión: flag persistido por el relay (null = ruta legacy). */
+  is_intermediate?: boolean | null;
 }
 
 export interface ProjectDetail extends ProjectOut {

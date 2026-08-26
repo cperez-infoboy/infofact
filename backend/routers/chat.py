@@ -23,7 +23,12 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
-from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    HumanMessage,
+    ToolMessage,
+)
 from pydantic import BaseModel, Field
 
 from backend.config import settings
@@ -44,6 +49,15 @@ _active_streams: set[str] = set()
 
 MAX_TOOL_OUTPUT_CHARS = 500
 ASTREAM_VERSION = "v2"
+
+# Clave con la que LangChain (>= 1.3.15) marca las llamadas internas de
+# middleware (p. ej. el resumen de compactación del SummarizationMiddleware:
+# los bloques "## SESSION INTENT / ## SUMMARY"). Su texto es maquinaria
+# interna: el relay NUNCA lo emite al usuario ni lo persiste (bug de la
+# sesión 48: el resumen interno se mostró y se concatenó con la respuesta
+# real del agente). Valor: token de proceso imposible de falsear; para el
+# filtro basta la presencia de la clave en la metadata del evento.
+INTERNAL_CALL_METADATA_KEY = "lc_internal_call"
 # Techo de recursión del graph (steps). LangGraph default = 25, muy chico para
 # DeepAgents que loopea tool-calls. 100 ≈ 50 rondas model+tool, suficiente para
 # la fase de requerimientos sin abrir la puerta a runaway costoso.
@@ -211,6 +225,15 @@ def _safe_json(obj: Any) -> Any:
         return json.loads(json.dumps(obj, default=str))
     except Exception:  # noqa: BLE001 - serialización best-effort
         return str(obj)
+
+
+def _is_internal_call(metadata: Any) -> bool:
+    """True si el chunk viene de una llamada interna de middleware.
+
+    Los eventos `messages` de astream llevan (chunk, metadata); la metadata de
+    las llamadas internas (compactación) incluye INTERNAL_CALL_METADATA_KEY.
+    """
+    return isinstance(metadata, dict) and INTERNAL_CALL_METADATA_KEY in metadata
 
 
 def _sanitize_error(exc: Exception) -> str:
@@ -671,6 +694,8 @@ def _agrupar_direct_stream(session_id: int, project_id: int, key: str):
                         ChatMessage(
                             session_id=session_id,
                             role="assistant",
+                            kind="text",
+                            is_intermediate=False,
                             content=assistant_text,
                         )
                     )
@@ -723,9 +748,17 @@ async def send_message(
         _active_streams.add(key)
 
         # Persistir mensaje de usuario antes del stream para que sobreviva aun
-        # si el agente falla a mitad de camino.
-        db.add(ChatMessage(session_id=session_id, role="user", content=body.content))
+        # si el agente falla a mitad de camino. Se guarda el id para ligarlo al
+        # HumanMessage del checkpointer (additional_kwargs['chat_row_id']): así
+        # get_session_detail restaura el contenido original sin adivinar
+        # posiciones cuando hay turnos de ruta directa (p.ej. /agrupar puro)
+        # que persisten fila pero nunca crean HumanMessage.
+        user_msg = ChatMessage(
+            session_id=session_id, role="user", kind="text", content=body.content
+        )
+        db.add(user_msg)
         await db.commit()
+        user_msg_id = user_msg.id
 
     # Guardia router-level (inviolable) para captura sobre datos existentes: si
     # el comando es de captura y hay requerimientos previos sin una decision
@@ -736,7 +769,10 @@ async def send_message(
         async with AsyncSessionLocal() as db:
             db.add(
                 ChatMessage(
-                    session_id=session_id, role="assistant", content=gate_msg
+                    session_id=session_id,
+                    role="assistant",
+                    kind="text",
+                    content=gate_msg,
                 )
             )
             await db.commit()
@@ -793,9 +829,49 @@ async def send_message(
             max_total=settings.relay_max_assistant_chars,
         )
         seen_tool_calls: set[str] = set()
+        # Foto de sesión: segmento assistant en curso (se persiste al cerrarse)
+        # y tools con su name/args vistos en tool_start, para persistir la fila
+        # completa al tool_end.
+        segment_parts: list[str] = []
+        pending_tools: dict[str, dict] = {}
+
+        async def _close_segment(intermediate: bool) -> None:
+            """Persiste el segmento assistant actual como fila de la línea de
+            tiempo. Cerrado por tool_start -> razonamiento intermedio; por
+            completed/failed -> respuesta final. Fallo de persistencia no
+            rompe el stream."""
+            nonlocal segment_parts
+            seg = "".join(segment_parts).strip()
+            segment_parts = []
+            if not seg:
+                return
+            try:
+                async with AsyncSessionLocal() as db:
+                    db.add(
+                        ChatMessage(
+                            session_id=session_id,
+                            role="assistant",
+                            kind="text",
+                            is_intermediate=intermediate,
+                            content=seg[: settings.relay_max_assistant_chars],
+                        )
+                    )
+                    await db.commit()
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "no se pudo persistir segmento session_id=%s", session_id
+                )
+
         try:
             async for chunk in agent.astream(
-                {"messages": [{"role": "user", "content": content}]},
+                {
+                    "messages": [
+                        HumanMessage(
+                            content=content,
+                            additional_kwargs={"chat_row_id": user_msg_id},
+                        )
+                    ]
+                },
                 stream_mode=["messages", "custom"],
                 subgraphs=True,
                 version=ASTREAM_VERSION,
@@ -808,6 +884,10 @@ async def send_message(
                     if not isinstance(cdata, tuple) or len(cdata) != 2:
                         continue
                     token, _metadata = cdata
+                    # Llamada interna de middleware (resumen de compactación):
+                    # su texto no se muestra ni se persiste.
+                    if _is_internal_call(_metadata):
+                        continue
                     # astream messages mode v2 con este modelo entrega objetos
                     # AIMessage COMPLETOS (content + tool_calls), no deltas
                     # AIMessageChunk. Se aceptan ambas formas: los deltas traen
@@ -820,6 +900,7 @@ async def send_message(
                         text = getattr(token, "content", "")
                         # Delta de texto (ignorar mensajes que traen tool calls).
                         if isinstance(text, str) and text and not calls:
+                            segment_parts.append(text)
                             for frame in accumulator.add(text):
                                 yield frame
                         # Inicio de tool call: emitir tool_start una vez por id.
@@ -831,6 +912,15 @@ async def send_message(
                                 c_id = c.get("id") or c_name
                                 if c_name and c_id not in seen_tool_calls:
                                     seen_tool_calls.add(c_id)
+                                    # El tool cierra el segmento actual:
+                                    # razonamiento intermedio.
+                                    await _close_segment(intermediate=True)
+                                    pending_tools[c_id] = {
+                                        "name": c_name,
+                                        "args": c.get("args")
+                                        if isinstance(c.get("args"), dict)
+                                        else {},
+                                    }
                                     yield _sse(
                                         "tool_start",
                                         {
@@ -839,15 +929,39 @@ async def send_message(
                                         },
                                     )
                     elif isinstance(token, ToolMessage):
+                        output = _truncate(
+                            _stringify(getattr(token, "content", ""))
+                        )
+                        pending = pending_tools.pop(
+                            getattr(token, "tool_call_id", None) or "", None
+                        )
                         yield _sse(
                             "tool_end",
                             {
                                 "name": getattr(token, "name", "") or "tool",
-                                "output": _truncate(
-                                    _stringify(getattr(token, "content", ""))
-                                ),
+                                "output": output,
                             },
                         )
+                        try:
+                            async with AsyncSessionLocal() as db:
+                                db.add(
+                                    ChatMessage(
+                                        session_id=session_id,
+                                        role="tool",
+                                        kind="tool",
+                                        tool_name=(pending or {}).get("name")
+                                        or getattr(token, "name", "")
+                                        or "tool",
+                                        tool_args=(pending or {}).get("args") or {},
+                                        content=output,
+                                    )
+                                )
+                                await db.commit()
+                        except Exception:  # noqa: BLE001
+                            logger.exception(
+                                "no se pudo persistir tool row session_id=%s",
+                                session_id,
+                            )
                 elif ctype == "custom":
                     # Evento del pipeline via get_stream_writer dentro de una tool.
                     # cdata = {"event": "extraction.progress", "data": {...}}
@@ -857,25 +971,17 @@ async def send_message(
                         yield _sse(ev_name, _safe_json(ev_data))
 
             assistant_text = accumulator.result()
-            try:
-                async with AsyncSessionLocal() as db:
-                    db.add(
-                        ChatMessage(
-                            session_id=session_id,
-                            role="assistant",
-                            content=assistant_text,
-                        )
-                    )
-                    await db.commit()
-            except Exception:  # noqa: BLE001 - la persistencia no rompe el stream
-                logger.exception(
-                    "no se pudo persistir mensaje del asistente session_id=%s",
-                    session_id,
-                )
-
+            # Foto de sesión: la respuesta final es el ÚLTIMO segmento (los
+            # intermedios ya quedaron persistidos por _close_segment). El
+            # evento completed sigue llevando el acumulado completo del turno
+            # (compatibilidad con el frontend en vivo).
+            await _close_segment(intermediate=False)
             yield _sse("completed", {"message": assistant_text})
         except Exception as exc:  # noqa: BLE001 - saneamos y emitimos 'failed'
             logger.exception("agent stream failed session_id=%s", session_id)
+            # Turno abortado: persistir el segmento parcial como intermedio
+            # para que la recarga muestre fielmente el corte.
+            await _close_segment(intermediate=True)
             yield _sse("failed", {"error": _sanitize_error(exc)})
         finally:
             _active_streams.discard(key)
