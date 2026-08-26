@@ -312,8 +312,13 @@
     confirmLabel="Eliminar"
     danger={true}
     onconfirm={() => {
+      // Capturar ANTES de limpiar: `target` ({@const}) es una lectura viva
+      // de confirmTarget — si se null-ifica primero, deleteEntry leería null
+      // (bug real: TypeError 'path' de null, sin llegar a disparar el DELETE).
+      const node = confirmTarget ?? target;
+      if (!node) return;
       confirmTarget = null;
-      void deleteEntry(target);
+      void deleteEntry(node);
     }}
     oncancel={() => (confirmTarget = null)}
   />
