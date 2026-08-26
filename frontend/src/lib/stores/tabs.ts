@@ -141,6 +141,60 @@ export function setActive(id: string): void {
   activeTabId.set(id);
 }
 
+/** Si la tab activa fue removida de la lista, activa la última restante. */
+function _fixActiveAfterRemoval(): void {
+  const currentActive = get(activeTabId);
+  if (currentActive === null) return;
+  const list = get(openTabs);
+  if (!list.some((t) => t.id === currentActive)) {
+    const fallback = list[list.length - 1] ?? null;
+    activeTabId.set(fallback ? fallback.id : null);
+  }
+}
+
+/**
+ * Cierra las tabs de archivo cuyo path es `path` o descendiente
+ * (eliminar archivo/carpeta desde el explorador).
+ */
+export function closeTabsUnderPath(path: string): void {
+  const prefix = path.endsWith('/') ? path : path + '/';
+  openTabs.update((list) =>
+    list.filter(
+      (t) => !(t.kind === 'file' && (t.path === path || t.path.startsWith(prefix)))
+    )
+  );
+  _fixActiveAfterRemoval();
+}
+
+/**
+ * Re-apunta tabs de archivo bajo `oldPath` al equivalente bajo `newPath`
+ * (renombrar/mover): conserva contenido y estado dirty, y re-apunta la tab
+ * activa si estaba en el rango.
+ */
+export function retargetTabsUnderPath(oldPath: string, newPath: string): void {
+  const prefix = oldPath.endsWith('/') ? oldPath : oldPath + '/';
+  openTabs.update((list) =>
+    list.map((t) => {
+      if (t.kind !== 'file') return t;
+      if (t.path === oldPath) {
+        return { ...t, id: newPath, path: newPath, name: basename(newPath) };
+      }
+      if (t.path.startsWith(prefix)) {
+        const np = newPath + t.path.slice(oldPath.length);
+        return { ...t, id: np, path: np, name: basename(np) };
+      }
+      return t;
+    })
+  );
+  const currentActive = get(activeTabId);
+  if (currentActive === null) return;
+  if (currentActive === oldPath) {
+    activeTabId.set(newPath);
+  } else if (currentActive.startsWith(prefix)) {
+    activeTabId.set(newPath + currentActive.slice(oldPath.length));
+  }
+}
+
 /** Marca un tab de archivo como dirty + actualiza su contenido.
  *  No-op para view tabs (no son texto editable). */
 export function markDirty(id: string, content: string): void {

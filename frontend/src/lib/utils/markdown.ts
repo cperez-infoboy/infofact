@@ -15,9 +15,18 @@ marked.setOptions({
 // DOMPurify solo funciona en el navegador (depende de DOM). En SSR devolvemos
 // una cadena vacía porque este renderer solo se invoca dentro de componentes
 // client-side del chat.
-export function renderMarkdown(src: string): string {
+//
+// `breaks` (default true) convierte saltos de línea sueltos en <br>, natural
+// para chat; para archivos .md completos conviene semántica estándar (false).
+export function renderMarkdown(
+  src: string,
+  opts?: { breaks?: boolean }
+): string {
   if (!browser) return '';
-  const raw = marked.parse(src ?? '', { async: false }) as string;
+  const raw = marked.parse(src ?? '', {
+    async: false,
+    breaks: opts?.breaks ?? true
+  }) as string;
   return DOMPurify.sanitize(raw, {
     ALLOWED_TAGS: [
       'p', 'br', 'strong', 'em', 'del', 'code', 'pre',

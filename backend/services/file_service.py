@@ -101,8 +101,8 @@ async def list_tree(
         raise RuntimeError(f"tree listing returned non-JSON: {exc}") from exc
 
 
-async def read_file(profile: str, project_slug: str, path: str) -> str:
-    """Lee un archivo del workspace como texto UTF-8.
+async def read_bytes(profile: str, project_slug: str, path: str) -> bytes:
+    """Lee un archivo del workspace como bytes crudos (PDFs, imágenes, docx).
 
     Usa DockerSandbox.download_files (vía `cat` dentro del container) en vez
     de un execute(`cat`) a mano: así aprovechamos el mismo código que el
@@ -120,7 +120,14 @@ async def read_file(profile: str, project_slug: str, path: str) -> str:
         raise RuntimeError(f"read failed: {result.error}")
     if result.content is None:
         raise RuntimeError("read returned no content")
-    return result.content.decode("utf-8", errors="replace")
+    return result.content
+
+
+async def read_file(profile: str, project_slug: str, path: str) -> str:
+    """Lee un archivo del workspace como texto UTF-8."""
+    return (await read_bytes(profile, project_slug, path)).decode(
+        "utf-8", errors="replace"
+    )
 
 
 async def write_file(profile: str, project_slug: str, path: str, content: str) -> None:
@@ -163,9 +170,149 @@ async def delete_file(profile: str, project_slug: str, path: str) -> None:
 
     Usa ``rm -f`` via ``DockerSandbox.execute``; el ``-f`` hace que un archivo
     inexistente no se reporte como error.
+
+    .. deprecated:: solo soporta archivos (``rm -f`` falla en dirs). Usar
+       ``delete_entry``, que cubre archivos y carpetas vía ``_FS_OP_SCRIPT``.
     """
     sandbox = await _sandbox(profile, project_slug)
     safe = sandbox._safe_path(path)
     result = sandbox.execute(f"rm -f -- {shlex.quote(safe)}", timeout=10)
     if result.exit_code != 0:
         raise RuntimeError(f"delete failed: {result.output.strip()}")
+
+
+# --- Operaciones de filesystem del explorador (mkdir / new_file / move /
+# copy / delete) -----------------------------------------------------------
+#
+# Igual que _TREE_SCRIPT: un micro-script Python que corre dentro del
+# container (cwd = raíz del workspace del proyecto) y emite JSON estable
+# {ok: true, path?} | {ok: false, error: <code>}. Con semántica Python
+# (os/shutil) en vez de shell evitamos los footguns de cp/mv (p.ej. `cp`
+# dentro de un dir existente) y reportamos códigos de error precisos.
+
+class FsOpError(RuntimeError):
+    """Error de una operación de filesystem con código estable para el router.
+
+    Códigos: is_root, not_found, already_exists, target_exists,
+    target_inside_source, error.
+    """
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+_FS_OP_SCRIPT = """
+import json,os,shutil,sys
+def ok(path):
+    print(json.dumps({"ok":True,"path":path}));sys.exit(0)
+def fail(code):
+    print(json.dumps({"ok":False,"error":code}));sys.exit(0)
+def splitext(name):
+    if name.startswith(".") and name.count(".") == 1:
+        return name,""
+    return os.path.splitext(name)
+try:
+    op=sys.argv[1];args=sys.argv[2:]
+    if op=="mkdir":
+        p=args[0]
+        if os.path.exists(p):fail("already_exists")
+        os.makedirs(p);ok(p)
+    elif op=="new_file":
+        p=args[0]
+        if os.path.lexists(p):fail("already_exists")
+        d=os.path.dirname(p)
+        if d and not os.path.isdir(d):fail("not_found")
+        open(p,"x").close();ok(p)
+    elif op=="move":
+        src,dst=args[0],args[1]
+        if src in (".",""):fail("is_root")
+        if not os.path.lexists(src):fail("not_found")
+        if os.path.lexists(dst):fail("target_exists")
+        asrc=os.path.abspath(src);adst=os.path.abspath(dst)
+        if adst==asrc or adst.startswith(asrc+os.sep):fail("target_inside_source")
+        d=os.path.dirname(dst)
+        if d and not os.path.isdir(d):fail("not_found")
+        os.rename(src,dst);ok(dst)
+    elif op=="copy":
+        src,dstdir=args[0],args[1]
+        if src in (".",""):fail("is_root")
+        if not os.path.lexists(src):fail("not_found")
+        if not os.path.isdir(dstdir):fail("not_found")
+        base=os.path.basename(src) or "copia"
+        stem,ext=splitext(base)
+        cand=os.path.normpath(os.path.join(dstdir,base));n=0
+        while os.path.lexists(cand):
+            n+=1
+            if n>99:fail("target_exists")
+            cand=os.path.normpath(os.path.join(dstdir,stem+" copia"+((" "+str(n)) if n>1 else "")+ext))
+        if os.path.isdir(src) and not os.path.islink(src):
+            shutil.copytree(src,cand,symlinks=True)
+        else:
+            shutil.copy2(src,cand,follow_symlinks=False)
+        ok(cand)
+    elif op=="delete":
+        p=args[0]
+        if p in (".","","/"):fail("is_root")
+        if not os.path.lexists(p):fail("not_found")
+        if os.path.isdir(p) and not os.path.islink(p):
+            shutil.rmtree(p)
+        else:
+            os.remove(p)
+        ok(p)
+    else:
+        fail("unknown_op")
+except OSError:
+    fail("error")
+"""
+
+
+async def _fs_op(profile: str, project_slug: str, *args: str) -> str | None:
+    """Ejecuta una operación de ``_FS_OP_SCRIPT`` en el container.
+
+    Devuelve el path final cuando la operación lo produce (copy/move), o
+    None. Levanta FsOpError con el código del script; ValueError de
+    _safe_path (path traversal) se propaga tal cual.
+    """
+    sandbox = await _sandbox(profile, project_slug)
+    safe_args = [sandbox._safe_path(a) for a in args]
+    invocation = " ".join(shlex.quote(a) for a in safe_args)
+    result = sandbox.execute(
+        f"python3 -c {shlex.quote(_FS_OP_SCRIPT)} {invocation}", timeout=60
+    )
+    if result.exit_code != 0:
+        # El script siempre sale 0 (error en JSON); exit != 0 es python roto.
+        raise RuntimeError(f"fs op failed: {result.output.strip()}")
+    try:
+        payload = json.loads(result.output)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"fs op returned non-JSON: {exc}") from exc
+    if not payload.get("ok"):
+        raise FsOpError(payload.get("error") or "error")
+    return payload.get("path")
+
+
+async def create_dir(profile: str, project_slug: str, path: str) -> None:
+    """Crea un directorio (falla con already_exists si ya existe)."""
+    await _fs_op(profile, project_slug, "mkdir", path)
+
+
+async def create_file(profile: str, project_slug: str, path: str) -> None:
+    """Crea un archivo vacío (falla con already_exists si ya existe)."""
+    await _fs_op(profile, project_slug, "new_file", path)
+
+
+async def move_entry(profile: str, project_slug: str, src: str, dst: str) -> None:
+    """Mueve/renombra ``src`` a ``dst`` (path destino completo, sin pisar)."""
+    await _fs_op(profile, project_slug, "move", src, dst)
+
+
+async def copy_entry(profile: str, project_slug: str, src: str, dst_dir: str) -> str:
+    """Copia ``src`` dentro de ``dst_dir``; resuelve colisión con sufijo
+    `` copia`` / `` copia N``. Devuelve el path final de la copia."""
+    return await _fs_op(profile, project_slug, "copy", src, dst_dir) or src
+
+
+async def delete_entry(profile: str, project_slug: str, path: str) -> None:
+    """Borra ``path`` (archivo o carpeta con todo su contenido)."""
+    await _fs_op(profile, project_slug, "delete", path)

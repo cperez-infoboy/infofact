@@ -23,6 +23,8 @@ import {
   setActive,
   markDirty,
   saveActive,
+  closeTabsUnderPath,
+  retargetTabsUnderPath,
   MAX_TABS,
   _resetTabsForTests
 } from './tabs';
@@ -179,5 +181,80 @@ describe('tabs store', () => {
     openTabs.subscribe((v) => (list = v))();
     expect(list.filter((t) => t.kind === 'requirements')).toHaveLength(1);
     expect(list.length).toBeLessThanOrEqual(MAX_TABS);
+  });
+});
+
+describe('closeTabsUnderPath / retargetTabsUnderPath (explorador)', () => {
+  beforeEach(() => {
+    _resetTabsForTests();
+    currentProject.set({
+      id: 1,
+      name: 'test',
+      slug: 'test',
+      phase: 'requirements',
+      created_at: '',
+      sessions: []
+    } as any);
+  });
+
+  function paths(): string[] {
+    let list: any[] = [];
+    openTabs.subscribe((v) => (list = v))();
+    return list.filter((t) => t.kind === 'file').map((t) => t.path);
+  }
+
+  it('closeTabsUnderPath cierra el path exacto y descendientes; no prefijos similares', async () => {
+    await openTab('docs/a.md');
+    await openTab('docs/sub/b.md');
+    await openTab('docs-x/c.md'); // prefijo similar, NO descendiente
+    await openView('requirements');
+
+    closeTabsUnderPath('docs/sub');
+
+    const p = paths();
+    expect(p).toContain('docs/a.md');
+    expect(p).toContain('docs-x/c.md');
+    expect(p).not.toContain('docs/sub/b.md');
+    // La vista sticky sobrevive.
+    let list: any[] = [];
+    openTabs.subscribe((v) => (list = v))();
+    expect(list.filter((t) => t.kind === 'requirements')).toHaveLength(1);
+  });
+
+  it('closeTabsUnderPath sobre archivo cierra solo ese archivo y reasigna activa', async () => {
+    await openTab('docs/a.md');
+    await openTab('docs/b.md'); // activa
+    closeTabsUnderPath('docs/b.md');
+    expect(paths()).toEqual(['docs/a.md']);
+    let active = '';
+    activeTabId.subscribe((v) => (active = v ?? ''))();
+    expect(active).toBe('docs/a.md');
+  });
+
+  it('retargetTabsUnderPath re-apunta exacta y descendientes, conserva dirty/contenido', async () => {
+    await openTab('docs/a.md');
+    markDirty('docs/a.md', 'unsaved');
+    await openTab('docs/sub/b.md');
+
+    retargetTabsUnderPath('docs', 'documentos');
+
+    const p = paths();
+    expect(p).toContain('documentos/a.md');
+    expect(p).toContain('documentos/sub/b.md');
+    expect(p).not.toContain('docs/a.md');
+    let list: any[] = [];
+    openTabs.subscribe((v) => (list = v))();
+    const moved = list.find((t) => t.path === 'documentos/a.md');
+    expect(moved.dirty).toBe(true);
+    expect(moved.content).toBe('unsaved');
+    expect(moved.name).toBe('a.md');
+  });
+
+  it('retargetTabsUnderPath re-apunta la tab activa', async () => {
+    await openTab('docs/a.md'); // activa
+    retargetTabsUnderPath('docs/a.md', 'docs/renombrado.md');
+    let active = '';
+    activeTabId.subscribe((v) => (active = v ?? ''))();
+    expect(active).toBe('docs/renombrado.md');
   });
 });

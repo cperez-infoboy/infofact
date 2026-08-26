@@ -18,10 +18,23 @@
   import GroupingPlanPanel from '$lib/components/GroupingPlanPanel.svelte';
   import SrsViewer from '$lib/components/SrsViewer.svelte';
   import AnalysisViewer from '$lib/components/AnalysisViewer.svelte';
+  import MarkdownEditor from '$lib/components/MarkdownEditor.svelte';
 
   let { } = $props();
 
   let activeTab = $derived($openTabs.find((t) => t.id === $activeTabId) ?? null);
+
+  // Archivos .md: editor WYSIWYG (Tiptap) por defecto, toggle a texto crudo.
+  let isMd = $derived(
+    activeTab?.kind === 'file' && /\.md$/i.test(activeTab.path)
+  );
+  let mdMode = $state<'editor' | 'texto'>('editor');
+
+  // Al cambiar de tab, los .md arrancan en el editor WYSIWYG.
+  $effect(() => {
+    void $activeTabId;
+    mdMode = 'editor';
+  });
 
   function handleInput(e: Event) {
     const value = (e.target as HTMLTextAreaElement).value;
@@ -89,15 +102,28 @@
   <!-- Contenido: switch por kind -->
   <div class="flex-1 min-h-0 min-w-0 overflow-hidden">
     {#if activeTab?.kind === 'file'}
-      <textarea
-        class="w-full h-full resize-none bg-bg text-text font-mono text-sm p-4 focus:outline-none"
-        value={activeTab.content}
-        oninput={handleInput}
-        onkeydown={handleKeydown}
-        spellcheck="false"
-        autocomplete="off"
-        autocapitalize="off"
-      ></textarea>
+      {#if isMd && mdMode === 'editor'}
+        <!-- key por tab: remonta el editor al cambiar de archivo (estado y
+             undo history limpios por instancia). -->
+        {#key activeTab.id}
+          <MarkdownEditor
+            initialContent={activeTab.content}
+            onchange={(md) => {
+              if ($activeTabId) markDirty($activeTabId, md);
+            }}
+          />
+        {/key}
+      {:else}
+        <textarea
+          class="w-full h-full resize-none bg-bg text-text font-mono text-sm p-4 focus:outline-none"
+          value={activeTab.content}
+          oninput={handleInput}
+          onkeydown={handleKeydown}
+          spellcheck="false"
+          autocomplete="off"
+          autocapitalize="off"
+        ></textarea>
+      {/if}
     {:else if activeTab?.kind === 'requirements'}
       <RequirementsExplorer projectId={$currentProjectId} />
     {:else if activeTab?.kind === 'grouping'}
@@ -115,12 +141,41 @@
     {/if}
   </div>
 
-  <!-- Footer del viewer: guardar (solo archivos) -->
+  <!-- Footer del viewer: guardar (solo archivos) + toggle md (solo .md) -->
   {#if activeTab?.kind === 'file'}
     <div
-      class="h-8 flex items-center justify-between px-3 border-t border-border bg-bg text-xs"
+      class="h-8 flex items-center gap-3 px-3 border-t border-border bg-bg text-xs"
     >
       <span class="text-text-dim truncate" title={activeTab.path}>{activeTab.path}</span>
+      <div class="flex-1"></div>
+      {#if isMd}
+        <div
+          class="flex items-center rounded-sm border border-border overflow-hidden"
+          role="group"
+          aria-label="Modo de edición del markdown"
+        >
+          <button
+            type="button"
+            class="px-2 py-0.5 text-xs transition-colors {mdMode === 'editor'
+              ? 'bg-surface-3 text-text'
+              : 'bg-surface-2 text-text-dim hover:text-text'}"
+            onclick={() => (mdMode = 'editor')}
+            title="Editor visual (WYSIWYG)"
+          >
+            editor
+          </button>
+          <button
+            type="button"
+            class="px-2 py-0.5 text-xs transition-colors border-l border-border {mdMode === 'texto'
+              ? 'bg-surface-3 text-text'
+              : 'bg-surface-2 text-text-dim hover:text-text'}"
+            onclick={() => (mdMode = 'texto')}
+            title="Editar el markdown como texto crudo"
+          >
+            texto
+          </button>
+        </div>
+      {/if}
       <button
         type="button"
         class="px-2 py-0.5 bg-accent text-bg hover:bg-accent-hover disabled:opacity-50 transition-colors"

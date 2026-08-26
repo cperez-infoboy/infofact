@@ -1,6 +1,6 @@
 // Tests del store de chat: acumulación de tokens, bloques de tool, flujo
 // completo de un stream sintético inyectado directamente en el parser.
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 // Mockeamos streamMessage para inyectar handlers sin fetch real.
 const handlersHolder: {

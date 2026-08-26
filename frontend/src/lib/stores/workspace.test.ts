@@ -1,6 +1,6 @@
 // Tests del store de workspace: normalizeNode maneja缺失children/type defaults.
 import { describe, it, expect } from 'vitest';
-import { normalizeNode } from './workspace';
+import { normalizeNode, parentOf, humanizeWorkspaceError } from './workspace';
 
 describe('workspace store - normalizeNode', () => {
   it('file node sin children', () => {
@@ -80,5 +80,34 @@ describe('workspace store - normalizeNode', () => {
     expect(r.children!.length).toBe(2);
     expect(r.children![0].children![0].name).toBe('b.md');
     expect(r.children![1].type).toBe('file');
+  });
+});
+
+describe('parentOf', () => {
+  it("top-level → '.'", () => {
+    expect(parentOf('a.md')).toBe('.');
+  });
+
+  it('primer nivel', () => {
+    expect(parentOf('docs/a.md')).toBe('docs');
+  });
+
+  it('anidado', () => {
+    expect(parentOf('docs/sub/a.md')).toBe('docs/sub');
+  });
+});
+
+describe('humanizeWorkspaceError', () => {
+  it('mapea códigos conocidos a español', () => {
+    expect(humanizeWorkspaceError('target_exists')).toBe(
+      'Ya existe un elemento con ese nombre en el destino'
+    );
+    expect(humanizeWorkspaceError('is_root')).toBe(
+      'La raíz del workspace no se puede modificar'
+    );
+  });
+
+  it('código desconocido se muestra tal cual', () => {
+    expect(humanizeWorkspaceError('weird_code')).toBe('weird_code');
   });
 });

@@ -226,6 +226,20 @@
     background: var(--color-surface);
   }
 
+  /* ===== Tiptap markdown editor (MarkdownEditor.svelte) =====
+     .md-body ya aporta la tipografía del contenido (headings, listas,
+     tablas, código); acá solo lo mínimo del contenteditable. */
+  .md-editor .ProseMirror {
+    outline: none;
+    min-height: 100%;
+  }
+  .md-editor .ProseMirror > *:first-child {
+    margin-top: 0;
+  }
+  .md-editor .selectedCell {
+    background: var(--color-surface-2);
+  }
+
   * {
     scrollbar-width: thin;
     scrollbar-color: var(--color-surface-3) transparent;
