@@ -60,7 +60,7 @@ async def test_critique_refinement_runs_concurrently(monkeypatch):
     """Within one batch, refinement _judge_item calls overlap in time."""
     items = [_item(i) for i in range(5)]
 
-    async def fake_judge_batch(batch, neighbors_by_id, *, rules=None):
+    async def fake_judge_batch(batch, neighbors_by_id, *, rules=None, **kw):
         return [_non_clean(it) for it in batch], crt.BatchStats(batch_calls=1)
 
     monkeypatch.setattr(crt, "_judge_batch", fake_judge_batch)
@@ -69,7 +69,7 @@ async def test_critique_refinement_runs_concurrently(monkeypatch):
     max_in_flight = 0
 
     async def fake_judge_item(item, neighbors=None, *, attempts=3,
-                              transient_retries=8, rules=None):
+                              transient_retries=8, rules=None, **kw):
         nonlocal in_flight, max_in_flight
         in_flight += 1
         max_in_flight = max(max_in_flight, in_flight)
@@ -96,7 +96,7 @@ async def test_critique_peak_concurrency_bounded_by_semaphore(monkeypatch):
     """The decoupled refinement still respects `concurrency` as a hard cap."""
     items = [_item(i) for i in range(8)]
 
-    async def fake_judge_batch(batch, neighbors_by_id, *, rules=None):
+    async def fake_judge_batch(batch, neighbors_by_id, *, rules=None, **kw):
         return [_non_clean(it) for it in batch], crt.BatchStats(batch_calls=1)
 
     monkeypatch.setattr(crt, "_judge_batch", fake_judge_batch)
@@ -105,7 +105,7 @@ async def test_critique_peak_concurrency_bounded_by_semaphore(monkeypatch):
     max_in_flight = 0
 
     async def fake_judge_item(item, neighbors=None, *, attempts=3,
-                              transient_retries=8, rules=None):
+                              transient_retries=8, rules=None, **kw):
         nonlocal in_flight, max_in_flight
         in_flight += 1
         max_in_flight = max(max_in_flight, in_flight)

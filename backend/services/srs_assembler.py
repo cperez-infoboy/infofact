@@ -344,6 +344,28 @@ async def _build_narrative_context(
     if project_description:
         parts.append(f"\n## Descripción del proyecto\n{project_description}")
 
+    # Reglas persistentes del proyecto (scope srs + all): consideraciones
+    # duraderas del usuario que dirigen la redacción. Best-effort — si el
+    # harness no carga, la narrativa sigue sin reglas.
+    try:
+        from backend.database import AsyncSessionLocal
+        from backend.models.project_rule import RuleScope
+        from backend.services import project_rules_store
+
+        async with AsyncSessionLocal() as session:
+            rules_block = await project_rules_store.rules_block_for(
+                session, project_id, RuleScope.SRS
+            )
+        if rules_block:
+            parts.append("\n## Reglas del proyecto\n" + rules_block)
+    except Exception:  # noqa: BLE001 — best-effort
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "narrative: no se pudieron cargar las reglas del proyecto",
+            exc_info=True,
+        )
+
     # Top-20 requerimientos por prioridad.
     parts.append("\n## Requerimientos (muestra)")
     sorted_items = sorted(

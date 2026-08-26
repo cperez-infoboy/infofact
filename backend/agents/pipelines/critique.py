@@ -253,6 +253,7 @@ async def _judge_item(
     attempts: int = _JUDGE_ATTEMPTS,
     transient_retries: int = _TRANSIENT_RETRIES,
     rules: DocumentRules | None = None,
+    rules_block: str = "",
 ) -> CritiqueVerdict:
     """Single LLM critic pass over one item.
 
@@ -281,6 +282,8 @@ async def _judge_item(
     conventions_block = _format_conventions_block(rules) if rules else ""
     if conventions_block:
         lines.append(conventions_block)
+    if rules_block:
+        lines.append(rules_block)
     user = "\n".join(lines)
     msgs = [("system", _CRITIC_SYSTEM), ("human", user)]
     parse_fails = 0
@@ -319,6 +322,7 @@ async def _per_item_fallback(
     neighbors_by_id: dict[str, list[RawRequirement]] | None = None,
     *,
     rules: DocumentRules | None = None,
+    rules_block: str = "",
 ) -> list[CritiqueVerdict]:
     """Run `_judge_item` concurrently for each item.
 
@@ -331,7 +335,8 @@ async def _per_item_fallback(
 
     async def _one(it: RawRequirement) -> CritiqueVerdict:
         return await _judge_item(
-            it, (neighbors_by_id or {}).get(it.id), rules=rules
+            it, (neighbors_by_id or {}).get(it.id), rules=rules,
+            rules_block=rules_block,
         )
 
     return list(await asyncio.gather(*[_one(it) for it in items]))
@@ -343,6 +348,7 @@ async def _judge_batch(
     *,
     max_tokens: int = BATCH_MAX_TOKENS,
     rules: DocumentRules | None = None,
+    rules_block: str = "",
 ) -> tuple[list[CritiqueVerdict], BatchStats]:
     """Batch-mode critic pass over M items in one LLM call.
 
@@ -370,7 +376,8 @@ async def _judge_batch(
     if len(items) == 1:
         only = items[0]
         v = await _judge_item(
-            only, (neighbors_by_id or {}).get(only.id), rules=rules
+            only, (neighbors_by_id or {}).get(only.id), rules=rules,
+            rules_block=rules_block,
         )
         return [v], stats
 
@@ -396,6 +403,8 @@ async def _judge_batch(
     conventions_block = _format_conventions_block(rules) if rules else ""
     if conventions_block:
         user = user + "\n---\n" + conventions_block
+    if rules_block:
+        user = user + "\n---\n" + rules_block
     msgs = [("system", _CRITIC_BATCH_SYSTEM), ("human", user)]
 
     llm = structured_llm(CritiqueBatch)
@@ -417,7 +426,8 @@ async def _judge_batch(
                         transient_fails, len(items),
                     )
                     fallback = await _per_item_fallback(
-                        items, neighbors_by_id, rules=rules
+                        items, neighbors_by_id, rules=rules,
+                        rules_block=rules_block,
                     )
                     stats.fallback += len(fallback)
                     return fallback, stats
@@ -436,7 +446,8 @@ async def _judge_batch(
                         parse_fails, len(items),
                     )
                     fallback = await _per_item_fallback(
-                        items, neighbors_by_id, rules=rules
+                        items, neighbors_by_id, rules=rules,
+                        rules_block=rules_block,
                     )
                     stats.fallback += len(fallback)
                     return fallback, stats
@@ -454,7 +465,7 @@ async def _judge_batch(
             len(missing), len(items),
         )
         omitted_verdicts = await _per_item_fallback(
-            missing, neighbors_by_id, rules=rules
+            missing, neighbors_by_id, rules=rules, rules_block=rules_block
         )
         stats.omitted += len(missing)
         for it, v in zip(missing, omitted_verdicts):
@@ -549,6 +560,7 @@ async def critique_item(
     max_iter: int = DEFAULT_MAX_ITER,
     _initial_verdict: CritiqueVerdict | None = None,
     rules: DocumentRules | None = None,
+    rules_block: str = "",
 ) -> tuple[RawRequirement | None, CritiqueVerdict]:
     """Generator-critic loop over one item.
 
@@ -573,7 +585,7 @@ async def critique_item(
     current = item
     quality_flags = programmatic_findings_for_text(current.statement)
     verdict = _initial_verdict or await _judge_item(
-        current, neighbors, rules=rules
+        current, neighbors, rules=rules, rules_block=rules_block
     )
     verdict = _apply_quality_flags(verdict, quality_flags)
     refinements = 0
@@ -582,7 +594,9 @@ async def critique_item(
            and verdict.suggested_rewrite
            and refinements < max_iter):
         current = current.model_copy(update={"statement": verdict.suggested_rewrite})
-        verdict = await _judge_item(current, neighbors, rules=rules)
+        verdict = await _judge_item(
+            current, neighbors, rules=rules, rules_block=rules_block
+        )
         # Recomputa las señales sobre el enunciado reescrito: si la
         # reescritura corrigió el defecto, la señal desaparece (idempotente).
         verdict = _apply_quality_flags(
@@ -612,6 +626,7 @@ async def critique_all(
     concurrency: int = DEFAULT_CONCURRENCY,
     batch_size: int = DEFAULT_BATCH_SIZE,
     rules: DocumentRules | None = None,
+    rules_block: str = "",
     on_progress: Callable[[int, int], Awaitable[None]] | None = None,
 ) -> CritiqueResult:
     """Run the critic over all items concurrently. Returns survivors + verdicts.
@@ -662,6 +677,7 @@ async def critique_all(
             async with sem:
                 fv, bstats = await _judge_batch(
                     to_judge, neighbors_by_id, rules=rules,
+                    rules_block=rules_block,
                 )
             agg.batch_calls += bstats.batch_calls
             agg.omitted += bstats.omitted
@@ -680,6 +696,7 @@ async def critique_all(
                 return await critique_item(
                     it, neighbors=nbrs, max_iter=max_iter,
                     _initial_verdict=v, rules=rules,
+                    rules_block=rules_block,
                 )
 
         if to_judge:
@@ -697,7 +714,9 @@ async def critique_all(
         # Dangling: no LLM (critique_item short-circuits to _dangling_verdict),
         # so no semaphore needed.
         for it in dangling:
-            kept, v = await critique_item(it, max_iter=max_iter, rules=rules)
+            kept, v = await critique_item(
+                it, max_iter=max_iter, rules=rules, rules_block=rules_block
+            )
             done += 1
             if done % 10 == 0 or done == total:
                 logger.info("critique progress: %d/%d", done, total)

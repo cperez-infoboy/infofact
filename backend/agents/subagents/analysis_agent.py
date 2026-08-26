@@ -182,6 +182,12 @@ mensajes van en español neutro.
 falla reiteradamente, reportalo en vez de entrar en loop.
 - Tras commit_analysis el analisis queda en estado CANDIDATE; el usuario lo \
 revisa y lo cierra (LOCKED) desde la UI.
+- REGLAS PERSISTENTES: el proyecto tiene consideraciones duraderas que se \
+inyectan como bloque PROJECT_RULES en discover_projects. Si el usuario pide \
+que algo valga "de ahora en mas" (restriccion tecnologica permanente, \
+criterio de fronteras), registrilo con add_project_rule (scope analysis o \
+all); si lo revoca, retire_project_rule. Reporta los conflicts que devuelva \
+la tool antes de dejar dos reglas que se pisen.
 """
 
 
@@ -610,6 +616,27 @@ las fronteras usando métricas objetivas del grafo del MER. Requiere que \
             all_goals = await list_goals(session, project_id)
         active = [g for g in all_goals if g.status != GoalStatus.REJECTED]
 
+        # Reglas persistentes del proyecto (scope analysis + all): el harness
+        # dirige las fronteras de subdominios con las consideraciones duraderas.
+        # Best-effort: sin harness, la etapa corre sin bloque.
+        from backend.models.project_rule import RuleScope
+        from backend.services import project_rules_store
+
+        try:
+            async with AsyncSessionLocal() as session:
+                project_rules_block = await project_rules_store.rules_block_for(
+                    session, project_id, RuleScope.ANALYSIS
+                )
+        except Exception:  # noqa: BLE001 — additive steering only
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "project rules unavailable; discover_projects runs "
+                "without PROJECT_RULES",
+                exc_info=True,
+            )
+            project_rules_block = ""
+
         result = await _discover_projects(
             mer_result=run.mer_result,
             process_result=run.process_result,
@@ -618,6 +645,7 @@ las fronteras usando métricas objetivas del grafo del MER. Requiere que \
             project_description=run.project_description,
             goals=active,
             feedback=run.feedback or "",
+            rules_block=project_rules_block,
         )
         run.project_result = result
         run.stages_done.add(STAGE_PROJECTS)
@@ -1527,6 +1555,9 @@ def make_analysis_agent_subagent(
     recibe en ``subagents=[...]`` y DeepAgents envuelve como tool ``task``.
     """
     stage_tools = _make_stage_tools(project_id, project_name, project_description)
+    from backend.agents.tools.project_rules_tools import make_project_rules_tools
+
+    rules_tools = make_project_rules_tools(project_id)
     return {
         "name": "analysis-agent",
         "description": (
@@ -1541,7 +1572,7 @@ def make_analysis_agent_subagent(
             "sub-proyectos -> arquitectura -> commit)."
         ),
         "system_prompt": ANALYSIS_AGENT_PROMPT,
-        "tools": stage_tools + _make_read_tools(project_id),
+        "tools": stage_tools + _make_read_tools(project_id) + rules_tools,
         # deepagents NO propaga el middleware del orquestador a los
         # subagentes (pero SI les inyecta FilesystemMiddleware): cada spec
         # necesita su guarda de tamaño y su filtro de tools de filesystem.

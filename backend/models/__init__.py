@@ -6,6 +6,12 @@ from backend.models.document_embedding import DocumentEmbedding
 from backend.models.document_parse import DocumentParse
 from backend.models.project import Project
 from backend.models.project_document import ProjectDocument
+from backend.models.project_rule import (
+    ProjectRule,
+    RuleScope,
+    RuleSource,
+    RuleStatus,
+)
 from backend.models.requirement import (
     ChangedBy,
     GroupDecision,
@@ -56,6 +62,10 @@ __all__ = [
     "User",
     "Project",
     "ProjectDocument",
+    "ProjectRule",
+    "RuleScope",
+    "RuleSource",
+    "RuleStatus",
     "DocumentParse",
     "DocumentEmbedding",
     "ChatSession",

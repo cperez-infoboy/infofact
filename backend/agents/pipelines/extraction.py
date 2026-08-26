@@ -331,13 +331,16 @@ async def extract_chunk(
     project_name: str,
     project_description: str,
     rules: DocumentRules | None = None,
+    rules_block: str = "",
 ) -> ChunkExtraction:
     """Extract explicit requirements from one chunk.
 
     ``rules`` (optional) carries run-level conventions. When
     ``rules.priority_field_label`` is set, it is surfaced in the user message
     so the extractor knows which labeled field to read for ``priority_hint``.
-    Default None preserves the historical behavior.
+    ``rules_block`` (optional) is the persistent PROJECT_RULES block; it goes
+    BEFORE the chunk text so long chunks cannot bury it (lost-in-the-middle).
+    Defaults preserve the historical behavior.
     """
     llm = _structured_llm(ChunkExtraction)
     lines = [
@@ -348,6 +351,8 @@ async def extract_chunk(
         lines.append(
             f"PRIORITY_FIELD_LABEL: {rules.priority_field_label}"
         )
+    if rules_block:
+        lines.append(rules_block)
     lines.append(f"CHUNK:\n{chunk.text}")
     user = "\n".join(lines)
     result = await llm.ainvoke([("system", _EXTRACTOR_SYSTEM), ("human", user)])
@@ -366,6 +371,7 @@ async def extract_all(
     project_description: str,
     concurrency: int = DEFAULT_CONCURRENCY,
     rules: DocumentRules | None = None,
+    rules_block: str = "",
     on_progress: Callable[[int, int], Awaitable[None]] | None = None,
 ) -> list[RawRequirement]:
     """Extract across all chunks (multi-document safe), then verify spans.
@@ -391,6 +397,7 @@ async def extract_all(
                     project_name=project_name,
                     project_description=project_description,
                     rules=rules,
+                    rules_block=rules_block,
                 )
                 return res.items
             except Exception:

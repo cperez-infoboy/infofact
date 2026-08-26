@@ -486,6 +486,9 @@ from backend.routers import srs as srs_router
 app.include_router(srs_router.router, prefix="/api", tags=["srs"])
 from backend.routers import analysis as analysis_router
 app.include_router(analysis_router.router, prefix="/api", tags=["analysis"])
+# Harness de reglas persistentes del proyecto (captura / análisis / SRS).
+from backend.routers import project_rules as project_rules_router
+app.include_router(project_rules_router.router, prefix="/api", tags=["project-rules"])
 # Explorar / editar archivos del workspace del usuario.
 app.include_router(workspaces.router, prefix="/api/workspaces", tags=["workspaces"])
 # Documentos fuente del proyecto: upload binario + scan + CRUD (Fase A ingesta).

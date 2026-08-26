@@ -313,6 +313,7 @@ async def _classify_item(
     attempts: int = _CLASSIFY_ATTEMPTS,
     transient_retries: int = _TRANSIENT_RETRIES,
     rules: DocumentRules | None = None,
+    rules_block: str = "",
 ) -> ClassificationDecision:
     """One LLM classification call over one item.
 
@@ -339,6 +340,8 @@ async def _classify_item(
     conventions_block = _format_conventions_block(rules)
     if conventions_block:
         lines.append(conventions_block)
+    if rules_block:
+        lines.append(rules_block)
     user = "\n".join(lines)
     msgs = [("system", _CLASSIFY_SYSTEM), ("human", user)]
     parse_fails = 0
@@ -375,6 +378,7 @@ async def _per_item_fallback_classify(
     items: list[RawRequirement],
     *,
     rules: DocumentRules | None = None,
+    rules_block: str = "",
 ) -> list[ClassificationDecision]:
     """Run `_classify_item` concurrently for each item.
 
@@ -384,7 +388,12 @@ async def _per_item_fallback_classify(
     if not items:
         return []
     return list(
-        await asyncio.gather(*[_classify_item(it, rules=rules) for it in items])
+        await asyncio.gather(
+            *[
+                _classify_item(it, rules=rules, rules_block=rules_block)
+                for it in items
+            ]
+        )
     )
 
 
@@ -393,6 +402,7 @@ async def _classify_batch(
     *,
     max_tokens: int = BATCH_MAX_TOKENS,
     rules: DocumentRules | None = None,
+    rules_block: str = "",
 ) -> tuple[list[ClassificationDecision], BatchStats]:
     """Batch-mode classifier pass over M items in one LLM call.
 
@@ -409,7 +419,7 @@ async def _classify_batch(
         return [], stats
     if len(items) == 1:
         only = items[0]
-        d = await _classify_item(only, rules=rules)
+        d = await _classify_item(only, rules=rules, rules_block=rules_block)
         return [d], stats
 
     # Build the batch user message.
@@ -430,6 +440,8 @@ async def _classify_batch(
         # Appended ONCE after the last item so every item sees the same
         # legend/scope context while keeping per-item blocks intact.
         user = user + "\n---\n" + conventions_block
+    if rules_block:
+        user = user + "\n---\n" + rules_block
     msgs = [("system", _CLASSIFY_BATCH_SYSTEM), ("human", user)]
 
     llm = structured_llm(ClassificationBatch)
@@ -451,7 +463,7 @@ async def _classify_batch(
                         transient_fails, len(items),
                     )
                     fallback = await _per_item_fallback_classify(
-                        items, rules=rules
+                        items, rules=rules, rules_block=rules_block
                     )
                     stats.fallback += len(fallback)
                     return fallback, stats
@@ -470,7 +482,7 @@ async def _classify_batch(
                         parse_fails, len(items),
                     )
                     fallback = await _per_item_fallback_classify(
-                        items, rules=rules
+                        items, rules=rules, rules_block=rules_block
                     )
                     stats.fallback += len(fallback)
                     return fallback, stats
@@ -489,7 +501,9 @@ async def _classify_batch(
             "classify batch omitted %d/%d items; routing to per-item",
             len(missing), len(items),
         )
-        omitted = await _per_item_fallback_classify(missing, rules=rules)
+        omitted = await _per_item_fallback_classify(
+            missing, rules=rules, rules_block=rules_block
+        )
         stats.omitted += len(missing)
         for it, d in zip(missing, omitted):
             by_id[it.id] = d
@@ -603,6 +617,7 @@ async def classify_all(
     concurrency: int = DEFAULT_CONCURRENCY,
     batch_size: int = DEFAULT_BATCH_SIZE,
     rules: DocumentRules | None = None,
+    rules_block: str = "",
 ) -> ClassificationResult:
     """Classify every item; optionally decompose the high-level ones.
 
@@ -636,7 +651,9 @@ async def classify_all(
 
     async def _one_batch(batch: list[RawRequirement]):
         async with sem:
-            first_decisions, bstats = await _classify_batch(batch, rules=rules)
+            first_decisions, bstats = await _classify_batch(
+                batch, rules=rules, rules_block=rules_block
+            )
             agg.batch_calls += bstats.batch_calls
             agg.omitted += bstats.omitted
             agg.fallback += bstats.fallback

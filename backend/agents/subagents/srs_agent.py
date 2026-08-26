@@ -130,6 +130,13 @@ traduzcas). Los mensajes van en español neutro.
 etapa falla reiteradamente, reportalo en vez de entrar en loop.
 - Tras commit_srs el SRS queda en estado CANDIDATE; el usuario lo revisa \
 (edita narrativa, marca pendientes) y lo cierra (LOCKED) desde la UI.
+- REGLAS PERSISTENTES: el proyecto tiene consideraciones duraderas (scope srs \
++ all) que el contexto narrativo inyecta automaticamente como bloque \
+PROJECT_RULES. Si el usuario pide que un criterio de redaccion valga "de \
+ahora en mas" (terminologia obligatoria, tono, secciones que no pueden \
+faltar), registrilo con add_project_rule (scope srs o all) para que persista \
+en futuras generaciones del SRS; si lo revoca, retire_project_rule. Las \
+indicaciones de UNA generacion siguen yendo por `instructions`.
 """
 
 
@@ -678,7 +685,10 @@ def make_srs_agent_subagent(
     stage_tools = _make_stage_tools(project_id, project_name, project_description)
     doc_tools = make_document_read_tools(project_id)
     srs_read_tools = make_srs_read_tools(project_id)
-    tools = stage_tools + doc_tools + srs_read_tools
+    from backend.agents.tools.project_rules_tools import make_project_rules_tools
+
+    rules_tools = make_project_rules_tools(project_id)
+    tools = stage_tools + doc_tools + srs_read_tools + rules_tools
     return {
         "name": "srs-agent",
         "description": (

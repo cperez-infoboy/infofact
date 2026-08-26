@@ -72,8 +72,11 @@ from backend.agents.subagents.capture_run_holder import (
 )
 from backend.agents.size_guard import SizeGuardMiddleware
 from backend.agents.tools.grouping_tools import make_grouping_tools
+from backend.agents.tools.project_rules_tools import make_project_rules_tools
 from backend.agents.tools.requirements_tools import make_requirements_tools
 from backend.agents.tools.vision_tools import make_vision_tools
+from backend.models.project_rule import RuleScope, RuleSource
+from backend.services import project_rules_store
 
 
 REQUIREMENTS_CAPTURE_AGENT_PROMPT = """\
@@ -191,6 +194,17 @@ saltear):
 - Los requerimientos viven en la base de datos del backend, fuera del sandbox:
   nunca los busques en archivos del workspace (no hay .db ni .sqlite
   accesibles) — el workspace solo contiene los documentos fuente del proyecto.
+
+REGLAS PERSISTENTES DEL PROYECTO: el proyecto tiene un harness de
+consideraciones duraderas. Los stages inyectan automaticamente las activas
+(scope capture) como bloque PROJECT_RULES en los prompts del pipeline. Si el
+usuario pide que algo valga "de ahora en mas" (prestar atencion a un tema,
+tratamiento especial de terminos, prioridades del cliente), NO lo tengas en
+cuenta solo esta vez: registrilo con add_project_rule (scope: capture |
+analysis | srs | all) para que persista en capturas, analisis y SRS futuros.
+Si pide revocarlo, usa retire_project_rule. Antes de crear, revisa los
+conflicts que devuelve la tool y reporta al usuario si choca con una regla
+activa (retira la perdedora tras confirmarlo).
 
 AGRUPAMIENTO (/agrupar y curacion de planes): NO es una captura. Ninguna
 tarea de agrupamiento (detectar duplicados, revisar planes pendientes,
@@ -475,6 +489,109 @@ async def _mark_used_in_capture(
         await session.commit()
 
 
+async def _project_rules_block(project_id: int) -> str:
+    """Fetch the persistent PROJECT_RULES block (scope capture + all).
+
+    Best-effort: the rules are additive steering — when the harness is
+    unavailable the stage still runs with no block (logged), never aborts.
+    """
+    try:
+        from backend.database import AsyncSessionLocal
+
+        async with AsyncSessionLocal() as session:
+            return await project_rules_store.rules_block_for(
+                session, project_id, RuleScope.CAPTURE
+            )
+    except Exception:  # noqa: BLE001 — additive steering only
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "project rules unavailable; stage runs without PROJECT_RULES",
+            exc_info=True,
+        )
+        return ""
+
+
+async def _persist_convention_rules(project_id: int, document_rules) -> int:
+    """Persist the discovered DocumentRules into the project rules harness.
+
+    Each verbatim signal becomes a ProjectRule (scope=capture,
+    source=conventions) so it survives the run and feeds future captures via
+    the PROJECT_RULES block — today the rules die with the holder. Exact-content
+    dedup: a second run that rediscovers the same signals does not duplicate
+    rows. Best-effort — a failure here degrades to run-only rules (logged,
+    never aborts the stage).
+    """
+    if document_rules is None:
+        return 0
+    entries: list[tuple[str, str]] = []
+    if document_rules.priority_field_label:
+        entries.append((
+            f"Document priority field label: "
+            f"'{document_rules.priority_field_label}' (the labeled field "
+            f"carries the client's explicit priority).",
+            "priority_field_label",
+        ))
+    for entry in document_rules.priority_legend:
+        entries.append((
+            f"Client priority legend label (verbatim): '{entry.label}'.",
+            "priority_legend",
+        ))
+    for marker in document_rules.scope_markers:
+        entries.append((
+            f"Out-of-scope marker (verbatim): '{marker}'.",
+            "scope_marker",
+        ))
+    for term, definition in (
+        document_rules.glossary.items()
+        if isinstance(document_rules.glossary, dict)
+        else (document_rules.glossary or [])
+    ):
+        entries.append((f"Client glossary: '{term}' = {definition}.", "glossary"))
+    if not entries:
+        return 0
+
+    import logging
+
+    log = logging.getLogger(__name__)
+    from backend.database import AsyncSessionLocal
+
+    created = 0
+    try:
+        async with AsyncSessionLocal() as session:
+            existing = {
+                r.content
+                for r in await project_rules_store.list_rules(
+                    session, project_id, scope=RuleScope.CAPTURE
+                )
+            }
+            existing |= {
+                r.content
+                for r in await project_rules_store.list_rules(
+                    session, project_id, scope=RuleScope.ALL
+                )
+            }
+            for content, kind in entries:
+                if content in existing:
+                    continue
+                await project_rules_store.add_rule(
+                    session,
+                    project_id,
+                    scope=RuleScope.CAPTURE,
+                    content=content,
+                    reason=f"discovered by the CONVENTIONS stage ({kind})",
+                    source=RuleSource.CONVENTIONS,
+                    check_conflicts=False,
+                )
+                existing.add(content)
+                created += 1
+            await session.commit()
+    except Exception:  # noqa: BLE001 — best-effort, never abort the stage
+        log.exception("persist_convention_rules failed; rules stay run-only")
+        return 0
+    return created
+
+
 def _no_run(required_first: str) -> dict:
     """Standard reply when a stage tool runs with no active capture."""
     return {
@@ -705,6 +822,9 @@ def _make_stage_tools(
         run.timings[STAGE_CONVENTIONS] = (time.perf_counter() - t0) * 1000
         run.document_rules = document_rules
         run.stages_done.add(STAGE_CONVENTIONS)
+        # Persist the discovered signals as project rules so they survive this
+        # run (exact-content dedup across runs; best-effort).
+        harness_created = await _persist_convention_rules(project_id, document_rules)
         await on_progress(
             STAGE_CONVENTIONS, "convenciones listas",
             {
@@ -720,6 +840,7 @@ def _make_stage_tools(
             "priority_field_label": document_rules.priority_field_label,
             "scope_markers": len(document_rules.scope_markers),
             "glossary_terms": len(document_rules.glossary),
+            "harness_rules_persisted": harness_created,
             "stages_done": sorted(run.stages_done),
         }
 
@@ -746,6 +867,10 @@ def _make_stage_tools(
         await on_progress(STAGE_EXTRACT, "extraccion", {"phase": "start"})
         t0 = time.perf_counter()
 
+        # Persistent project rules (scope capture + all): fetched per stage so
+        # a rule added mid-run applies from the next stage.
+        project_rules_block = await _project_rules_block(project_id)
+
         async def _extract_progress(done: int, total: int):
             await on_progress(
                 STAGE_EXTRACT, f"{done}/{total} fragmentos",
@@ -758,6 +883,7 @@ def _make_stage_tools(
             project_name=run.project_name,
             project_description=run.project_description,
             rules=run.document_rules,
+            rules_block=project_rules_block,
             on_progress=_extract_progress,
         )
         gap_results = await asyncio.gather(*[
@@ -900,8 +1026,11 @@ def _make_stage_tools(
                 {"current": done, "total": total},
             )
 
+        project_rules_block = await _project_rules_block(project_id)
+
         crit = await critique_all(
             run.cons.items, rules=run.document_rules,
+            rules_block=project_rules_block,
             on_progress=_crit_progress,
         )
         await on_event("validation.report", {
@@ -946,7 +1075,13 @@ def _make_stage_tools(
         on_progress, _on_event = _make_emitters()
         await on_progress(STAGE_CLASSIFY, "clasificacion", {"phase": "start"})
         t0 = time.perf_counter()
-        cls = await classify_all(run.crit.items, rules=run.document_rules)
+
+        project_rules_block = await _project_rules_block(project_id)
+
+        cls = await classify_all(
+            run.crit.items, rules=run.document_rules,
+            rules_block=project_rules_block,
+        )
 
         run.timings[STAGE_CLASSIFY] = (time.perf_counter() - t0) * 1000
         run.cls = cls
@@ -1081,6 +1216,7 @@ def make_requirements_capture_agent_subagent(
     editing_tools = make_requirements_tools(project_id)
     grouping_tools = make_grouping_tools(project_id)
     vision_tools = make_vision_tools(profile, project_slug)
+    rules_tools = make_project_rules_tools(project_id)
 
     return {
         "name": "requirements-capture-agent",
@@ -1105,6 +1241,7 @@ def make_requirements_capture_agent_subagent(
             *editing_tools,
             *grouping_tools,
             *vision_tools,
+            *rules_tools,
         ],
         # deepagents NO propaga el middleware del orquestador a los
         # subagentes (pero SI les inyecta FilesystemMiddleware): cada spec

@@ -220,8 +220,13 @@ def _build_project_context(
     process_result=None,
     adr_result=None,
     feedback: str = "",
+    rules_block: str = "",
 ) -> str:
-    """Build shared context text from project, goals, MER, processes and ADRs."""
+    """Build shared context text from project, goals, MER, processes and ADRs.
+
+    ``rules_block`` (optional) is the persistent PROJECT_RULES block — appended
+    last so the user's durable considerations close the context.
+    """
     lines: list[str] = []
 
     if feedback:
@@ -287,6 +292,10 @@ def _build_project_context(
             lines.append(entry)
         lines.append("")
 
+    if rules_block:
+        lines.append(rules_block.rstrip())
+        lines.append("")
+
     return "\n".join(lines)
 
 
@@ -304,11 +313,13 @@ async def _discover_projects(
     process_result=None,
     adr_result=None,
     feedback: str = "",
+    rules_block: str = "",
 ) -> list[ProjectSkeleton]:
     """Pass 1: discover project areas by grouping bounded contexts."""
     context = _build_project_context(
         project_name, project_description, goals,
         mer_result, process_result, adr_result, feedback,
+        rules_block=rules_block,
     )
     msgs = [("system", _PROJECT_DISCOVERY_PROMPT), ("human", context)]
     llm = structured_llm(ProjectSchema)
@@ -458,6 +469,7 @@ async def _critique_projects(
     project_name: str = "",
     project_description: str = "",
     goals: list[Any] | None = None,
+    rules_block: str = "",
 ) -> ProjectCritiqueSchema | None:
     """Pass 3: LLM critique using objective metrics."""
     # Format projects for the prompt.
@@ -492,6 +504,8 @@ async def _critique_projects(
         f"PROYECTOS PROPUESTOS:\n{proj_summary}\n\n"
         f"{metrics_text}\n"
     )
+    if rules_block:
+        user_text += f"\n{rules_block}\n"
     msgs = [("system", _PROJECT_CRITIQUE_PROMPT), ("human", user_text)]
     llm = structured_llm(ProjectCritiqueSchema)
     try:
@@ -518,6 +532,7 @@ async def _refine_projects(
     mer_result=None,
     process_result=None,
     adr_result=None,
+    rules_block: str = "",
 ) -> list[ProjectSkeleton]:
     """Pass 4: adjust boundaries based on critique suggestions."""
     suggestions_text = "\n".join(
@@ -545,6 +560,7 @@ async def _refine_projects(
     context = _build_project_context(
         project_name, project_description, goals,
         mer_result, process_result, adr_result, feedback=feedback,
+        rules_block=rules_block,
     )
     msgs = [("system", _PROJECT_REFINE_PROMPT), ("human", context)]
     llm = structured_llm(ProjectSchema)
@@ -573,6 +589,7 @@ async def discover_projects(
     goals: list[Any] | None = None,
     enable_critique: bool = True,
     feedback: str = "",
+    rules_block: str = "",
 ) -> ProjectResult:
     """Discover project areas (DDD subdomains) from MER + processes + ADRs.
 
@@ -600,6 +617,7 @@ async def discover_projects(
         process_result=process_result,
         adr_result=adr_result,
         feedback=feedback,
+        rules_block=rules_block,
     )
 
     if not projects:
@@ -623,6 +641,7 @@ async def discover_projects(
             project_name=project_name,
             project_description=project_description,
             goals=goals,
+            rules_block=rules_block,
         )
 
         if critique is not None:
@@ -640,6 +659,7 @@ async def discover_projects(
                     mer_result=mer_result,
                     process_result=process_result,
                     adr_result=adr_result,
+                    rules_block=rules_block,
                 )
                 if refined:
                     projects = refined
