@@ -41,6 +41,10 @@ def build_llm(
         base_url=settings.llm_base_url,
         temperature=temperature,
         streaming=streaming,
+        # Incidente sesion 49: sin max_tokens explicito el proxy cortaba la
+        # salida en 4096 tokens (finish_reason=length) y write_file llegaba
+        # con args vacios. Env-tunable via LLM_MAX_TOKENS.
+        max_tokens=settings.llm_max_tokens,
         # Z.ai (glm-5.2) sometimes stalls mid-stream: TCP stays open but chunks
         # stop arriving. langchain_openai's default 120s then aborts with
         # StreamChunkTimeoutError. 300s (5 min) gives margin for provider

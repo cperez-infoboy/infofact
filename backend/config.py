@@ -47,6 +47,15 @@ class Settings(BaseSettings):
     llm_api_key: str = ""
     llm_base_url: str = "https://api.z.ai/api/coding/paas/v4"
     llm_model: str = "glm-5.2"
+    # Tope de tokens de SALIDA por llamada al modelo. Sin este valor el
+    # request no envia max_tokens y el proxy OpenAI-compatible aplica su
+    # default (4096): razonamiento + un write_file grande (~10K chars =
+    # 3-4K tokens) no entra, la respuesta se corta a mitad del tool_use
+    # (finish_reason=length) y los argumentos llegan vacios -> "file_path:
+    # Field required" en loop de reintentos (incidente sesion 49). 32K
+    # cubre escrituras de documentos completos (SRS ~30-50K chars) mas
+    # razonamiento; es un techo, no un presupuesto, asi que no tiene costo.
+    llm_max_tokens: int = 32_768
 
     # Vision (image understanding) for /captura over diagrams and UI mockups.
     # GLM-5.2 is text-only; vision needs a separate multimodal model. By default
