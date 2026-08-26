@@ -100,6 +100,28 @@ def _build_model() -> ChatOpenAI:
     return build_llm()
 
 
+def _workspace_paths_block(project_slug: str) -> str:
+    """Convención de rutas del workspace, anexada al prompt del orquestador.
+
+    Sin este bloque el modelo inventaba prefijos absolutos (`/workspace/...`)
+    y pagaba un ciclo por corrección con "path escapes project workspace"
+    (sesión 50 de planitrack2-0). Las rutas relativas ya funcionan tal cual:
+    solo falta decírselo explícitamente.
+    """
+    return (
+        "\n\n## Convención de rutas del workspace\n"
+        "Las tools de archivos (`ls`, `read_file`, `glob`, `grep`, "
+        "`write_file`, `edit_file`) resuelven las rutas RELATIVAS a la raíz "
+        "del proyecto actual, que es además su directorio de trabajo.\n"
+        '- Correcto (relativo): `ls(".")`, `ls("Observaciones")`, '
+        '`read_file("docs/plan.md")`. Úselas siempre que pueda.\n'
+        "- La raíz NO es `/workspace` ni la raíz del container (`/`): un path "
+        "absoluto inventado produce error y obliga a reintentar.\n"
+        f"- Solo si necesita una ruta absoluta, la raíz del proyecto es "
+        f"`/workspaces/{project_slug}/`."
+    )
+
+
 async def build_checkpointer() -> AsyncSqliteSaver:
     """Crea y configura el AsyncSqliteSaver sobre settings.checkpointer_db.
 
@@ -167,6 +189,9 @@ def build_agent(
         if project_description:
             header += f" Descripción: {project_description}"
         system_prompt = header + "\n\n" + system_prompt
+    # La convención va SIEMPRE (con o sin nombre de proyecto): es lo que
+    # evita que las tools de archivos reciban prefijos absolutos inventados.
+    system_prompt += _workspace_paths_block(project_slug)
     # Requirements phase gets the agent-driven capture subagent: a staged
     # orchestrator that reasons the capture stage by stage and owns the editing
     # tools. project_id is closed over so the model cannot address another
