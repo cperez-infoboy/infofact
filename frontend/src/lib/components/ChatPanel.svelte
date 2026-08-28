@@ -20,9 +20,11 @@
     Message,
     UserMessage,
     AssistantMessage,
+    ThinkingMessage,
     ToolMessage
   } from '$lib/stores/chat';
   import { renderMarkdown } from '$lib/utils/markdown';
+  import { revealStep, REVEAL_TICK_MS } from '$lib/utils/typewriter';
   import { searchFiles, type SearchEntry } from '$lib/api/workspaces';
   import {
     parseAtTrigger,
@@ -115,6 +117,54 @@
   // Estado mostrar/ocultar JSON de input/output por tool id.
   let expandedToolDetails: Record<string, boolean> = $state({});
 
+  // --- Typewriter: reveal progresivo del texto en streaming ---------------
+  // Estado solo de RENDER: el store conserva el contenido completo (historial
+  // y respuestas cerradas intactos); este mapa acota cuántos caracteres de
+  // cada assistant message EN streaming se pintan por tick. Un interval avanza
+  // el reveal con paso adaptativo (revealStep): con streaming real sigue al
+  // ritmo de llegada; ante una ráfaga (respuesta completa en un frame) drena
+  // en ~10 ticks en vez de arrastrarse a paso fijo. Mensajes sin streaming se
+  // muestran enteros, sin animación.
+  let revealedChars: Record<string, number> = $state({});
+  let revealTimer: ReturnType<typeof setInterval> | null = null;
+
+  function revealTick(): void {
+    let pending = false;
+    for (const m of get(messages)) {
+      if (m.kind !== 'assistant' || !m.streaming) continue;
+      const current = revealedChars[m.id] ?? 0;
+      if (current >= m.content.length) continue;
+      const next = Math.min(
+        current + revealStep(m.content.length - current),
+        m.content.length
+      );
+      revealedChars[m.id] = next;
+      if (next < m.content.length) pending = true;
+    }
+    if (!pending) stopRevealLoop();
+  }
+
+  function startRevealLoop(): void {
+    if (revealTimer !== null) return;
+    revealTimer = setInterval(revealTick, REVEAL_TICK_MS);
+  }
+
+  function stopRevealLoop(): void {
+    if (revealTimer !== null) {
+      clearInterval(revealTimer);
+      revealTimer = null;
+    }
+  }
+
+  /** Texto visible del assistant message: completo si no está en streaming
+   *  (historial restaurado, respuesta cerrada); prefijo revelado hasta el
+   *  tick actual mientras llega el stream (typewriter). */
+  function revealedContent(msg: AssistantMessage): string {
+    if (!msg.streaming) return msg.content;
+    const shown = revealedChars[msg.id] ?? 0;
+    return msg.content.slice(0, Math.min(shown, msg.content.length));
+  }
+
   // Cuando cambia la sesión, cargar su historial dentro del chat store.
   let lastLoadedSession: number | null = null;
   $effect(() => {
@@ -138,6 +188,7 @@
     // Contar longitud acumulada (token + tool agrega items).
     const currentLen = list.reduce((acc, m) => {
       if (m.kind === 'assistant') return acc + m.content.length;
+      if (m.kind === 'thinking') return acc + m.content.length;
       if (m.kind === 'tool') return acc + (m.output?.length ?? 0) + 1;
       return acc + 1;
     }, 0);
@@ -148,6 +199,15 @@
       });
     }
     lastMsgCount = currentLen;
+  });
+
+  // Arranca/para el loop del typewriter según haya assistant en streaming.
+  $effect(() => {
+    const streaming = $messages.some(
+      (m) => m.kind === 'assistant' && m.streaming
+    );
+    if (streaming) startRevealLoop();
+    else stopRevealLoop();
   });
 
   function handleScroll() {
@@ -356,6 +416,7 @@
   type RenderItem =
     | { type: 'user'; msg: UserMessage }
     | { type: 'assistant'; msg: AssistantMessage; isFinal: boolean }
+    | { type: 'thinking'; msg: ThinkingMessage }
     | { type: 'tool-group'; tools: ToolMessage[] };
 
   function toRenderItems(list: Message[]): RenderItem[] {
@@ -373,16 +434,23 @@
       } else if (m.kind === 'user') {
         items.push({ type: 'user', msg: m });
         i++;
+      } else if (m.kind === 'thinking') {
+        items.push({ type: 'thinking', msg: m });
+        i++;
       } else {
-        // isFinal: el próximo mensaje NO es un tool NI otro assistant → es la
-        // respuesta final del turno. Dos assistants consecutivos (subagente →
-        // orquestador tras delegación via task) hacen que el primero sea
-        // intermedio; sólo el último assistant del turno se renderiza completo.
-        // Foto de sesión: si el relay persistió el flag isIntermediate, es
-        // autoritativo (override de la inferencia posicional).
+        // isFinal: el próximo mensaje NO es un tool, otro assistant NI un
+        // thinking → es la respuesta final del turno. Dos assistants
+        // consecutivos (subagente → orquestador tras delegación via task)
+        // hacen que el primero sea intermedio; sólo el último assistant del
+        // turno se renderiza completo. Foto de sesión: si el relay persistió
+        // el flag isIntermediate, es autoritativo (override de la inferencia
+        // posicional).
         const next = list[i + 1];
         const nextIsToolOrAssistant =
-          next !== undefined && (next.kind === 'tool' || next.kind === 'assistant');
+          next !== undefined &&
+          (next.kind === 'tool' ||
+            next.kind === 'assistant' ||
+            next.kind === 'thinking');
         const isFinal =
           m.isIntermediate !== undefined
             ? !m.isIntermediate
@@ -397,7 +465,10 @@
   let renderItems = $derived(toRenderItems($messages));
 
   // Al desmontar el panel, limpiar timer/búsquedas pendientes del picker.
-  onDestroy(() => closeMention());
+  onDestroy(() => {
+    closeMention();
+    stopRevealLoop();
+  });
 </script>
 
 <section
@@ -439,6 +510,8 @@
           </div>
         {:else if item.type === 'assistant'}
           {@render assistantBlock(item.msg, item.isFinal)}
+        {:else if item.type === 'thinking'}
+          {@render thinkingBlock(item.msg)}
         {:else}
           {@render toolGroupBlock(item.tools)}
         {/if}
@@ -556,14 +629,15 @@
      no se confunda con ella. Expandir muestra texto plano crudo, nunca
      markdown. -->
 {#snippet reasoningBlock(msg: AssistantMessage)}
-  {@const preview = cleanPreview(msg.content)}
+  {@const content = revealedContent(msg)}
+  {@const preview = cleanPreview(content)}
   {#if !msg.streaming && expandedTexts[msg.id]}
     <div class="max-w-[95%] border-l-2 border-border pl-3 py-0.5">
       <div class="text-[10px] uppercase tracking-wider text-text-faint mb-0.5">
         Razonamiento del agente
       </div>
       <div class="text-xs text-text-muted italic whitespace-pre-wrap break-words">
-        {msg.content}
+        {content}
       </div>
       <button
         type="button"
@@ -594,6 +668,48 @@
       </div>
     </div>
   {/if}
+{/snippet}
+
+<!-- Razonamiento interno del modelo (reasoning_content de GLM, evento SSE
+     `thinking`). Mientras llega va expandido (a menos que el usuario lo
+     colapse); al cerrarse queda colapsado con un preview de una línea.
+     Texto plano crudo, nunca markdown; no se restaura en el historial
+     (efímero del turno). -->
+{#snippet thinkingBlock(msg: ThinkingMessage)}
+  {@const expanded = expandedTexts[msg.id] ?? msg.streaming}
+  {@const preview = cleanPreview(msg.content)}
+  <div class="max-w-[95%] border-l-2 border-border pl-3 py-0.5">
+    <button
+      type="button"
+      class="flex items-center gap-1 text-[10px] uppercase tracking-wider text-text-faint cursor-pointer select-none"
+      onclick={() => toggleText(msg.id)}
+    >
+      <svg
+        viewBox="0 0 24 24"
+        class="h-3 w-3 transition-transform"
+        class:rotate-180={expanded}
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        aria-hidden="true"
+      >
+        <path d="m6 9 6 6 6-6" />
+      </svg>
+      Pensamiento interno
+    </button>
+    {#if expanded}
+      <div
+        class="text-xs text-text-faint italic whitespace-pre-wrap break-words mt-0.5"
+      >
+        {msg.content}{#if msg.streaming}<span
+          class="animate-pulse ml-0.5"
+          aria-label="pensando">▋</span
+        >{/if}
+      </div>
+    {:else if preview}
+      <div class="text-xs text-text-faint italic mt-0.5 truncate">{preview}</div>
+    {/if}
+  </div>
 {/snippet}
 
 {#snippet toolGroupBlock(tools: ToolMessage[])}

@@ -57,6 +57,14 @@ class Settings(BaseSettings):
     # razonamiento; es un techo, no un presupuesto, asi que no tiene costo.
     llm_max_tokens: int = 32_768
 
+    # Streaming del modelo conversacional. True: ChatOpenAI usa la API de
+    # streaming (SSE) y el relay recibe AIMessageChunk delta a delta, así el
+    # chat despliega el texto a medida que el modelo genera (typewriter
+    # real). False: cada llamada devuelve el AIMessage completo y el texto
+    # aparece entero al terminar (comportamiento previo). Kill-switch por si
+    # el proveedor OpenAI-compatible falla con SSE.
+    llm_agent_streaming: bool = True
+
     # Vision (image understanding) for /captura over diagrams and UI mockups.
     # GLM-5.2 is text-only; vision needs a separate multimodal model. By default
     # it reuses the agent's endpoint + key (z.ai/glm-4.6v), but vision can point
@@ -95,6 +103,10 @@ class Settings(BaseSettings):
     #   - llm_total_input_chars: ~60K tokens de prompt total por turno.
     relay_max_delta_chars: int = 2_000
     relay_max_assistant_chars: int = 30_000
+    # Techo del thinking (reasoning_content de GLM) por turno. Es texto
+    # EFÍMERO de UI (evento SSE `thinking`): no se persiste ni entra al input
+    # del modelo, así que un techo holgado solo acota el transporte.
+    relay_max_thinking_chars: int = 60_000
     llm_max_message_chars: int = 24_000
     llm_total_input_chars: int = 240_000
 

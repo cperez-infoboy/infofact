@@ -14,10 +14,70 @@ from __future__ import annotations
 import os
 import re
 
+from langchain_core.messages import AIMessageChunk
+from langchain_core.outputs import ChatGenerationChunk
 from langchain_openai import ChatOpenAI
 from langgraph.constants import TAG_NOSTREAM
 
 from backend.config import settings
+
+
+class ChatZai(ChatOpenAI):
+    """ChatOpenAI que preserva el thinking interno del modelo en el stream.
+
+    langchain-openai apunta a la API oficial de OpenAI y descarta los campos
+    no estándar de proveedores third-party: su docstring lo dice explícito
+    ("reasoning_content ... are not extracted or preserved"). Este override
+    copia la cadena de pensamiento del delta a ``additional_kwargs`` del
+    chunk, donde la agregación de langchain_core la concatena (merge_dicts).
+    Campos aceptados: ``delta.reasoning_content`` (convención de facto:
+    Z.ai GLM, DeepSeek, Qwen/vLLM, LiteLLM) y ``delta.reasoning`` (OpenRouter).
+
+    El nombre queda como registro histórico de dónde nació el caso; la
+    lógica es agnóstica del proveedor OpenAI-compatible.
+
+    El relay (routers/chat.py) la reenvía como evento SSE ``thinking`` —
+    efímero de UI: no se persiste en ChatMessage ni se reenvía al modelo.
+
+    Nota: el path NO-streaming convierte con la función module-level
+    ``_convert_dict_to_message`` (no overridable por subclase), así que con
+    LLM_AGENT_STREAMING=false el thinking simplemente no llega:
+    comportamiento previo, sin regresión.
+    """
+
+    def _convert_chunk_to_generation_chunk(
+        self,
+        chunk: dict,
+        default_chunk_class: type,
+        base_generation_info: dict | None,
+    ) -> ChatGenerationChunk | None:
+        generation_chunk = super()._convert_chunk_to_generation_chunk(
+            chunk, default_chunk_class, base_generation_info
+        )
+        if generation_chunk is None or not isinstance(
+            generation_chunk.message, AIMessageChunk
+        ):
+            return generation_chunk
+        # El payload ya llega como dict (model_dump del SDK); el delta está
+        # en choices[0]. Con forma anidada legacy, en chunk["chunk"].
+        choices = chunk.get("choices")
+        if not choices and isinstance(chunk.get("chunk"), dict):
+            choices = chunk["chunk"].get("choices")
+        if not choices:
+            return generation_chunk
+        delta = choices[0].get("delta") or {}
+        # ``reasoning_content``: convención de facto iniciada por DeepSeek y
+        # usada por Z.ai GLM, Qwen/vLLM y los proxies LiteLLM.
+        # ``reasoning``: normalización equivalente de OpenRouter.
+        # Solo strings: si un proveedor manda ``reasoning`` estructurado
+        # (lista/dict de detalles), se descarta y el thinking no llega —
+        # degradación graciosa, sin crash.
+        reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+        if isinstance(reasoning, str) and reasoning:
+            generation_chunk.message.additional_kwargs["reasoning_content"] = (
+                reasoning
+            )
+        return generation_chunk
 
 
 def build_llm(
@@ -35,7 +95,9 @@ def build_llm(
         raise RuntimeError(
             "LLM_API_KEY is not set. Put it in .env (see .env.example)."
         )
-    return ChatOpenAI(
+    return ChatZai(
+        # ChatZai (subclase de ChatOpenAI) preserva reasoning_content de Z.ai
+        # para el evento SSE `thinking`; ver docstring de la clase.
         model=settings.llm_model,
         api_key=settings.llm_api_key,
         base_url=settings.llm_base_url,

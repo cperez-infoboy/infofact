@@ -3,6 +3,7 @@
 //
 // Protocolo (backend/routers/chat.py):
 //   event: token\ndata: {"delta": "..."}
+//   event: thinking\ndata: {"delta": "..."}   (razonamiento interno del modelo, efímero)
 //   event: tool_start\ndata: {"name": "...", "input": {...}}
 //   event: tool_end\ndata: {"name": "...", "output": "..."}
 //   event: completed\ndata: {}
@@ -177,6 +178,9 @@ export interface RelayTruncatedEvent {
 
 export interface StreamHandlers {
   onToken?: (delta: string) => void;
+  /** Delta del razonamiento interno del modelo (reasoning_content de GLM,
+   *  evento SSE `thinking`). Es efímero: no viaja en el historial. */
+  onThinking?: (delta: string) => void;
   onToolStart?: (name: string, input: ToolInput) => void;
   onToolEnd?: (name: string, output: string) => void;
   onRelayTruncated?: (t: RelayTruncatedEvent) => void;
@@ -333,6 +337,11 @@ export function dispatchEvent(ev: ParsedEvent, handlers: StreamHandlers): void {
     case 'token':
       if (typeof payload.delta === 'string') {
         handlers.onToken?.(payload.delta);
+      }
+      break;
+    case 'thinking':
+      if (typeof payload.delta === 'string') {
+        handlers.onThinking?.(payload.delta);
       }
       break;
     case 'tool_start':

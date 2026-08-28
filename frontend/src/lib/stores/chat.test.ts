@@ -372,6 +372,96 @@ describe('api chat + stores - grouping.ready (comando /agrupar)', () => {
   });
 });
 
+describe('chat store - thinking interno (evento SSE thinking)', () => {
+  beforeEach(() => {
+    _resetChatForTests();
+    handlersHolder.handlers = null;
+  });
+
+  it('onThinking abre un thinking message y acumula deltas', async () => {
+    await sendMessage(42, 'hola');
+    const h = handlersHolder.handlers!;
+
+    h.onThinking?.('primer paso ');
+    h.onThinking?.('segundo paso');
+
+    let list: any[] = [];
+    messages.subscribe((v) => (list = v))();
+    const th = list.filter((m) => m.kind === 'thinking');
+    expect(th).toHaveLength(1);
+    expect(th[0].content).toBe('primer paso segundo paso');
+    expect(th[0].streaming).toBe(true);
+  });
+
+  it('el primer token cierra el thinking y abre el segmento assistant', async () => {
+    await sendMessage(42, 'hola');
+    const h = handlersHolder.handlers!;
+
+    h.onThinking?.('razonando…');
+    h.onToken?.('respuesta');
+
+    let list: any[] = [];
+    messages.subscribe((v) => (list = v))();
+    const th = list.find((m) => m.kind === 'thinking');
+    expect(th.streaming).toBe(false);
+    const a = list.find((m) => m.kind === 'assistant');
+    expect(a.content).toBe('respuesta');
+    // Orden cronológico: thinking antes del texto.
+    expect(list.findIndex((m) => m.kind === 'thinking')).toBeLessThan(
+      list.findIndex((m) => m.kind === 'assistant')
+    );
+  });
+
+  it('tool_start cierra el thinking y tool_end cierra el thinking del subagente', async () => {
+    await sendMessage(42, 'delega');
+    const h = handlersHolder.handlers!;
+
+    // Thinking del orquestador cerrado por la tool call;
+    // el thinking del subagente (dentro de task) lo cierra tool_end.
+    h.onThinking?.('pienso que…');
+    h.onToolStart?.('task', { task: 'x' });
+    h.onThinking?.('pensamiento del subagente');
+    h.onToolEnd?.('task', 'ok');
+    h.onCompleted?.();
+
+    let list: any[] = [];
+    messages.subscribe((v) => (list = v))();
+    const thinking = list.filter((m) => m.kind === 'thinking');
+    expect(thinking).toHaveLength(2);
+    expect(thinking.every((m) => m.streaming === false)).toBe(true);
+  });
+
+  it('completed cierra un thinking que quedó abierto', async () => {
+    await sendMessage(42, 'solo pienso');
+    const h = handlersHolder.handlers!;
+
+    h.onThinking?.('sin texto después');
+    h.onCompleted?.();
+
+    let list: any[] = [];
+    messages.subscribe((v) => (list = v))();
+    const th = list.find((m) => m.kind === 'thinking');
+    expect(th.streaming).toBe(false);
+    // Sin tokens no hay assistant vacío.
+    expect(list.some((m) => m.kind === 'assistant')).toBe(false);
+  });
+
+  it('dispatchEvent thinking dispara onThinking con el delta', () => {
+    const calls: string[] = [];
+    dispatchEvent(
+      { event: 'thinking', data: '{"delta":"paso"}' },
+      { onThinking: (d) => calls.push(d) }
+    );
+    expect(calls).toEqual(['paso']);
+  });
+
+  it('dispatchEvent thinking con payload raro no rompe', () => {
+    expect(() =>
+      dispatchEvent({ event: 'thinking', data: '{}' }, {})
+    ).not.toThrow();
+  });
+});
+
 describe('chat store - loadHistoryFromDetail', () => {
   it('mapea roles a Message kinds', () => {
     const history = [

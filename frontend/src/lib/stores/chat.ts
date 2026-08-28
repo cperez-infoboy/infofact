@@ -84,7 +84,19 @@ export interface ToolMessage {
   created_at: string;
 }
 
-export type Message = UserMessage | AssistantMessage | ToolMessage;
+/** Razonamiento interno del modelo (reasoning_content de GLM, evento SSE
+ *  `thinking`). Efímero de UI: NO se persiste en el backend, así que no
+ *  aparece al recargar el historial. Mientras streaming=true se muestra
+ *  expandido; el siguiente texto/tool lo cierra. */
+export interface ThinkingMessage {
+  kind: 'thinking';
+  id: string;
+  content: string;
+  streaming: boolean;
+  created_at: string;
+}
+
+export type Message = UserMessage | AssistantMessage | ThinkingMessage | ToolMessage;
 
 // --- Stores -----------------------------------------------------------------
 
@@ -150,6 +162,40 @@ export function markAssistantTruncated(
     list.map((m) =>
       m.kind === 'assistant' && m.id === assistantId
         ? { ...m, truncated: info }
+        : m
+    )
+  );
+}
+
+/** Crea un thinking message vacío y devuelve su id (deltas siguientes lo
+ *  llenan). Uno por llamada al modelo; el orquestador y cada subagente
+ *  generan el suyo. */
+export function openThinkingMessage(): string {
+  const id = nextId('th');
+  messages.update((list) => [
+    ...list,
+    { kind: 'thinking', id, content: '', streaming: true, created_at: nowIso() }
+  ]);
+  return id;
+}
+
+/** Acumula un delta de thinking en el mensaje indicado. */
+export function appendThinking(thinkingId: string, delta: string): void {
+  messages.update((list) =>
+    list.map((m) =>
+      m.kind === 'thinking' && m.id === thinkingId
+        ? { ...m, content: m.content + delta }
+        : m
+    )
+  );
+}
+
+/** Cierra el thinking message (streaming=false). */
+export function closeThinkingMessage(thinkingId: string): void {
+  messages.update((list) =>
+    list.map((m) =>
+      m.kind === 'thinking' && m.id === thinkingId
+        ? { ...m, streaming: false }
         : m
     )
   );
@@ -243,6 +289,16 @@ export async function sendMessage(sessionId: number, content: string): Promise<b
 
   // Segmento de texto actual (lazy: se abre con el primer token).
   let currentAssistantId: string | null = null;
+  // Thinking interno en curso (lazy: se abre con el primer delta de
+  // reasoning_content). Cualquier transición (texto, tool, cierre) lo cierra:
+  // la siguiente llamada al modelo abre un bloque nuevo.
+  let currentThinkingId: string | null = null;
+  const closeThinking = () => {
+    if (currentThinkingId !== null) {
+      closeThinkingMessage(currentThinkingId);
+      currentThinkingId = null;
+    }
+  };
   // Mapping name -> toolId del tool message que estamos llenando.
   // El backend puede emitir varios tool_start antes de su tool_end
   // (uno por cada tool call). Acumulamos FIFO y matcheamos por nombre.
@@ -250,13 +306,21 @@ export async function sendMessage(sessionId: number, content: string): Promise<b
 
   try {
     const controller = await streamMessage(sessionId, content, {
+      onThinking: (delta) => {
+        if (currentThinkingId === null) {
+          currentThinkingId = openThinkingMessage();
+        }
+        appendThinking(currentThinkingId, delta);
+      },
       onToken: (delta) => {
+        closeThinking();
         if (currentAssistantId === null) {
           currentAssistantId = openAssistantMessage();
         }
         appendToken(currentAssistantId, delta);
       },
       onToolStart: (name, input) => {
+        closeThinking();
         // Cerrar el segmento de texto actual (drop si quedó vacío).
         if (currentAssistantId !== null) {
           closeAssistantMessage(currentAssistantId, true);
@@ -279,6 +343,9 @@ export async function sendMessage(sessionId: number, content: string): Promise<b
         markAssistantTruncated(currentAssistantId, t);
       },
       onToolEnd: (name, output) => {
+        // El tool_end de la delegación cierra también el thinking del
+        // subagente (llegó DENTRO de task, después del tool_start).
+        closeThinking();
         // FIFO match por nombre: primer pending con mismo name.
         const idx = pendingTools.findIndex((p) => p.name === name);
         if (idx >= 0) {
@@ -352,6 +419,7 @@ export async function sendMessage(sessionId: number, content: string): Promise<b
         onGroupingDone(e);
       },
       onCompleted: () => {
+        closeThinking();
         if (currentAssistantId !== null) {
           closeAssistantMessage(currentAssistantId, true);
           currentAssistantId = null;
@@ -360,6 +428,7 @@ export async function sendMessage(sessionId: number, content: string): Promise<b
       onFailed: (err) => {
         chatError.set(err);
         endGrouping();
+        closeThinking();
         if (currentAssistantId !== null) {
           closeAssistantMessage(currentAssistantId, true);
           currentAssistantId = null;

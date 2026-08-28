@@ -193,6 +193,43 @@ class _RelayAccumulator:
         return text
 
 
+_THINKING_TRUNCATION_MARKER = "\n[…pensamiento interno truncado por el límite del relay]"
+
+
+class _ThinkingRelay:
+    """Emite el thinking interno (reasoning_content de GLM) con tope por turno.
+
+    El thinking es texto EFÍMERO de UI (evento SSE ``thinking``): no se
+    acumula, no se persiste en ChatMessage y no entra al input del modelo.
+    Al alcanzar el tope emite UN marcador y calla por el resto del turno
+    (distinto de _RelayAccumulator: acá no hay acumulado que reportar).
+    """
+
+    def __init__(self, max_chars: int) -> None:
+        self._max = max_chars
+        self._shown = 0
+        self._closed = False
+
+    def add(self, delta: str) -> list[str]:
+        """Devuelve los frames SSE ``thinking`` correspondientes al delta."""
+        if not delta or self._closed:
+            return []
+        room = self._max - self._shown
+        if room <= 0:
+            self._closed = True
+            return [_sse("thinking", {"delta": _THINKING_TRUNCATION_MARKER})]
+        if len(delta) <= room:
+            self._shown += len(delta)
+            return [_sse("thinking", {"delta": delta})]
+        take = delta[:room]
+        self._shown = self._max
+        self._closed = True
+        return [
+            _sse("thinking", {"delta": take}),
+            _sse("thinking", {"delta": _THINKING_TRUNCATION_MARKER}),
+        ]
+
+
 def _stringify(obj: Any) -> str:
     """Convierte output de tool (str, ToolMessage, etc.) a texto."""
     if obj is None:
@@ -828,6 +865,9 @@ async def send_message(
             max_delta=settings.relay_max_delta_chars,
             max_total=settings.relay_max_assistant_chars,
         )
+        # Thinking interno (reasoning_content de GLM): efímero, con tope
+        # propio por turno (ver _ThinkingRelay).
+        thinking_relay = _ThinkingRelay(max_chars=settings.relay_max_thinking_chars)
         seen_tool_calls: set[str] = set()
         # Foto de sesión: segmento assistant en curso (se persiste al cerrarse)
         # y tools con su name/args vistos en tool_start, para persistir la fila
@@ -894,6 +934,17 @@ async def send_message(
                     # tool_call_chunks; los mensajes completos, tool_calls.
                     # Dedup por id de tool call en cualquier caso.
                     if isinstance(token, (AIMessage, AIMessageChunk)):
+                        # Thinking interno del modelo (reasoning_content,
+                        # capturado por ChatZai en agents/llm.py): evento SSE
+                        # efímero — NO se acumula en segment_parts ni se
+                        # persiste; llega por delta y el frontend lo muestra
+                        # en el bloque colapsable "Pensamiento interno".
+                        reasoning_delta = (
+                            getattr(token, "additional_kwargs", None) or {}
+                        ).get("reasoning_content")
+                        if isinstance(reasoning_delta, str) and reasoning_delta:
+                            for frame in thinking_relay.add(reasoning_delta):
+                                yield frame
                         tcc = getattr(token, "tool_call_chunks", None)
                         tc = getattr(token, "tool_calls", None)
                         calls = tcc or tc

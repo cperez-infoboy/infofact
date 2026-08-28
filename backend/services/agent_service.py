@@ -113,7 +113,12 @@ def _build_model() -> ChatOpenAI:
     # Thin wrapper kept for existing call sites; real construction lives in
     # backend.agents.llm so the requirements pipelines reuse it without
     # importing backend.services (service layer only relays, CLAUDE.md).
-    return build_llm()
+    # streaming (regresión typewriter): con el default streaming=False cada
+    # llamada devolvía el AIMessage completo y el chat esperaba la respuesta
+    # entera antes de mostrar nada. El relay ya tolera chunks (dedup por id)
+    # y los subagentes heredan este modelo, así que el flag cubre orquestador
+    # y subagentes de una vez.
+    return build_llm(streaming=settings.llm_agent_streaming)
 
 
 def _workspace_paths_block(project_slug: str) -> str:
