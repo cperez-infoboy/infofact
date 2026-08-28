@@ -23,6 +23,13 @@ RUN curl -fsSL https://github.com/eza-community/eza/releases/latest/download/eza
 RUN userdel -r ubuntu 2>/dev/null || true \
     && useradd -m -u 1000 -s /bin/bash agent
 
+# Offload del resumen (SummarizationMiddleware de deepagents): el path
+# /conversation_history/<session>.md es fijo en el middleware y se escribe
+# a traves del backend del agente, es decir DENTRO de este container como
+# uid 1000. Sin este directorio, cada resumen falla con PermissionError y
+# el historial previo queda sin respaldo.
+RUN mkdir -p /conversation_history && chown agent:agent /conversation_history
+
 USER agent
 WORKDIR /workspaces
 
