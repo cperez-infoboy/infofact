@@ -30,6 +30,7 @@ from typing import Any
 from langchain_core.tools import tool
 
 from backend.agents.no_fs_tools import NoFilesystemToolsMiddleware
+from backend.agents.llm_retry_guard import EmptyResponseRetryMiddleware
 from backend.agents.size_guard import SizeGuardMiddleware
 from backend.agents.subagents.analysis_run_holder import (
     STAGE_ADR,
@@ -1576,5 +1577,5 @@ def make_analysis_agent_subagent(
         # deepagents NO propaga el middleware del orquestador a los
         # subagentes (pero SI les inyecta FilesystemMiddleware): cada spec
         # necesita su guarda de tamaño y su filtro de tools de filesystem.
-        "middleware": [SizeGuardMiddleware(), NoFilesystemToolsMiddleware()],
+        "middleware": [SizeGuardMiddleware(), EmptyResponseRetryMiddleware(), NoFilesystemToolsMiddleware()],
     }

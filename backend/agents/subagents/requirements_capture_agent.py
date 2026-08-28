@@ -70,6 +70,7 @@ from backend.agents.subagents.capture_run_holder import (
     get_or_create_run,
     get_run,
 )
+from backend.agents.llm_retry_guard import EmptyResponseRetryMiddleware
 from backend.agents.size_guard import SizeGuardMiddleware
 from backend.agents.tools.grouping_tools import make_grouping_tools
 from backend.agents.tools.project_rules_tools import make_project_rules_tools
@@ -1246,5 +1247,5 @@ def make_requirements_capture_agent_subagent(
         # deepagents NO propaga el middleware del orquestador a los
         # subagentes (pero SI les inyecta FilesystemMiddleware): cada spec
         # necesita su guarda de tamaño y su filtro de tools de filesystem.
-        "middleware": [SizeGuardMiddleware(), NoFilesystemToolsMiddleware()],
+        "middleware": [SizeGuardMiddleware(), EmptyResponseRetryMiddleware(), NoFilesystemToolsMiddleware()],
     }

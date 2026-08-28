@@ -27,6 +27,7 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from backend.agents.llm import build_llm
 from backend.agents.sandboxes.docker_sandbox import DockerSandbox
+from backend.agents.llm_retry_guard import EmptyResponseRetryMiddleware
 from backend.agents.size_guard import SizeGuardMiddleware
 from backend.agents.tools import fetch_url, web_search
 from backend.agents.subagents.requirements_capture_agent import (
@@ -259,7 +260,7 @@ def build_agent(
         # Guarda de tamaño del input: trunca (sin eliminar) los mensajes
         # gigantes que puedan venir del checkpointer antes de cada llamada
         # al modelo. Transitorio: no reescribe el estado del thread.
-        middleware=[SizeGuardMiddleware()],
+        middleware=[SizeGuardMiddleware(), EmptyResponseRetryMiddleware()],
     )
 
 
