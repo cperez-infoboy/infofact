@@ -13,9 +13,13 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import pytest
 from pydantic import BaseModel
 
-from backend.agents.llm import StructuredRunnable
+from backend.agents.llm import (
+    StructuredOutputTruncatedError,
+    StructuredRunnable,
+)
 from langgraph.constants import TAG_NOSTREAM
 
 
@@ -98,3 +102,62 @@ def test_invoke_sync_also_nostream():
 
     assert out.answer == "ok"
     assert llm.calls[0]["config"]["tags"] == ["t", TAG_NOSTREAM]
+
+
+# ---------------------------------------------------------------------------
+# Detección de truncado (finish_reason=length) -> StructuredOutputTruncatedError
+# ---------------------------------------------------------------------------
+
+
+class _MetaResp:
+    """Respuesta con metadata del proveedor (finish_reason)."""
+
+    def __init__(self, content: str, finish_reason: str = "stop"):
+        self.content = content
+        self.response_metadata = {"finish_reason": finish_reason}
+
+
+class _MetaStubLLM(_StubLLM):
+    def __init__(self, content: str, finish_reason: str = "stop"):
+        super().__init__()
+        self._resp = _MetaResp(content, finish_reason)
+
+    async def ainvoke(self, messages, config=None, **kwargs):
+        self.calls.append({"config": config, "kwargs": kwargs})
+        return self._resp
+
+    def invoke(self, messages, config=None, **kwargs):
+        self.calls.append({"config": config, "kwargs": kwargs})
+        return self._resp
+
+
+def test_truncated_json_raises_typed_error():
+    """JSON roto + finish_reason=length -> error tipado de truncado."""
+    llm = _MetaStubLLM('{"answer": "ok"', finish_reason="length")
+    sr = StructuredRunnable(llm, _Out)
+
+    with pytest.raises(StructuredOutputTruncatedError):
+        asyncio.run(sr.ainvoke([("user", "hi")]))
+
+
+def test_truncated_flag_with_valid_json_still_parses():
+    """finish_reason=length con JSON completo y válido: se parsea igual.
+
+    El flag solo cambia el diagnóstico cuando el JSON NO parsea; un proveedor
+    que reporte length de más no rompe caminos que hoy funcionan.
+    """
+    llm = _MetaStubLLM('{"answer": "ok"}', finish_reason="length")
+    sr = StructuredRunnable(llm, _Out)
+
+    out = asyncio.run(sr.ainvoke([("user", "hi")]))
+    assert out.answer == "ok"
+
+
+def test_broken_json_without_truncation_raises_generic():
+    """JSON roto con finish_reason=stop: error genérico, NO el tipado."""
+    llm = _MetaStubLLM("no es json", finish_reason="stop")
+    sr = StructuredRunnable(llm, _Out)
+
+    with pytest.raises(Exception) as excinfo:
+        asyncio.run(sr.ainvoke([("user", "hi")]))
+    assert not isinstance(excinfo.value, StructuredOutputTruncatedError)

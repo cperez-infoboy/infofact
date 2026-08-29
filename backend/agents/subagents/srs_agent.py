@@ -373,9 +373,12 @@ commit_srs. Emite ``quality.found`` por cada hallazgo accionable \
     async def infer_goals() -> dict:
         """Etapa 2/4: inferencia del modelo de goals (GORE: KAOS + i* + NFR).
 
-        Infiere goals funcionales, softgoals NFR y obstacles, y los vincula a \
-los requerimientos (GoalLink). PERSISTE goals + links. Emite \
-``goal.inferred`` por cada goal.
+        Dos fases para acotar la salida (con stores grandes el JSON monolítico \
+llegaba truncado y la etapa devolvía 0 goals tras horas de reintentos): \
+primero infiere goals funcionales, softgoals NFR y obstacles (5-15), \
+después los vincula a los requerimientos (GoalLink) por lotes. PERSISTE \
+goals + links. Emite ``goal.inferred`` por cada goal. Si la inferencia \
+falla devuelve ``error`` (sin degradar a un modelo vacío).
         """
         run = get_run(project_id)
         if run is None:
@@ -387,9 +390,16 @@ los requerimientos (GoalLink). PERSISTE goals + links. Emite \
 
         on_progress, on_event = _make_emitters()
         await on_progress(STAGE_GOALS, "inferencia de goals (GORE)")
-        async with AsyncSessionLocal() as session:
-            summary = await goals_engine.infer_goals(session, project_id)
-            goals = await srs_store.list_goals(session, project_id)
+        try:
+            async with AsyncSessionLocal() as session:
+                summary = await goals_engine.infer_goals(session, project_id)
+                goals = await srs_store.list_goals(session, project_id)
+        except goals_engine.GoalsInferenceError as exc:
+            # Ya no existe la degradación silenciosa a goals=0: el fallo se
+            # reporta para que el agente informe en vez de reintentar a ciegas
+            # (incidente v6 de Planitrack2.0: 3 reintentos de ~72 minutos).
+            logger.error("infer_goals falló en project %s: %s", project_id, exc)
+            return {"stage": STAGE_GOALS, "error": f"infer_goals: {exc}"}
 
         run.goals_summary = summary
         run.stages_done.add(STAGE_GOALS)
@@ -408,6 +418,8 @@ los requerimientos (GoalLink). PERSISTE goals + links. Emite \
             "links": summary.get("links", 0),
             "softgoals": summary.get("softgoals", 0),
             "obstacles": summary.get("obstacles", 0),
+            "link_batches_failed": summary.get("link_batches_failed", 0),
+            "links_partial": summary.get("links_partial", False),
             "stages_done": sorted(run.stages_done),
         }
 

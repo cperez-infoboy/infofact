@@ -221,6 +221,20 @@ def _format_instructions(schema) -> str:
     )
 
 
+class StructuredOutputTruncatedError(ValueError):
+    """El LLM cortó la salida por presupuesto (finish_reason=length) y el
+    JSON quedó incompleto y sin parsear.
+
+    Diagnóstico explícito para el caso de la sesión 8 de Planitrack2.0: el
+    thinking interno de GLM comparte el presupuesto de salida, el JSON
+    estructurado llega truncado y un parse error genérico esconde la causa
+    (la etapa reintentaba a ciegas y terminaba devolviendo resultados
+    vacíos). Con el tipo específico el caller puede aplicar el remedio
+    conocido (reintentar con thinking desactivado) en vez de tratarlo como
+    un parse accidentado.
+    """
+
+
 class StructuredRunnable:
     """LLM -> pydantic schema, fence-tolerant. Duck-typed ainvoke/invoke."""
 
@@ -228,16 +242,26 @@ class StructuredRunnable:
         self._llm = llm
         self._schema = schema
 
-    def _parse(self, text: str):
-        text = _strip_code_fences(_content_to_text(text))
+    def _parse(self, text: str, *, truncated: bool = False):
+        stripped = _strip_code_fences(_content_to_text(text))
         try:
-            return self._schema.model_validate_json(text)
+            return self._schema.model_validate_json(stripped)
         except Exception:
             # last resort: isolate the first {...} object (model may have added
             # prose around the JSON)
-            match = _JSON_OBJECT_RE.search(text)
+            match = _JSON_OBJECT_RE.search(stripped)
             if match:
-                return self._schema.model_validate_json(match.group(0))
+                try:
+                    return self._schema.model_validate_json(match.group(0))
+                except Exception:
+                    pass
+            # JSON roto + corte por presupuesto del proveedor = causa
+            # explícita, no un parse accidentado.
+            if truncated:
+                raise StructuredOutputTruncatedError(
+                    "structured output truncated by token budget "
+                    "(finish_reason=length); JSON incompleto"
+                ) from None
             raise
 
     @staticmethod
@@ -256,19 +280,25 @@ class StructuredRunnable:
         config["tags"] = tags
         return config
 
+    @staticmethod
+    def _was_truncated(resp) -> bool:
+        """True cuando el proveedor cortó la generación por presupuesto."""
+        meta = getattr(resp, "response_metadata", None) or {}
+        return meta.get("finish_reason") == "length"
+
     async def ainvoke(self, messages, config=None, **kwargs):
         msgs = list(messages) + [("system", _format_instructions(self._schema))]
         resp = await self._llm.ainvoke(
             msgs, config=self._nostream_config(config), **kwargs
         )
-        return self._parse(resp.content)
+        return self._parse(resp.content, truncated=self._was_truncated(resp))
 
     def invoke(self, messages, config=None, **kwargs):
         msgs = list(messages) + [("system", _format_instructions(self._schema))]
         resp = self._llm.invoke(
             msgs, config=self._nostream_config(config), **kwargs
         )
-        return self._parse(resp.content)
+        return self._parse(resp.content, truncated=self._was_truncated(resp))
 
 
 def structured_llm(
