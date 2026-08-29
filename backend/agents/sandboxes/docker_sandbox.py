@@ -102,6 +102,17 @@ class DockerSandbox(BaseSandbox):
             # execute(), so this does not expand the attack surface.
             if normalized == "/tmp" or normalized.startswith("/tmp/"):
                 return normalized
+            # Offload del resumen de deepagents: SummarizationMiddleware escribe
+            # el respaldo del historial en /conversation_history/<thread>.md,
+            # un path FIJO fuera del workspace (no es configurable). Mismo
+            # criterio que /tmp: container por usuario, no cruza el límite
+            # inter-proyecto que _safe_path protege. Sin esta excepción cada
+            # resumen falla con invalid_path y el historial queda sin respaldo.
+            if (
+                normalized == "/conversation_history"
+                or normalized.startswith("/conversation_history/")
+            ):
+                return normalized
             if normalized == self.workspace_root:
                 return "."
             if normalized.startswith(self.workspace_root + "/"):

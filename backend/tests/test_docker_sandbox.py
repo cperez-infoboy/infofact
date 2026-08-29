@@ -159,3 +159,49 @@ def test_bound_error_names_valid_root(monkeypatch):
 
     assert "path escapes project workspace" in res.error
     assert "/workspaces/planitrack2-0" in res.error
+
+
+def test_upload_allows_conversation_history_offload_path(monkeypatch):
+    """El offload del resumen (SummarizationMiddleware de deepagents) escribe
+    el respaldo en /conversation_history/<thread>.md con path absoluto FIJO:
+    el guard debe aceptarlo (si no, cada resumen falla con invalid_path y el
+    historial previo queda sin respaldo)."""
+    calls = _capture_exec(monkeypatch)
+    sbx = _make_sandbox()
+
+    res = sbx.write("/conversation_history/session_abc.md", "contenido")
+
+    assert res.error is None
+    assert len(calls) == 1
+    script = " ".join(calls[0])
+    assert "mkdir -p /conversation_history" in script
+    assert "cat > /conversation_history/session_abc.md" in script
+
+
+def test_download_allows_conversation_history_offload_path(monkeypatch):
+    """La re-lectura del contenido offloaded (recuperabilidad del historial)
+    usa el mismo path absoluto: debe pasar el guard."""
+    calls = _capture_exec(monkeypatch)
+    sbx = _make_sandbox()
+
+    res = sbx.download_files(["/conversation_history/session_abc.md"])
+
+    assert res[0].error is None
+    assert calls[0][-2:] == ["cat", "/conversation_history/session_abc.md"]
+
+
+def test_upload_still_rejects_other_absolute_escape_paths(monkeypatch):
+    """La excepción es SOLO /conversation_history: /etc y proyectos hermanos
+    siguen rechazados sin ejecutar nada."""
+    calls = _capture_exec(monkeypatch)
+    sbx = _make_sandbox()
+
+    for escape in ("/etc/passwd", "/workspaces/otro-proyecto/x.md"):
+        res = sbx.write(escape, "x")
+        # El mensaje con el formato que emite write() (el mismo que quedó en
+        # los logs del incidente del offload).
+        assert res.error == f"Failed to write file '{escape}': invalid_path", (
+            f"esperaba invalid_path para {escape!r}"
+        )
+
+    assert calls == []
