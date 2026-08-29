@@ -42,7 +42,9 @@ def _patch_llm(monkeypatch, plans: dict) -> list[dict]:
 
     plans: {schema: [resultado | excepción, ...]}. El último elemento de la
     lista SE REPITE (para planes de fallo persistente no hace falta enumerar
-    cada reintento). Devuelve el registro de llamadas a la factory.
+    cada reintento). Devuelve el registro de llamadas a la factory; cada
+    entrada lleva ``ainvoke_kwargs`` con los kwargs extra que viajaron a la
+    invocación (p. ej. ``max_tokens``).
     """
     calls: list[dict] = []
 
@@ -51,6 +53,7 @@ def _patch_llm(monkeypatch, plans: dict) -> list[dict]:
         plan = plans[schema]
 
         async def ainvoke(msgs, config=None, **kwargs):
+            calls[-1]["ainvoke_kwargs"] = dict(kwargs)
             item = plan.pop(0) if len(plan) > 1 else plan[0]
             if isinstance(item, Exception):
                 raise item
@@ -66,6 +69,12 @@ def _patch_llm(monkeypatch, plans: dict) -> list[dict]:
 def _goal(code: str, kind: str = "functional_goal", parent: str | None = None):
     return ge.InferredGoal(
         code=code, kind=kind, statement=f"Goal {code}", parent_code=parent
+    )
+
+
+def _goal_stmt(code: str, statement: str, parent: str | None = None):
+    return ge.InferredGoal(
+        code=code, kind="functional_goal", statement=statement, parent_code=parent
     )
 
 
@@ -341,6 +350,164 @@ async def test_goal_alias_dedupe_and_dangling_parent_dropped(monkeypatch):
             parents = list(rows.values())
             assert parents.count(None) == 2
             assert len([p for p in parents if p is not None]) == 1
+    finally:
+        await engine.dispose()
+        tmp.cleanup()
+
+
+# ---------------------------------------------------------------------------
+# Fase 1 por chunks (incidente 2026-08-29: la llamada monolítica con el
+# catálogo completo no completaba en el gateway del proveedor).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_phase1_chunked_merge_renumbers_and_dedupes(monkeypatch):
+    """Chunks separados: códigos renumerados globalmente, statement casi igual
+    entre chunks colapsa al canónico y el hijo del duplicado lo referencia."""
+    monkeypatch.setattr(ge, "GOALS_CHUNK_SIZE", 2)  # 4 reqs => 2 chunks
+    monkeypatch.setattr(ge, "DEFAULT_CONCURRENCY", 1)  # orden determinista
+    # Chunk 1 (REQ-0000..0001): raíz + hijo.
+    # Chunk 2 (REQ-0002..0003): el mismo "Servir pedidos" con otro código
+    # local + un goal nuevo.
+    plans = _plans(None, [])
+    plans[ge.GoalGoals] = [
+        ge.GoalGoals(
+            goals=[
+                _goal_stmt("G1", "Servir pedidos"),
+                _goal_stmt("G2", "Registrar altas", parent="G1"),
+            ]
+        ),
+        ge.GoalGoals(
+            goals=[
+                _goal_stmt("G1", "Servir  pedidos"),  # duplicado del chunk 1
+                _goal_stmt("G3", "Reportar métricas"),
+            ]
+        ),
+    ]
+    plans[ge.GoalLinks] = [_links([("G1", "REQ-0000")])]
+    calls = _patch_llm(monkeypatch, plans)
+    sm, tmp, engine = await _fresh_db()
+    try:
+        async with sm() as session:
+            pid = await _seed(session, n=4)
+            summary = await ge.infer_goals(session, pid)
+
+        # 3 goals: servir (canónico), altas (hijo), reportar. El duplicado no
+        # se emite dos veces.
+        assert summary["goals"] == 3
+        assert summary["goals_chunks_failed"] == 0
+        goal_calls = [c for c in calls if c["schema"] is ge.GoalGoals]
+        assert len(goal_calls) == 2  # un chunk, una llamada
+        async with sm() as session:
+            rows = (
+                await session.execute(sa_select(Goal).order_by(Goal.id))
+            ).scalars().all()
+            # El store asigna códigos opacos propios (GOAL-XXXX) y persiste
+            # raíces primero: los alias G1..Gn solo resuelven referencias
+            # internas (parent/links).
+            assert sorted(g.statement for g in rows) == sorted(
+                [
+                    "Servir pedidos",
+                    "Registrar altas",
+                    "Reportar métricas",
+                ]
+            )
+            by_stmt = {g.statement: g for g in rows}
+            # El hijo del chunk 1 cuelga del canónico; "Reportar métricas" es
+            # raíz (y el duplicado no se emitió dos veces).
+            assert by_stmt["Registrar altas"].parent_id == (
+                by_stmt["Servir pedidos"].id
+            )
+            assert by_stmt["Reportar métricas"].parent_id is None
+    finally:
+        await engine.dispose()
+        tmp.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_phase1_chunk_failure_is_partial_not_fatal(monkeypatch):
+    """Un chunk caído no arrastra la fase: goals parciales con contador explícito."""
+    monkeypatch.setattr(ge, "GOALS_CHUNK_SIZE", 1)  # 2 reqs => 2 chunks
+    monkeypatch.setattr(ge, "DEFAULT_CONCURRENCY", 1)
+    boom = ValueError("gateway 500")
+    plans = _plans(None, [])
+    plans[ge.GoalGoals] = [
+        ge.GoalGoals(goals=[_goal_stmt("G1", "Servir pedidos")]),
+        boom,
+    ]
+    plans[ge.GoalLinks] = [_links([("G1", "REQ-0000")])]
+    _patch_llm(monkeypatch, plans)
+    sm, tmp, engine = await _fresh_db()
+    try:
+        async with sm() as session:
+            pid = await _seed(session, n=2)
+            summary = await ge.infer_goals(session, pid)
+
+        assert summary["goals"] == 1
+        assert summary["goals_chunks_failed"] == 1
+        assert summary["goals_partial"] is True
+        async with sm() as session:
+            assert len((await session.execute(sa_select(Goal))).scalars().all()) == 1
+    finally:
+        await engine.dispose()
+        tmp.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_all_chunks_failed_is_explicit_error(monkeypatch):
+    """Sin chunks sobrevivientes: error explícito, nunca goals parciales vacíos."""
+    monkeypatch.setattr(ge, "GOALS_CHUNK_SIZE", 1)
+    monkeypatch.setattr(ge, "DEFAULT_CONCURRENCY", 1)
+    plans = {ge.GoalGoals: [ValueError("gateway 500")], ge.GoalLinks: []}
+    _patch_llm(monkeypatch, plans)
+    sm, tmp, engine = await _fresh_db()
+    try:
+        async with sm() as session:
+            pid = await _seed(session, n=2)
+            with pytest.raises(ge.GoalsInferenceError, match="fase goals falló"):
+                await ge.infer_goals(session, pid)
+            assert (
+                len((await session.execute(sa_select(Goal))).scalars().all()) == 0
+            )
+    finally:
+        await engine.dispose()
+        tmp.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_max_tokens_travels_to_every_invoke(monkeypatch):
+    """max_tokens por llamada (fallback asequible) en thinking y sin-thinking."""
+    trunc = StructuredOutputTruncatedError("truncated")
+    plans = _plans(None, [])
+    plans[ge.GoalGoals] = [
+        trunc,
+        trunc,
+        ge.GoalGoals(goals=[_goal("G1")]),
+    ]
+    plans[ge.GoalLinks] = [_links([("G1", "REQ-0000")])]
+    calls = _patch_llm(monkeypatch, plans)
+    sm, tmp, engine = await _fresh_db()
+    try:
+        async with sm() as session:
+            pid = await _seed(session, n=1)
+            summary = await ge.infer_goals(session, pid)
+
+        assert summary["goals"] == 1
+        # Ambas pasadas de la fase goals (con y sin thinking) llevaron el cap
+        # (el runnable de cada pasada se construye una vez y reusa sus
+        # reintentos de parse; dos factory calls, todas con max_tokens).
+        goal_calls = [c for c in calls if c["schema"] is ge.GoalGoals]
+        assert len(goal_calls) == 2
+        assert all(
+            c["ainvoke_kwargs"].get("max_tokens") == ge.GOALS_MAX_TOKENS
+            for c in goal_calls
+        )
+        # Y el lote de links también.
+        link_calls = [c for c in calls if c["schema"] is ge.GoalLinks]
+        assert link_calls[0]["ainvoke_kwargs"].get("max_tokens") == (
+            ge.GOALS_MAX_TOKENS
+        )
     finally:
         await engine.dispose()
         tmp.cleanup()

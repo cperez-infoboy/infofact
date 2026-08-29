@@ -191,7 +191,11 @@ def _loop_err(exc: StageLoopExceeded) -> dict[str, Any]:
         "stage": exc.stage,
         "calls": exc.calls,
         "cap": exc.cap,
-        "message": str(exc),
+        "message": (
+            f"{exc} El cap acota el loop de la etapa dentro de este episodio: "
+            "informe al usuario que reintente con el comando /srs (el rearmado "
+            "de contadores es router-level; no existe una tool para ello)."
+        ),
     }
 
 

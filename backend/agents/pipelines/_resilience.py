@@ -189,6 +189,7 @@ async def invoke_structured_resilient(
     max_parse: int = 2,
     max_transient: int | None = None,
     thinking_off_body: dict | None = None,
+    extra: dict | None = None,
 ):
     """Invocación estructurada con degradación por truncado de salida.
 
@@ -204,7 +205,9 @@ async def invoke_structured_resilient(
     ``make_llm(**kwargs)`` construye el runnable estructurado (p. ej.
     ``lambda **kw: structured_llm(schema, **kw)``); ``thinking_off_body``
     permite inyectar el body sin thinking del caller (los módulos pasan su
-    ``disable_thinking_body()`` importado, así los tests pueden stubearlo).
+    ``disable_thinking_body()`` importado, así los tests pueden stubearlo);
+    ``extra`` viaja a ``_invoke_with_retry`` y de ahí a cada ``ainvoke``
+    (mismo precedente que critique/classification con ``max_tokens``).
 
     Compartido por ``goals_engine`` (fase goals / lote de links) y
     ``srs_quality`` (batch / per-ítem) para que la degradación por truncado
@@ -222,6 +225,7 @@ async def invoke_structured_resilient(
             context_label=context_label,
             max_parse=max_parse,
             max_transient=max_transient,
+            extra=extra,
         )
     except StructuredOutputTruncatedError:
         logger.warning(
@@ -240,6 +244,7 @@ async def invoke_structured_resilient(
         context_label=f"{context_label}/sin-thinking",
         max_parse=max_parse,
         max_transient=max_transient,
+        extra=extra,
     )
 
 

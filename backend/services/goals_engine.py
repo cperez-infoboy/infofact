@@ -24,12 +24,25 @@ intento. Ahora la salida se acota por diseño: fase 1 infiere SOLO goals
 (5-15, sin links) y fase 2 infiere links por LOTES de requerimientos (la
 salida de cada lote escala con el lote, no con el proyecto), en paralelo y
 con degradación a thinking desactivado cuando un JSON llega truncado.
+
+Además (incidente 2026-08-29 del mismo proyecto) la fase 1 se parte en
+CHUNKS de requerimientos: la llamada monolítica con el catálogo completo
+(~35K tokens de entrada con ~800 reqs) no completaba en el gateway del
+proveedor (500 api_error en segundos o request colgada), y el max_tokens
+global (32768) hacía inasequible el fallback por créditos. Cada chunk es
+una llamada con max_tokens propio (la salida de goals es chica por
+diseño) y el merge entre chunks es determinista: renumeración global de
+códigos, dedupe de statements casi iguales y corte de parent_code no
+resolubles.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import Any, Literal
+
+from rapidfuzz import fuzz
 
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -56,6 +69,23 @@ _INFER_ATTEMPTS = 2
 # por requerimiento (~50 tokens c/u), así que 120 deja el JSON con margen de
 # ~10x respecto del presupuesto de salida, thinking incluido.
 _LINK_BATCH_SIZE = 120
+# Requerimientos por chunk de fase 1: mantiene la entrada muy por debajo del
+# umbral donde el gateway del proveedor empezó a fallar (~35K tokens) y deja
+# la salida de goals (5-15) con margen amplio. Env-tunable para recalibrar
+# sin código (mismo patrón que INFOFACT_CONCURRENCY).
+GOALS_CHUNK_SIZE = int(os.environ.get("INFOFACT_GOALS_CHUNK", "270"))
+# max_tokens por llamada de goals (fase 1 y lotes de links): la salida es
+# chica por diseño; el global (llm_max_tokens=32768) pedía reserva de 32K y
+# volvía inasequible el fallback por créditos (OpenRouter 402: asequibles
+# ~13.9K). 8192 queda debajo del umbral observado y con thinking activo el
+# truncado ya degrada al camino sin thinking.
+GOALS_MAX_TOKENS = int(os.environ.get("INFOFACT_GOALS_MAX_TOKENS", "8192"))
+# token_sort_ratio mínimo (0-100) para considerar dos goals de chunks
+# distintos el mismo objetivo (dedupe del merge).
+_GOALS_DEDUPE_RATIO = 90
+# Tope de goals del modelo final: el prompt pide 5-15; con chunks el merge
+# puede excederlo y se recorta conservando raíces primero.
+_MAX_GOALS = 15
 
 
 class GoalsInferenceError(RuntimeError):
@@ -139,8 +169,8 @@ _LINKS_SYSTEM = (
 )
 
 
-async def _invoke_unit(schema, msgs: list, *, label: str):
-    """Una unidad estructurada (fase goals / un lote de links).
+async def _invoke_unit(schema, msgs: list, *, label: str, extra: dict | None = None):
+    """Una unidad estructurada (chunk de goals / un lote de links).
 
     Degradación por truncado delegada al helper compartido
     ``invoke_structured_resilient`` (mismo tratamiento que ``srs_quality``):
@@ -149,6 +179,8 @@ async def _invoke_unit(schema, msgs: list, *, label: str):
     desactivado (el pensamiento interno comparte el presupuesto de salida).
     El resto de los fallos (transient 429/5xx, parse sin truncar) queda
     acotado por ``_invoke_with_retry``, que propaga la excepción al agotarse.
+    ``extra`` (p. ej. ``max_tokens``) viaja a cada ``ainvoke`` en ambas
+    pasadas.
     """
     return await invoke_structured_resilient(
         lambda **kw: structured_llm(schema, **kw),
@@ -156,6 +188,7 @@ async def _invoke_unit(schema, msgs: list, *, label: str):
         context_label=label,
         max_parse=_INFER_ATTEMPTS,
         thinking_off_body=disable_thinking_body(),
+        extra=extra,
     )
 
 
@@ -178,39 +211,56 @@ async def infer_goals(
         await replace_goals(session, project_id, [], [], req_by_code=req_by_code)
         return {"goals": 0, "links": 0, "softgoals": 0, "obstacles": 0}
 
-    catalog = "\n".join(
-        f"- {it.code} [{it.type.value}]: {it.statement}" for it in live
+    # ------------------------------------------------------------------
+    # Fase 1: goals por chunks (salida acotada por chunk, sin links).
+    # ------------------------------------------------------------------
+    chunks = list(_chunk(live, GOALS_CHUNK_SIZE))
+    sem = asyncio.Semaphore(max(1, DEFAULT_CONCURRENCY))
+
+    async def _goals_chunk(batch: list) -> GoalGoals:
+        catalog = "\n".join(
+            f"- {it.code} [{it.type.value}]: {it.statement}" for it in batch
+        )
+        msgs = [
+            ("system", _GOALS_SYSTEM),
+            ("human", f"PROJECT REQUIREMENTS:\n{catalog}"),
+        ]
+        async with sem:
+            return await _invoke_unit(
+                GoalGoals,
+                msgs,
+                label=f"goals {batch[0].code}..{batch[-1].code}",
+                extra={"max_tokens": GOALS_MAX_TOKENS},
+            )
+
+    outcomes = await asyncio.gather(
+        *(_goals_chunk(b) for b in chunks), return_exceptions=True
     )
 
-    # ------------------------------------------------------------------
-    # Fase 1: goals (salida acotada: 5-15, sin links).
-    # ------------------------------------------------------------------
-    try:
-        goals_out: GoalGoals = await _invoke_unit(
-            GoalGoals,
-            [
-                ("system", _GOALS_SYSTEM),
-                ("human", f"PROJECT REQUIREMENTS:\n{catalog}"),
-            ],
-            label="goals",
-        )
-    except Exception as exc:  # noqa: BLE001 — se reporta como error de etapa
-        raise GoalsInferenceError(f"fase goals falló: {exc}") from exc
+    chunk_goal_lists: list[list[InferredGoal]] = []
+    failed_chunks = 0
+    first_error: Exception | None = None
+    for chunk, out in zip(chunks, outcomes):
+        if isinstance(out, BaseException):
+            failed_chunks += 1
+            if first_error is None:
+                first_error = out
+            logger.warning(
+                "goals chunk %s..%s falló (%s); el resto del proyecto sigue",
+                chunk[0].code,
+                chunk[-1].code,
+                type(out).__name__,
+            )
+            continue
+        chunk_goal_lists.append(_valid_goals(out.goals))
 
-    goals: list[InferredGoal] = []
-    seen_codes: set[str] = set()
-    for g in goals_out.goals:
-        if not g.code or not g.statement or g.code in seen_codes:
-            continue  # sin código/statement, o alias repetido
-        seen_codes.add(g.code)
-        goals.append(g)
-    # Un parent_code hacia un goal no emitido rompería la jerarquía en
-    # silencio (replace_goals lo dejaría como raíz): se corta explícitamente.
-    goals = [
-        g if (not g.parent_code or g.parent_code in seen_codes)
-        else g.model_copy(update={"parent_code": None})
-        for g in goals
-    ]
+    if not chunk_goal_lists:
+        # Ningún chunk sobrevivió: mismo contrato explícito de la versión
+        # monolítica (nunca un modelo vacío silencioso).
+        raise GoalsInferenceError(f"fase goals falló: {first_error}") from first_error
+
+    goals = _merge_chunked_goals(chunk_goal_lists)
+    seen_codes = {g.code for g in goals}
 
     if not goals:
         # Un catálogo vivo no puede inferir 0 goals (v6: «989 reqs, 0 goals»):
@@ -248,6 +298,7 @@ async def infer_goals(
                 GoalLinks,
                 msgs,
                 label=f"links {batch[0].code}..{batch[-1].code}",
+                extra={"max_tokens": GOALS_MAX_TOKENS},
             )
 
     outcomes = await asyncio.gather(
@@ -307,20 +358,110 @@ async def infer_goals(
         "links": result["links"],
         "softgoals": softgoals,
         "obstacles": obstacles,
+        "goals_chunks_failed": failed_chunks,
+        "goals_partial": failed_chunks > 0,
         "link_batches_failed": failed_batches,
         "links_partial": failed_batches > 0,
     }
     logger.info(
         "goals: inferred %d goals, %d links (softgoals=%d, obstacles=%d, "
-        "lotes de links fallidos=%d/%d)",
+        "chunks de goals fallidos=%d/%d, lotes de links fallidos=%d/%d)",
         summary["goals"],
         summary["links"],
         softgoals,
         obstacles,
+        failed_chunks,
+        len(chunks),
         failed_batches,
         len(batches),
     )
     return summary
+
+
+def _valid_goals(raw: list[InferredGoal]) -> list[InferredGoal]:
+    """Valida los goals de un chunk: alias repetidos o items sin
+    código/statement se descartan (contrato de la versión monolítica)."""
+    goals: list[InferredGoal] = []
+    seen: set[str] = set()
+    for g in raw:
+        if not g.code or not g.statement or g.code in seen:
+            continue
+        seen.add(g.code)
+        goals.append(g)
+    return goals
+
+
+def _find_duplicate(statement: str, seen: list[tuple[str, str]]) -> str | None:
+    """Código global del goal cuyo statement es casi igual al dado.
+
+    ``seen`` lleva pares (statement, código global). El umbral es alto
+    (_GOALS_DEDUPE_RATIO) para fusionar solo reformulaciones evidentes del
+    mismo objetivo, no objetivos vecinos legítimos.
+    """
+    for other, code in seen:
+        if fuzz.token_sort_ratio(statement, other) >= _GOALS_DEDUPE_RATIO:
+            return code
+    return None
+
+
+def _merge_chunked_goals(chunks: list[list[InferredGoal]]) -> list[InferredGoal]:
+    """Merge determinista de los goals de cada chunk.
+
+    Los chunks infieren por separado: los códigos locales colisionan (cada
+    uno arranca en ``G1``) y dos chunks pueden emitir el mismo objetivo con
+    distinto código. Reglas:
+
+    - Renumeración global secuencial (G1..Gn) en orden de emisión.
+    - Dedupe por statement casi igual entre chunks: el duplicado no se emite
+      y su código local queda mapeado al canónico (los hijos que lo
+      referencian cuelgan del goal que ya existe).
+    - parent_code solo se resuelve DENTRO del chunk (un goal de otro chunk
+      no es referenciable con códigos locales); el resto se corta, igual que
+      el parent fantasma de la versión monolítica.
+    - Con más de _MAX_GOALS se conservan las raíces primero y se corta el
+      parent de los hijos que quedaron fuera del tope.
+    """
+    merged: list[InferredGoal] = []
+    seen_statements: list[tuple[str, str]] = []
+    emitted: set[str] = set()
+    counter = 0
+    for chunk in chunks:
+        # Paso 1: destino global de cada código local del chunk. Los hijos
+        # pueden declararse antes que el padre, así que el remap se cierra
+        # antes de emitir.
+        remap: dict[str, str] = {}
+        for g in chunk:
+            canon = _find_duplicate(g.statement, seen_statements)
+            if canon is None:
+                counter += 1
+                canon = f"G{counter}"
+                seen_statements.append((g.statement, canon))
+            remap[g.code] = canon
+        # Paso 2: emitir con parent resuelto (duplicados omitidos).
+        for g in chunk:
+            code = remap[g.code]
+            if code in emitted:
+                continue  # duplicado de este u otro chunk
+            emitted.add(code)
+            parent = remap.get(g.parent_code) if g.parent_code else None
+            merged.append(
+                g.model_copy(update={"code": code, "parent_code": parent})
+            )
+
+    if len(merged) > _MAX_GOALS:
+        roots = [g for g in merged if not g.parent_code]
+        children = [g for g in merged if g.parent_code]
+        merged = (roots + children)[:_MAX_GOALS]
+        kept = {g.code for g in merged}
+        merged = [
+            g if (not g.parent_code or g.parent_code in kept)
+            else g.model_copy(update={"parent_code": None})
+            for g in merged
+        ]
+        logger.info(
+            "goals: recorte del merge a %d goals (raíces primero)", _MAX_GOALS
+        )
+    return merged
 
 
 def _safe_kind(value: str) -> Any:

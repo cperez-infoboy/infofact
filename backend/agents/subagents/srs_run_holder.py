@@ -66,6 +66,17 @@ class SrsRun:
             raise StageLoopExceeded(stage=stage, calls=n, cap=cap)
         return n
 
+    def rearm_stages(self) -> None:
+        """Reinicia los contadores de loop sin tocar salidas ni stages_done.
+
+        El cap acota el loop de una etapa DENTRO de un episodio de
+        razonamiento; sin esto, un run reanudado en un turno posterior
+        hereda el contador agotado de episodios previos y el guard bloquea
+        la etapa instantáneamente (incidente 2026-08-29: dos «reintenta»
+        del usuario chocaron contra 4/3 y 5/3 sin ni llamar al LLM).
+        """
+        self.calls.clear()
+
     def reset_pipeline_outputs(self) -> None:
         """Limpia las salidas de etapas pero conserva los contadores de loop."""
         self.quality_summary = None
@@ -110,6 +121,20 @@ def get_or_create_run(
 
 def get_run(project_id: int) -> SrsRun | None:
     return _ACTIVE_RUNS.get(project_id)
+
+
+def rearm_run(project_id: int) -> SrsRun | None:
+    """Rearma los contadores de loop del run activo (si lo hay).
+
+    Router-owned (mismo principio que la guardia de captura): lo invoca el
+    handler de ``/srs`` al arrancar un episodio nuevo, así el subagente no
+    puede rearmarse por su cuenta. Preserva salidas de etapas y
+    ``stages_done`` para que el run continúe donde quedó.
+    """
+    run = _ACTIVE_RUNS.get(project_id)
+    if run is not None:
+        run.rearm_stages()
+    return run
 
 
 def clear_run(project_id: int) -> SrsRun | None:

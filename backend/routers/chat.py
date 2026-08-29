@@ -35,6 +35,7 @@ from backend.config import settings
 from backend.database import AsyncSessionLocal
 from backend.deps import COOKIE_NAME, decode_access_token
 from backend.models import ChatMessage, ChatSession, Project, User
+from backend.agents.subagents.srs_run_holder import rearm_run
 from backend.agents.tools.grouping_tools import run_grouping_review
 from backend.services.agent_service import build_agent
 from backend.services.container_service import ensure_container
@@ -802,6 +803,13 @@ async def send_message(
     # explicita, NO despachamos al agente; mostramos una confirmacion. Cierra el
     # bypass del subagente agent-driven que elegia on_existing por si solo.
     gate_msg = await _capture_gate_message(project.id, body.content)
+
+    # /srs: rearmar los contadores de loop del run activo (si lo hay) al
+    # arrancar un episodio nuevo. Router-owned (mismo principio que la guardia
+    # de arriba): el subagente no puede rearmarse por su cuenta. Preserva las
+    # salidas de etapas ya completadas para que el run continue donde quedo.
+    if body.content.strip().startswith(_SRS_PREFIX):
+        rearm_run(project.id)
     if gate_msg is not None:
         async with AsyncSessionLocal() as db:
             db.add(
