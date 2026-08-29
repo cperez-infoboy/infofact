@@ -114,3 +114,50 @@ def test_stage_cap_env_tunable(monkeypatch):
     monkeypatch.delenv("INFOFACT_STAGE_CAP")
     # Default cap applies again (fresh stage counter unaffected by the env).
     assert run.bump("conventions") == 1
+
+
+def test_embedder_lazy_init_is_race_safe(monkeypatch):
+    """Con el singleton frío, N hilos construyen el modelo UNA sola vez.
+
+    Regresión (v6/v7 de Planitrack2.0): ``embed_texts`` corre via
+    ``asyncio.to_thread`` y dos ``search_documents`` concurrentes al arranque
+    construían ``SentenceTransformer`` a la vez — una instancia quedaba con
+    tensores en dispositivo meta ("Cannot copy out of meta tensor") y la tool
+    fallaba en forma transitoria. El guard con lock serializa la carga.
+    """
+    import sys
+    import threading
+    import time
+    from types import SimpleNamespace
+
+    constructions: list[str] = []
+
+    class _SlowST:
+        def __init__(self, name: str):
+            constructions.append(name)
+            time.sleep(0.05)  # abre la ventana de carrera
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sentence_transformers",
+        SimpleNamespace(SentenceTransformer=_SlowST),
+    )
+    monkeypatch.setattr(mod, "_EMBEDDER", None)
+
+    errors: list[Exception] = []
+
+    def _call() -> None:
+        try:
+            mod._get_embedder()
+        except Exception as exc:  # pragma: no cover — solo si el guard rompe
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_call) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == []
+    assert len(constructions) == 1
+    assert mod._EMBEDDER is not None

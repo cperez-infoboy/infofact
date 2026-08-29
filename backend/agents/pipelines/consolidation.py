@@ -36,6 +36,7 @@ import asyncio
 import logging
 import os
 import re
+import threading
 import unicodedata
 from dataclasses import dataclass, field
 
@@ -62,6 +63,13 @@ DEFAULT_MAX_CONTRADICT_CANDIDATES = 200
 DEFAULT_MAX_DUPLICATE_CANDIDATES = 200
 
 _EMBEDDER = None
+# Guard de la carga perezosa: embed_texts corre via asyncio.to_thread, asi dos
+# llamadas concurrentes (dos search_documents al arrancar con el singleton
+# frio) podian construir el modelo A LA VEZ — una quedaba con tensores en
+# dispositivo meta ("Cannot copy out of meta tensor") y la tool fallaba en
+# forma transitoria. El lock serializa la carga (doble check: el segundo
+# hilo reusa la instancia que el primero dejo lista).
+_EMBEDDER_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -159,14 +167,16 @@ def drop_duplicit_implicit(
 def _get_embedder():
     global _EMBEDDER
     if _EMBEDDER is None:
-        try:
-            from sentence_transformers import SentenceTransformer
-        except ImportError as exc:  # pragma: no cover - environment-dependent
-            raise RuntimeError(
-                "sentence-transformers is required for consolidation. Add it to "
-                "requirements.txt."
-            ) from exc
-        _EMBEDDER = SentenceTransformer(DEFAULT_EMBEDDING_MODEL)
+        with _EMBEDDER_LOCK:
+            if _EMBEDDER is None:  # doble check: otro hilo pudo cargarla
+                try:
+                    from sentence_transformers import SentenceTransformer
+                except ImportError as exc:  # pragma: no cover - environment-dependent
+                    raise RuntimeError(
+                        "sentence-transformers is required for consolidation. Add it to "
+                        "requirements.txt."
+                    ) from exc
+                _EMBEDDER = SentenceTransformer(DEFAULT_EMBEDDING_MODEL)
     return _EMBEDDER
 
 
