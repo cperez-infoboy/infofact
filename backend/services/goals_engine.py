@@ -34,15 +34,11 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.agents.llm import (
-    StructuredOutputTruncatedError,
-    disable_thinking_body,
-    structured_llm,
-)
+from backend.agents.llm import disable_thinking_body, structured_llm
 from backend.agents.pipelines._resilience import (
     DEFAULT_CONCURRENCY,
     _chunk,
-    _invoke_with_retry,
+    invoke_structured_resilient,
 )
 from backend.models.requirement import ReqStatus
 from backend.models.srs import GoalKind
@@ -146,31 +142,20 @@ _LINKS_SYSTEM = (
 async def _invoke_unit(schema, msgs: list, *, label: str):
     """Una unidad estructurada (fase goals / un lote de links).
 
-    Degradación por truncado: un finish_reason=length con JSON roto levanta
-    ``StructuredOutputTruncatedError``; el único remedio conocido es
-    reintentar con thinking desactivado (misma receta del guard de la sesión
-    8: el pensamiento interno comparte el presupuesto de salida). El resto
-    de los fallos (transient 429/5xx, parse sin truncar) queda acotado por
-    ``_invoke_with_retry``, que propaga la excepción al agotarse.
+    Degradación por truncado delegada al helper compartido
+    ``invoke_structured_resilient`` (mismo tratamiento que ``srs_quality``):
+    un finish_reason=length con JSON roto levanta
+    ``StructuredOutputTruncatedError`` y el reintento pasa a thinking
+    desactivado (el pensamiento interno comparte el presupuesto de salida).
+    El resto de los fallos (transient 429/5xx, parse sin truncar) queda
+    acotado por ``_invoke_with_retry``, que propaga la excepción al agotarse.
     """
-    try:
-        return await _invoke_with_retry(
-            structured_llm(schema),
-            msgs,
-            context_label=label,
-            max_parse=_INFER_ATTEMPTS,
-        )
-    except StructuredOutputTruncatedError:
-        logger.warning(
-            "%s: salida truncada por presupuesto de tokens; reintento con "
-            "thinking desactivado",
-            label,
-        )
-    return await _invoke_with_retry(
-        structured_llm(schema, extra_body=disable_thinking_body()),
+    return await invoke_structured_resilient(
+        lambda **kw: structured_llm(schema, **kw),
         msgs,
-        context_label=f"{label}/sin-thinking",
+        context_label=label,
         max_parse=_INFER_ATTEMPTS,
+        thinking_off_body=disable_thinking_body(),
     )
 
 

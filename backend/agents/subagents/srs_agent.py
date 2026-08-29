@@ -340,8 +340,16 @@ commit_srs. Emite ``quality.found`` por cada hallazgo accionable \
 
         on_progress, on_event = _make_emitters()
         await on_progress(STAGE_QUALITY, "análisis de calidad (INCOSE + smells + EARS + LLM)")
+
+        async def _report_progress(done: int, total: int) -> None:
+            await on_progress(
+                STAGE_QUALITY, f"lotes de calidad procesados: {done}/{total}"
+            )
+
         async with AsyncSessionLocal() as session:
-            summary, findings = await srs_quality.analyze_quality(session, project_id)
+            summary, findings = await srs_quality.analyze_quality(
+                session, project_id, on_progress=_report_progress
+            )
 
         run.quality_summary = summary
         run.findings = list(findings)
@@ -364,6 +372,7 @@ commit_srs. Emite ``quality.found`` por cada hallazgo accionable \
             "items_analyzed": summary.get("items_analyzed", 0),
             "total_findings": summary.get("total_findings", 0),
             "blockers": summary.get("blockers", 0),
+            "llm_eval_unavailable": summary.get("llm_eval_unavailable", 0),
             "by_severity": summary.get("by_severity", {}),
             "events_emitted": emitted,
             "stages_done": sorted(run.stages_done),

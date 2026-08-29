@@ -20,16 +20,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Literal
+import os
+from typing import Any, Awaitable, Callable, Literal
 
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.agents.llm import structured_llm
+from backend.agents.llm import disable_thinking_body, structured_llm
 from backend.agents.pipelines._resilience import (
     DEFAULT_BATCH_SIZE,
     _BATCH_PARSE_RETRIES,
-    _TRANSIENT_RETRIES,
+    invoke_structured_resilient,
     is_transient,
 )
 from backend.agents.pipelines._quality_rules import programmatic_findings_for_text
@@ -43,8 +44,12 @@ from backend.services.requirement_store import list_requirements
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_CONCURRENCY = 4
+# Concurrencia de batches LLM: 8 (precedente de extraction; el backoff
+# jitterado absorbe los 429 residuales del proxy). Env-tunable.
+DEFAULT_CONCURRENCY = int(os.environ.get("INFOFACT_CONCURRENCY", "8"))
 _JUDGE_ATTEMPTS = 3
+# Emisión de progreso: cada N batches completados (y en el último).
+_PROGRESS_EVERY = 10
 # Las reglas deterministas ITEM-level viven en ``_quality_rules`` (módulo
 # compartido con el pipeline de captura, shift-left de calidad). Ver ahí:
 # ``programmatic_findings_for_text``, ``detect_ears_pattern``, ``VAGUE_TERMS``.
@@ -185,66 +190,63 @@ def _verdict_to_findings(v: ItemQualityVerdict, req_id: int) -> list[dict[str, A
     return out
 
 
-def _empty_verdict(item_id: str, reason: str) -> ItemQualityVerdict:
-    return ItemQualityVerdict(
-        item_id=item_id,
-        findings=[
-            LlmFinding(
-                rule_id="llm.eval_unavailable",
-                dimension="info",
-                severity="info" if reason == "empty" else "minor",
-                message=(
-                    "No se pudo completar la evaluación LLM de este ítem "
-                    f"({reason}); revisión manual recomendada."
-                ),
-                suggestion=None,
-            )
-        ],
-    )
-
-
 async def _judge_batch(
     items: list,  # list[RequirementItem]
 ) -> dict[int, list[dict[str, Any]]]:
     """Una llamada LLM por batch. Devuelve {req_id: [finding_dict, ...]}.
 
-    Resiliencia (espejo de critique._judge_batch): transient backoff -> fallback
-    per-ítem; parse retries -> fallback per-ítem. Un fallo no aborta todo.
+    Resiliencia (espejo de critique._judge_batch): transient backoff ->
+    fallback per-ítem; parse retries -> fallback per-ítem. Un truncado
+    (JSON cortado por presupuesto, finish_reason=length) se degrada a
+    thinking desactivado antes de rendirse al fallback: mismo remedio que
+    ``goals_engine`` (incidente v6 de Planitrack2.0 — 3 generaciones
+    full-price con thinking activo y ~7 minutos por episodio de fallback).
+    Un fallo no aborta todo.
     """
     if not items:
         return {}
 
     async def _judge_one(it) -> list[dict[str, Any]]:
-        llm = structured_llm(ItemQualityVerdict)
         msgs = [
             ("system", _QUALITY_SYSTEM),
             ("human", f"ITEM_ID: {it.id}\nTYPE: {it.type.value}\nSTATEMENT: {it.statement}"),
         ]
-        parse_fails = 0
-        transient_fails = 0
-        while True:
-            try:
-                v = await llm.ainvoke(msgs)
-                v = v.model_copy(update={"item_id": str(it.id)})
-                return _verdict_to_findings(v, it.id)
-            except Exception as exc:  # noqa: BLE001
-                if is_transient(exc):
-                    transient_fails += 1
-                    if transient_fails >= _TRANSIENT_RETRIES:
-                        logger.warning(
-                            "quality transient exhausted for %s (%s)",
-                            it.id, type(exc).__name__,
-                        )
-                        return _verdict_to_findings(
-                            _empty_verdict(str(it.id), "rate_limited"), it.id
-                        )
-                    await asyncio.sleep(min(2 ** transient_fails, 60))
-                else:
-                    parse_fails += 1
-                    if parse_fails >= _JUDGE_ATTEMPTS:
-                        return _verdict_to_findings(
-                            _empty_verdict(str(it.id), "parse_error"), it.id
-                        )
+        try:
+            v = await invoke_structured_resilient(
+                lambda **kw: structured_llm(ItemQualityVerdict, **kw),
+                msgs,
+                context_label=f"quality/item:{it.id}",
+                max_parse=_JUDGE_ATTEMPTS,
+                thinking_off_body=disable_thinking_body(),
+            )
+        except Exception as exc:  # noqa: BLE001 — sentinel, no aborta
+            reason = "rate_limited" if is_transient(exc) else "parse_error"
+            logger.warning(
+                "quality LLM eval unavailable for %s (%s)", it.id, reason
+            )
+            # Sentinel directo (dict, sin el desvío por ItemQualityVerdict):
+            # su dimensión no existe en el Literal del esquema LLM y el intento
+            # histórico de construirla como LlmFinding crashaba con
+            # ValidationError antes de llegar a la DB (bug latente).
+            return [
+                {
+                    "scope": FindingScope.ITEM,
+                    "req_id": it.id,
+                    "dimension": FindingDimension.EVAL_UNAVAILABLE,
+                    "rule_id": "llm.eval_unavailable",
+                    "severity": FindingSeverity.MINOR,
+                    "message": (
+                        "No se pudo completar la evaluación LLM de este ítem "
+                        f"({reason}); revisión manual recomendada."
+                    ),
+                    "suggestion": None,
+                    "ears_pattern": None,
+                    "detected_by": "agent",
+                }
+            ]
+        return _verdict_to_findings(
+            v.model_copy(update={"item_id": str(it.id)}), it.id
+        )
 
     # Batch path.
     blocks = []
@@ -254,34 +256,20 @@ async def _judge_batch(
         )
     user = "\n---\n".join(blocks)
     msgs = [("system", _QUALITY_SYSTEM), ("human", user)]
-    llm = structured_llm(QualityBatch)
-    parse_fails = 0
-    transient_fails = 0
-    batch: QualityBatch | None = None
-    while True:
-        try:
-            batch = await llm.ainvoke(msgs)
-            break
-        except Exception as exc:  # noqa: BLE001
-            if is_transient(exc):
-                transient_fails += 1
-                if transient_fails >= _TRANSIENT_RETRIES:
-                    logger.warning(
-                        "quality batch transient exhausted; per-item fallback "
-                        "for %d items", len(items),
-                    )
-                    results = await asyncio.gather(*[_judge_one(it) for it in items])
-                    return {it.id: r for it, r in zip(items, results)}
-                await asyncio.sleep(min(2 ** transient_fails, 60))
-            else:
-                parse_fails += 1
-                if parse_fails >= _BATCH_PARSE_RETRIES:
-                    logger.warning(
-                        "quality batch parse failed; per-item fallback for %d items",
-                        len(items),
-                    )
-                    results = await asyncio.gather(*[_judge_one(it) for it in items])
-                    return {it.id: r for it, r in zip(items, results)}
+    try:
+        batch: QualityBatch = await invoke_structured_resilient(
+            lambda **kw: structured_llm(QualityBatch, **kw),
+            msgs,
+            context_label="quality/batch",
+            max_parse=_BATCH_PARSE_RETRIES,
+            thinking_off_body=disable_thinking_body(),
+        )
+    except Exception:  # noqa: BLE001 — fallback per-ítem
+        logger.warning(
+            "quality batch failed; per-item fallback for %d items", len(items)
+        )
+        results = await asyncio.gather(*[_judge_one(it) for it in items])
+        return {it.id: r for it, r in zip(items, results)}
 
     by_id = {v.item_id: v for v in batch.verdicts}
     out: dict[int, list[dict[str, Any]]] = {}
@@ -298,12 +286,17 @@ async def _judge_batch(
 
 
 async def analyze_quality(
-    session: AsyncSession, project_id: int
+    session: AsyncSession,
+    project_id: int,
+    on_progress: Callable[[int, int], Awaitable[None]] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Analiza la calidad de todos los requerimientos vivos del proyecto.
 
     Devuelve (summary, findings) donde ``findings`` son dict listos para
     ``srs_store.replace_findings``. Combina Fase A (programática) + Fase B (LLM).
+    ``on_progress(done, total)`` (opcional, awaited) reporta el avance de los
+    batches LLM: se emite cada ``_PROGRESS_EVERY`` lotes y en el último; el
+    caller decide el canal (SSE ``srs.progress`` desde el tool del agente).
     """
     items = await list_requirements(session, project_id, include_deleted=True)
     live = [it for it in items if it.status in _LIVE_STATUSES]
@@ -316,11 +309,23 @@ async def analyze_quality(
     # Fase B: LLM en batches concurrentes.
     sem = asyncio.Semaphore(DEFAULT_CONCURRENCY)
     batches = [live[i:i + DEFAULT_BATCH_SIZE] for i in range(0, len(live), DEFAULT_BATCH_SIZE)]
+    total = len(batches)
+    done = 0
     llm_by_req: dict[int, list[dict[str, Any]]] = {}
 
     async def _run(batch):
+        nonlocal done
         async with sem:
-            return await _judge_batch(batch)
+            result = await _judge_batch(batch)
+        done += 1
+        if on_progress is not None and (
+            done % _PROGRESS_EVERY == 0 or done == total
+        ):
+            try:
+                await on_progress(done, total)
+            except Exception:  # noqa: BLE001 — el progreso nunca rompe la etapa
+                pass
+        return result
 
     batch_results = await asyncio.gather(*[_run(b) for b in batches])
     for br in batch_results:
@@ -350,6 +355,11 @@ async def analyze_quality(
         "items_with_findings": len(items_with_findings),
         "items_analyzed": len(live),
         "blockers": blockers,
+        # Ítems cuya evaluación LLM cayó al sentinel (degradación explícita:
+        # el reporte deja de esconder cobertura de evaluación faltante).
+        "llm_eval_unavailable": sum(
+            1 for f in findings if f.get("rule_id") == "llm.eval_unavailable"
+        ),
     }
     logger.info(
         "quality: %d items -> %d findings (blockers=%d)",

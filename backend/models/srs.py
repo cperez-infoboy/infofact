@@ -56,6 +56,10 @@ class FindingDimension(str, Enum):
     AMBIGUITY = "ambiguity"
     COVERAGE_GAP = "coverage_gap"
     MISSING_REQ = "missing_req"
+    # Sentinel del motor de calidad: la evaluación LLM del ítem no pudo
+    # completarse (parse/transient agotado). No es un defecto del enunciado
+    # sino un hueco del análisis; pide revisión manual.
+    EVAL_UNAVAILABLE = "eval_unavailable"
 
 
 class FindingSeverity(str, Enum):

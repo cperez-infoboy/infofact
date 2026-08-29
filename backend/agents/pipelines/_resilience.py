@@ -181,6 +181,68 @@ async def _invoke_with_retry(
                 )
 
 
+async def invoke_structured_resilient(
+    make_llm,
+    msgs,
+    *,
+    context_label: str = "pipeline",
+    max_parse: int = 2,
+    max_transient: int | None = None,
+    thinking_off_body: dict | None = None,
+):
+    """Invocación estructurada con degradación por truncado de salida.
+
+    Primera pasada con el default del proveedor (thinking activo). Si el único
+    fallo es un truncado por presupuesto — ``StructuredOutputTruncatedError``
+    (finish_reason=length con JSON incompleto): el pensamiento interno de
+    Z.ai comparte el presupuesto de salida y lo quema antes de emitir nada —
+    reintenta con thinking desactivado, que produce el objeto estructurado
+    corto en una fracción del tiempo. El resto de los fallos (transient
+    429/5xx, parse sin truncar) conserva la semántica de ``_invoke_with_retry``
+    y propaga la excepción al agotarse.
+
+    ``make_llm(**kwargs)`` construye el runnable estructurado (p. ej.
+    ``lambda **kw: structured_llm(schema, **kw)``); ``thinking_off_body``
+    permite inyectar el body sin thinking del caller (los módulos pasan su
+    ``disable_thinking_body()`` importado, así los tests pueden stubearlo).
+
+    Compartido por ``goals_engine`` (fase goals / lote de links) y
+    ``srs_quality`` (batch / per-ítem) para que la degradación por truncado
+    no diverja entre etapas.
+    """
+    from backend.agents.llm import (
+        StructuredOutputTruncatedError,
+        disable_thinking_body,
+    )
+
+    try:
+        return await _invoke_with_retry(
+            make_llm(),
+            msgs,
+            context_label=context_label,
+            max_parse=max_parse,
+            max_transient=max_transient,
+        )
+    except StructuredOutputTruncatedError:
+        logger.warning(
+            "%s: salida truncada por presupuesto de tokens; reintento con "
+            "thinking desactivado",
+            context_label,
+        )
+    body = (
+        thinking_off_body
+        if thinking_off_body is not None
+        else disable_thinking_body()
+    )
+    return await _invoke_with_retry(
+        make_llm(extra_body=body),
+        msgs,
+        context_label=f"{context_label}/sin-thinking",
+        max_parse=max_parse,
+        max_transient=max_transient,
+    )
+
+
 def _format_goals(
     goals: list[Any] | None,
     section_title: str = "OBJETIVOS",
