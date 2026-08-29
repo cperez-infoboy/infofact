@@ -30,10 +30,16 @@ CHUNKS de requerimientos: la llamada monolítica con el catálogo completo
 (~35K tokens de entrada con ~800 reqs) no completaba en el gateway del
 proveedor (500 api_error en segundos o request colgada), y el max_tokens
 global (32768) hacía inasequible el fallback por créditos. Cada chunk es
-una llamada con max_tokens propio (la salida de goals es chica por
-diseño) y el merge entre chunks es determinista: renumeración global de
-códigos, dedupe de statements casi iguales y corte de parent_code no
-resolubles.
+una llamada con max_tokens propio y el merge entre chunks es determinista:
+renumeración global de códigos, dedupe de statements casi iguales y corte
+de parent_code no resolubles.
+
+Recalibración tras el primer run con chunks (mismo día): la salida REAL
+escala con los reqs del chunk (un goal cada ~3-5 reqs, ~100 tokens con
+statement y rationale) y la de links con el lote (rationale incluido), así
+que 270/8192 truncó 2/3 chunks y 7/7 lotes de links. Quedó en chunk 130,
+lote de links 60 y max_tokens 12288, debajo del techo de asequibilidad del
+fallback (~13.9K).
 """
 from __future__ import annotations
 
@@ -65,21 +71,25 @@ logger = logging.getLogger(__name__)
 # activo un reintento a 16K tokens cuesta minutos, así que ahí se cambia de
 # estrategia en cuanto se confirma el truncado.
 _INFER_ATTEMPTS = 2
-# Requerimientos por lote de links: la salida de un lote es a lo sumo un link
-# por requerimiento (~50 tokens c/u), así que 120 deja el JSON con margen de
-# ~10x respecto del presupuesto de salida, thinking incluido.
-_LINK_BATCH_SIZE = 120
+# Requerimientos por lote de links: cada link lleva rationale (~80-100
+# tokens), así que la salida real de un lote ronda los 2-6K tokens; 60 deja
+# margen amplio bajo el presupuesto por llamada (incidente 2026-08-29: con
+# 120 y 8192 truncaron 7/7 lotes). Env-tunable para recalibrar sin código.
+_LINK_BATCH_SIZE = int(os.environ.get("INFOFACT_LINK_BATCH", "60"))
 # Requerimientos por chunk de fase 1: mantiene la entrada muy por debajo del
-# umbral donde el gateway del proveedor empezó a fallar (~35K tokens) y deja
-# la salida de goals (5-15) con margen amplio. Env-tunable para recalibrar
-# sin código (mismo patrón que INFOFACT_CONCURRENCY).
-GOALS_CHUNK_SIZE = int(os.environ.get("INFOFACT_GOALS_CHUNK", "270"))
-# max_tokens por llamada de goals (fase 1 y lotes de links): la salida es
-# chica por diseño; el global (llm_max_tokens=32768) pedía reserva de 32K y
-# volvía inasequible el fallback por créditos (OpenRouter 402: asequibles
-# ~13.9K). 8192 queda debajo del umbral observado y con thinking activo el
-# truncado ya degrada al camino sin thinking.
-GOALS_MAX_TOKENS = int(os.environ.get("INFOFACT_GOALS_MAX_TOKENS", "8192"))
+# umbral donde el gateway del proveedor empezó a fallar (~35K tokens) y acota
+# la salida REAL: el modelo emite un goal cada ~3-5 reqs, con statement y
+# rationale (~100 tokens c/u). Env-tunable para recalibrar sin código
+# (mismo patrón que INFOFACT_CONCURRENCY).
+GOALS_CHUNK_SIZE = int(os.environ.get("INFOFACT_GOALS_CHUNK", "130"))
+# max_tokens por llamada (chunks de goals y lotes de links): el global
+# (llm_max_tokens=32768) pedía reserva de 32K y volvía inasequible el
+# fallback por créditos (OpenRouter 402: asequibles ~13.9K). 12288 queda
+# debajo de ese techo y, con thinking activo, el truncado degrada al camino
+# sin thinking. La calibración fina de la salida la hace el tamaño de
+# chunk/lote, no este techo: el primer run con chunks (270 reqs, 8192)
+# truncó 2/3 chunks y 7/7 lotes de links.
+GOALS_MAX_TOKENS = int(os.environ.get("INFOFACT_GOALS_MAX_TOKENS", "12288"))
 # token_sort_ratio mínimo (0-100) para considerar dos goals de chunks
 # distintos el mismo objetivo (dedupe del merge).
 _GOALS_DEDUPE_RATIO = 90
