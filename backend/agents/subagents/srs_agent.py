@@ -403,9 +403,15 @@ falla devuelve ``error`` (sin degradar a un modelo vacío).
 
         on_progress, on_event = _make_emitters()
         await on_progress(STAGE_GOALS, "inferencia de goals (GORE)")
+
+        async def _report_progress(phase: str, done: int, total: int) -> None:
+            await on_progress(STAGE_GOALS, f"{phase} procesados: {done}/{total}")
+
         try:
             async with AsyncSessionLocal() as session:
-                summary = await goals_engine.infer_goals(session, project_id)
+                summary = await goals_engine.infer_goals(
+                    session, project_id, on_progress=_report_progress
+                )
                 goals = await srs_store.list_goals(session, project_id)
         except goals_engine.GoalsInferenceError as exc:
             # Ya no existe la degradación silenciosa a goals=0: el fallo se

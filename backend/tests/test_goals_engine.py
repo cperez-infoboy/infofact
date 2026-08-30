@@ -9,7 +9,9 @@ silencio tras quemar ~72 minutos por intento. Pins de esta suite:
 - el truncado detectado degrada a un LLM con thinking desactivado,
 - el fallo de la fase goals es un error EXPLÍCITO, nunca un modelo vacío,
 - un lote de links caído no arrastra al resto (persistencia parcial),
-- dedupe de goals por alias y de aristas repetidas del LLM.
+- dedupe de goals por alias y de aristas repetidas del LLM,
+- el avance por unidad (chunk de goals / lote de links) se reporta vía
+  ``on_progress``, contando también las unidades que fallan.
 
 El LLM es stubado en todos los casos (sin red); la DB es sqlite temporal.
 """
@@ -508,6 +510,80 @@ async def test_max_tokens_travels_to_every_invoke(monkeypatch):
         assert link_calls[0]["ainvoke_kwargs"].get("max_tokens") == (
             ge.GOALS_MAX_TOKENS
         )
+    finally:
+        await engine.dispose()
+        tmp.cleanup()
+
+
+# ---------------------------------------------------------------------------
+# Progreso por unidad (la etapa goals deja de quedar muda tras el mensaje
+# inicial: mismo reporte de avance que srs_quality).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_progress_reported_per_unit(monkeypatch):
+    """Cada chunk de goals y cada lote de links emite (fase, hecho, total)."""
+    monkeypatch.setattr(ge, "GOALS_CHUNK_SIZE", 2)  # 4 reqs => 2 chunks
+    monkeypatch.setattr(ge, "_LINK_BATCH_SIZE", 2)  # 4 reqs => 2 lotes
+    # Concurrencia 1: el orden de emisión queda determinista.
+    monkeypatch.setattr(ge, "DEFAULT_CONCURRENCY", 1)
+    plans = _plans(
+        ge.GoalGoals(goals=[_goal("G1")]),
+        [_links([("G1", "REQ-0000")]), _links([("G1", "REQ-0002")])],
+    )
+    _patch_llm(monkeypatch, plans)
+    sm, tmp, engine = await _fresh_db()
+    events: list[tuple[str, int, int]] = []
+
+    async def on_progress(phase: str, done: int, total: int) -> None:
+        events.append((phase, done, total))
+
+    try:
+        async with sm() as session:
+            pid = await _seed(session, n=4)
+            await ge.infer_goals(session, pid, on_progress=on_progress)
+
+        assert events == [
+            ("chunks de goals", 1, 2),
+            ("chunks de goals", 2, 2),
+            ("lotes de links", 1, 2),
+            ("lotes de links", 2, 2),
+        ]
+    finally:
+        await engine.dispose()
+        tmp.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_progress_counts_failed_units_too(monkeypatch):
+    """El chunk que falla también cuenta: el avance llega a total y no se congela."""
+    monkeypatch.setattr(ge, "GOALS_CHUNK_SIZE", 1)  # 2 reqs => 2 chunks
+    monkeypatch.setattr(ge, "DEFAULT_CONCURRENCY", 1)
+    plans = _plans(None, [])
+    plans[ge.GoalGoals] = [
+        ge.GoalGoals(goals=[_goal("G1")]),
+        ValueError("gateway 500"),
+    ]
+    plans[ge.GoalLinks] = [_links([("G1", "REQ-0000")])]
+    _patch_llm(monkeypatch, plans)
+    sm, tmp, engine = await _fresh_db()
+    events: list[tuple[str, int, int]] = []
+
+    async def on_progress(phase: str, done: int, total: int) -> None:
+        events.append((phase, done, total))
+
+    try:
+        async with sm() as session:
+            pid = await _seed(session, n=2)
+            summary = await ge.infer_goals(session, pid, on_progress=on_progress)
+
+        assert summary["goals_partial"] is True
+        assert events == [
+            ("chunks de goals", 1, 2),
+            ("chunks de goals", 2, 2),  # el caído también se reporta
+            ("lotes de links", 1, 1),
+        ]
     finally:
         await engine.dispose()
         tmp.cleanup()

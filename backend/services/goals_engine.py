@@ -54,7 +54,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from typing import Any, Literal
+from typing import Any, Awaitable, Callable, Literal
 
 from rapidfuzz import fuzz
 
@@ -215,7 +215,9 @@ async def _invoke_unit(schema, msgs: list, *, label: str, extra: dict | None = N
 
 
 async def infer_goals(
-    session: AsyncSession, project_id: int
+    session: AsyncSession,
+    project_id: int,
+    on_progress: Callable[[str, int, int], Awaitable[None]] | None = None,
 ) -> dict[str, Any]:
     """Infiere el modelo de goals en dos fases y lo persiste (replace_goals).
 
@@ -224,6 +226,13 @@ async def infer_goals(
     la fase de goals falla o no infiere nada: ya no se degrada a un modelo
     vacío silencioso. Si no hay reqs vivos, limpia goals previos y devuelve
     ceros.
+
+    ``on_progress(fase, hecho, total)`` (opcional, awaited) reporta el avance
+    por unidad de trabajo: cada chunk de goals (fase 1) y cada lote de links
+    (fase 2), cuenten o fallen. ``fase`` es la etiqueta legible de la unidad
+    («chunks de goals» / «lotes de links»); el caller decide el canal (SSE
+    ``srs.progress`` desde el tool del agente, mismo patrón que
+    ``srs_quality``).
     """
     items = await list_requirements(session, project_id, include_deleted=True)
     live = [it for it in items if it.status in _LIVE_STATUSES]
@@ -233,13 +242,25 @@ async def infer_goals(
         await replace_goals(session, project_id, [], [], req_by_code=req_by_code)
         return {"goals": 0, "links": 0, "softgoals": 0, "obstacles": 0}
 
+    # Progreso por unidad: el fallo del canal nunca rompe la etapa (mismo
+    # contrato que srs_quality).
+    async def _report(phase: str, done: int, total: int) -> None:
+        if on_progress is None:
+            return
+        try:
+            await on_progress(phase, done, total)
+        except Exception:  # noqa: BLE001 — el progreso nunca rompe la etapa
+            pass
+
     # ------------------------------------------------------------------
     # Fase 1: goals por chunks (salida acotada por chunk, sin links).
     # ------------------------------------------------------------------
     chunks = list(_chunk(live, GOALS_CHUNK_SIZE))
     sem = asyncio.Semaphore(max(1, DEFAULT_CONCURRENCY))
+    chunk_done = 0
 
     async def _goals_chunk(batch: list) -> GoalGoals:
+        nonlocal chunk_done
         catalog = "\n".join(
             f"- {it.code} [{it.type.value}]: {it.statement}" for it in batch
         )
@@ -248,12 +269,18 @@ async def infer_goals(
             ("human", f"PROJECT REQUIREMENTS:\n{catalog}"),
         ]
         async with sem:
-            return await _invoke_unit(
-                GoalGoals,
-                msgs,
-                label=f"goals {batch[0].code}..{batch[-1].code}",
-                extra={"max_tokens": GOALS_MAX_TOKENS},
-            )
+            try:
+                return await _invoke_unit(
+                    GoalGoals,
+                    msgs,
+                    label=f"goals {batch[0].code}..{batch[-1].code}",
+                    extra={"max_tokens": GOALS_MAX_TOKENS},
+                )
+            finally:
+                # Cuenta también el chunk caído: el avance debe llegar a
+                # total aunque la unidad falle (quedaría congelado si no).
+                chunk_done += 1
+                await _report("chunks de goals", chunk_done, len(chunks))
 
     outcomes = await asyncio.gather(
         *(_goals_chunk(b) for b in chunks), return_exceptions=True
@@ -302,8 +329,10 @@ async def infer_goals(
     # ------------------------------------------------------------------
     batches = list(_chunk(live, _LINK_BATCH_SIZE))
     sem = asyncio.Semaphore(max(1, DEFAULT_CONCURRENCY))
+    batch_done = 0
 
     async def _link_batch(batch: list) -> GoalLinks:
+        nonlocal batch_done
         reqs_text = "\n".join(
             f"- {it.code} [{it.type.value}]: {it.statement}" for it in batch
         )
@@ -316,12 +345,16 @@ async def infer_goals(
             ),
         ]
         async with sem:
-            return await _invoke_unit(
-                GoalLinks,
-                msgs,
-                label=f"links {batch[0].code}..{batch[-1].code}",
-                extra={"max_tokens": GOALS_MAX_TOKENS},
-            )
+            try:
+                return await _invoke_unit(
+                    GoalLinks,
+                    msgs,
+                    label=f"links {batch[0].code}..{batch[-1].code}",
+                    extra={"max_tokens": GOALS_MAX_TOKENS},
+                )
+            finally:
+                batch_done += 1
+                await _report("lotes de links", batch_done, len(batches))
 
     outcomes = await asyncio.gather(
         *(_link_batch(b) for b in batches), return_exceptions=True
