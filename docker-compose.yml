@@ -67,7 +67,11 @@ services:
       DATABASE_URL: sqlite+aiosqlite:////app/data/infofact.db
       CHECKPOINTER_DB: /app/data/checkpoints.db
       REGISTRY_FILE: /app/data/container_registry.json
-      # Concurrencia del pipeline de extracción/crítica/clasificación.
-      # 4 (default) → 8 duplica throughput. Si hay rate_limit excesivo, bajar.
-      INFOFACT_CONCURRENCY: "8"
+      # Concurrencia del pipeline de extracción/crítica/clasificación y
+      # etapas del SRS (quality/goals/links).
+      # El default del código es 4 (bajado de 8 tras un pico de 429). El run
+      # 2026-08-29 contra litellm/claude-opus-5 con 8 generó tormentas de 429
+      # sostenidas y colas que superaban el request_timeout del gateway (408).
+      # No subir sin medir contra el upstream real de cada modelo.
+      INFOFACT_CONCURRENCY: "4"
     restart: unless-stopped
