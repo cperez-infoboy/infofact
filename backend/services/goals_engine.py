@@ -40,6 +40,14 @@ statement y rationale) y la de links con el lote (rationale incluido), así
 que 270/8192 truncó 2/3 chunks y 7/7 lotes de links. Quedó en chunk 130,
 lote de links 60 y max_tokens 12288, debajo del techo de asequibilidad del
 fallback (~13.9K).
+
+Incidente 2026-08-30: el gateway del proveedor corta con 408 todo request
+que no completa en request_timeout=600s; en ventanas de congestión las
+generaciones largas (4-12K tokens) no entran y las chicas (quality, ~1-2K)
+sí. Mitigación de nuestro lado: salidas más cortas por llamada — rationale
+de goals acotado a ~15 palabras (opcional) y el de links a ~12, presupuesto
+de 5-8 goals por chunk y lote de links 40. El fix estructural (subir el
+request_timeout del gateway) es infraestructura, no código.
 """
 from __future__ import annotations
 
@@ -71,11 +79,11 @@ logger = logging.getLogger(__name__)
 # activo un reintento a 16K tokens cuesta minutos, así que ahí se cambia de
 # estrategia en cuanto se confirma el truncado.
 _INFER_ATTEMPTS = 2
-# Requerimientos por lote de links: cada link lleva rationale (~80-100
-# tokens), así que la salida real de un lote ronda los 2-6K tokens; 60 deja
-# margen amplio bajo el presupuesto por llamada (incidente 2026-08-29: con
-# 120 y 8192 truncaron 7/7 lotes). Env-tunable para recalibrar sin código.
-_LINK_BATCH_SIZE = int(os.environ.get("INFOFACT_LINK_BATCH", "60"))
+# Requerimientos por lote de links: con rationale acotado (~12 palabras,
+# incidente 2026-08-30) un lote genera ~1-2.5K tokens; 40 deja margen amplio
+# bajo el timeout del gateway incluso con el upstream congestionado.
+# Env-tunable para recalibrar sin código.
+_LINK_BATCH_SIZE = int(os.environ.get("INFOFACT_LINK_BATCH", "40"))
 # Requerimientos por chunk de fase 1: mantiene la entrada muy por debajo del
 # umbral donde el gateway del proveedor empezó a fallar (~35K tokens) y acota
 # la salida REAL: el modelo emite un goal cada ~3-5 reqs, con statement y
@@ -154,8 +162,11 @@ _GOALS_SYSTEM = (
     "the linking).\n"
     "- LANGUAGE: every statement and rationale MUST stay in the SAME LANGUAGE "
     "as the requirements. Never translate.\n"
-    "- Keep the model FOCUSED: aim for 5-15 goals, not one per requirement. "
-    "Group related requirements under a shared goal.\n"
+    "- Keep the model FOCUSED: aim for 5-8 goals for THIS subset of "
+    "requirements, not one per requirement. Group related requirements "
+    "under a shared goal.\n"
+    "- rationale is OPTIONAL and SHORT: at most 15 words, or omit it "
+    "entirely rather than padding.\n"
     "- parent_code must reference a goal's `code` you emit.\n"
     "- Return ONLY the structured object."
 )
@@ -173,8 +184,9 @@ _LINKS_SYSTEM = (
     "codes verbatim. Never invent codes.\n"
     "- Link a requirement only when the relation is meaningful; skip the "
     "rest. A typical batch yields links for a fraction of its requirements.\n"
-    "- LANGUAGE: every rationale MUST stay in the SAME LANGUAGE as the "
-    "requirements. Never translate.\n"
+    "- rationale: at most 12 words, to the point.\n"
+    "- LANGUAGE: every statement and rationale MUST stay in the SAME LANGUAGE "
+    "as the requirements. Never translate.\n"
     "- Return ONLY the structured object."
 )
 
