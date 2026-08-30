@@ -309,7 +309,16 @@ def structured_llm(
     Drop-in for build_llm(temperature=t).with_structured_output(schema) on
     providers that wrap JSON in code fences or lack native tool calling.
     ``extra_body`` (opcional) reenvía extensiones propietarias del request.
+
+    Incidente 2026-08-30 (SRS por litellm/claude-opus-5): el upstream se
+    traba con generaciones grandes NON-streaming (20+ min sin cerrar, 408 al
+    request_timeout del gateway) mientras el mismo pedido en streaming
+    responde completo; el runtime agrega los chunks en un único AIMessage,
+    así que el contrato de ``StructuredRunnable`` no cambia. Salidas chicas
+    también funcionan en streaming, y ``stream_chunk_timeout`` (en
+    ``build_llm``) acota los stalls a mitad de stream.
     """
     return StructuredRunnable(
-        build_llm(temperature=temperature, extra_body=extra_body), schema
+        build_llm(temperature=temperature, streaming=True, extra_body=extra_body),
+        schema,
     )
