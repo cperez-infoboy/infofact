@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from collections.abc import AsyncGenerator
 from typing import Any
 
@@ -379,14 +380,18 @@ async def _capture_gate_message(project_id: int, content: str) -> str | None:
     )
 
 
-def _captura_agente_directive(user_instructions: str) -> str:
+def _captura_agente_directive(
+    user_instructions: str, capture_scope: str = ""
+) -> str:
     """Construye la directiva para el subagente agent-driven de captura.
 
     El orquestador delega a ``requirements-capture-agent`` via la tool ``task``.
     El texto libre despues del comando se reenvia como steering que el agente
     incorpora en orientar/planificar. Si el texto expresa una decision sobre los
     datos existentes (reset/append), se propaga explicitamente para que el
-    agente la aplique en ``ingest_documents`` sin volver a consultar.
+    agente la aplique en ``ingest_documents`` sin volver a consultar. Cuando el
+    comando nombra una carpeta, capture_scope viaja como [SCOPE]: un contrato
+    que las tools verifican mecanicamente (scope_violation), no steering.
     """
     directive = (
         "[DIRECTIVE] Delega INMEDIATAMENTE al subagente "
@@ -402,6 +407,16 @@ def _captura_agente_directive(user_instructions: str) -> str:
         "La ingesta de texto es UNICAMENTE via ingest_documents; no extraer el "
         "documento a mano."
     )
+    if capture_scope:
+        directive += (
+            f" [SCOPE] El usuario pidio capturar UNICAMENTE la carpeta "
+            f"'{capture_scope}'. Pasa target_subpath='{capture_scope}' en "
+            "orient_documents e ingest_documents, EXACTAMENTE ese valor en "
+            "cada llamada: si lo omites, la tool rechaza la llamada con "
+            "scope_violation. Ningun documento fuera de esa carpeta entra en "
+            "esta captura; si detectas material relevante fuera del alcance, "
+            "informalo en tu reporte final sin procesarlo."
+        )
     decision = _user_existing_decision(user_instructions)
     if decision == "reset":
         directive += (
@@ -541,10 +556,84 @@ def _agrupar_directive(user_instructions: str) -> str:
     return directive
 
 
-def _rewrite_command(content: str) -> str:
+# Extensiones de documento que la UI puede mencionar como alcance de captura.
+# Un token suelto sin separador de carpeta solo cuenta como alcance si termina
+# en una de estas (p. ej. "acta.pdf"); "atencion" nunca matchea.
+_CAPTURA_DOC_EXTENSIONS = re.compile(
+    r"\.(?:md|txt|csv|docx?|pdf|xlsx?|pptx?)$", re.IGNORECASE
+)
+
+
+def _looks_like_scope_token(token: str) -> bool:
+    """True si el token es plausiblemente una carpeta o documento del workspace.
+
+    Un token citado (comillas) es alcance por definición. Uno suelto lo es si
+    contiene un separador de carpeta o termina en extensión de documento; el
+    steering libre ("enfatiza las restricciones") no matchea nunca.
+    """
+    bare = token.strip().strip(",").strip()
+    if bare != token.strip().strip(","):
+        return False
+    if bare.startswith('"') or bare.startswith("'"):
+        return True
+    bare = bare.lstrip("@")
+    return bool(bare) and ("/" in bare or "\\" in bare or bool(
+        _CAPTURA_DOC_EXTENSIONS.search(bare)
+    ))
+
+
+def _extract_captura_scope(text: str) -> tuple[str, str]:
+    """Separa ``texto`` en (alcance pedido, steering restante).
+
+    Consume los primeros tokens con forma de ruta (soporta una lista separada
+    por comas, decorada con @ y comillas) y se frena en la primera palabra
+    libre. Devuelve ("", text) si el primer token no es una ruta: todo queda
+    como steering libre del usuario.
+    """
+    text = text.strip()
+    if not text:
+        return "", ""
+    quoted = re.match(r'^(["\'])(.+?)\1\s*(.*)$', text)
+    if quoted is not None:
+        return quoted.group(2).strip(), quoted.group(3).strip()
+    scope_tokens: list[str] = []
+    rest = text
+    while rest:
+        head, _, tail = rest.partition(" ")
+        if not _looks_like_scope_token(head):
+            break
+        scope_tokens.append(head.strip().strip(","))
+        rest = tail.strip()
+    if not scope_tokens:
+        return "", text
+    if len(scope_tokens) > 1:
+        # Varias rutas sueltas: el pipeline solo acepta UNA carpeta por
+        # captura (target_subpath), asi que un scope multi-ruta seria un
+        # contrato imposible. Queda como steering libre (comportamiento
+        # previo) hasta que exista soporte de listas en ingest_documents.
+        return "", text
+    scope = scope_tokens[0].lstrip("@")
+    return normalize_scope_text(scope), rest
+
+
+def normalize_scope_text(subpath: str) -> str:
+    """Decoraciones fuera (/, @, comillas) para comparar contra el registro."""
+    from backend.agents.subagents.capture_run_holder import normalize_scope
+
+    try:
+        return normalize_scope(subpath)
+    except ValueError:
+        return subpath
+
+
+def _rewrite_command(content: str, project_id: int | None = None) -> str:
     """Reescribe los slash commands en directivas al subagente.
 
-    - ``/captura [subpath]`` -> captura y validación de requerimientos.
+    - ``/captura [subpath] [steering]`` -> captura y validación de
+      requerimientos. Si el primer token tras el comando es una carpeta o
+      documento del workspace, se registra como alcance pedido (contract
+      scope, verificado por las tools) y viaja además como [SCOPE] en la
+      directiva; el resto del texto queda como steering libre.
     - ``/agrupar [steering]`` -> revisión de duplicados. El comando puro lo
       responde la rama directa de ``send_message``; con texto extra, esta
       directiva delega con el alcance del usuario (types/documents).
@@ -593,14 +682,31 @@ def _rewrite_command(content: str) -> str:
 
     if not stripped.startswith(_CAPTURA_PREFIX):
         return content
-    # /captura rutea al mismo subagente agentico que /captura_agente. El texto
-    # tras el comando es steering libre del usuario (subpath, foco, decision
-    # reset/append); _captura_agente_directive propaga la decision explicita y
-    # embebe el resto como INSTRUCCIONES DEL USUARIO.
-    _user_instructions = (
-        stripped[len(_CAPTURA_PREFIX):].strip().lstrip("/").strip()
-    )
-    return _captura_agente_directive(_user_instructions)
+    # /captura rutea al mismo subagente agentico que /captura_agente. La
+    # extraccion de alcance corre sobre el texto CRUDO tras el comando: el
+    # lstrip("/") historico (separador del comando) va DESPUES, porque si no
+    # "/captura /etc/passwd" llega al registro como scope "etc/passwd" (un
+    # absoluto disfrazado de relativo) en vez de degradar a steering.
+    _after_command = stripped[len(_CAPTURA_PREFIX):].strip()
+    _user_instructions = _after_command.lstrip("/").strip()
+    _capture_scope = ""
+    if project_id is not None:
+        _capture_scope, _remaining = _extract_captura_scope(_after_command)
+        if _capture_scope:
+            from backend.agents.subagents.capture_run_holder import (
+                set_capture_scope,
+            )
+            try:
+                _capture_scope = set_capture_scope(project_id, _capture_scope)
+                _user_instructions = _remaining
+            except ValueError:
+                # Ruta invalida (absoluta, traversal): no se registra scope ni
+                # se rompe el envio. El steering se restaura LITERAL (el
+                # lstrip historico no aplica: no sabemos que era decoracion) y
+                # la contencion final la hace _resolve_target en las tools.
+                _capture_scope = ""
+                _user_instructions = _after_command
+    return _captura_agente_directive(_user_instructions, _capture_scope)
 
 
 # Máximo de líneas de grupos en el resumen del chat de /agrupar (directo).
@@ -866,7 +972,7 @@ async def send_message(
         "configurable": {"thread_id": str(session_id)},
         "recursion_limit": RECURSION_LIMIT,
     }
-    content = _rewrite_command(body.content)
+    content = _rewrite_command(body.content, project_id=project.id)
 
     async def event_stream() -> AsyncGenerator[str, None]:
         accumulator = _RelayAccumulator(

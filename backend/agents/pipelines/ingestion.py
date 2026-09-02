@@ -22,6 +22,7 @@ the pipeline does not.
 """
 from __future__ import annotations
 
+import base64
 import logging
 import re
 from dataclasses import dataclass, field
@@ -580,11 +581,18 @@ def _chunk_plaintext(path: Path, document_id: str) -> list[Chunk]:
     large file reaches the extractor as several bounded chunks.
     """
     text = path.read_text(encoding="utf-8", errors="replace")
+    return _chunk_plaintext_text(text, document_id, path.name)
+
+
+def _chunk_plaintext_text(
+    text: str, document_id: str, fallback_name: str
+) -> list[Chunk]:
+    """Chunk already-read plaintext (shared by _parse_plaintext sanitizing)."""
     if not text.strip():
         return []
     return [
         Chunk(text=t, document_id=document_id, section_path=crumb, index=i)
-        for i, (crumb, t) in enumerate(_split_plaintext(text, path.name))
+        for i, (crumb, t) in enumerate(_split_plaintext(text, fallback_name))
     ]
 
 
@@ -716,15 +724,88 @@ def _plaintext_sections(text: str, fallback_title: str) -> list[SectionNode]:
     return sections
 
 
+_DATA_URI_RE = re.compile(
+    r"\[?(\w+)\]?:\s*<data:image/[a-z+]+;base64,[A-Za-z0-9+/=]+>"
+)
+
+_MEDIA_DIR_NAME = ".infofact-media"
+
+
+def _media_dir_for(path: Path) -> Path:
+    """Media dir next to the document (workspace-relative)."""
+    return path.parent / _MEDIA_DIR_NAME / path.stem
+
+
+def _sanitize_plaintext_media(
+    path: Path, text: str, document_id: str
+) -> tuple[str, list[Chunk]]:
+    """Replace embedded base64 data-URIs with placeholders + vision chunks.
+
+    A pandoc-exported .md can carry megabytes of base64 in single lines (no
+    newline), which defeats the line-based plaintext chunking: chunks up to
+    ~350K chars reach the extractor and it returns 0 items (session-14
+    failure). Each data-URI is swapped for a short placeholder, the binary is
+    materialized under the media dir, and the image becomes an
+    ``image_description`` chunk via the vision model — the same convention
+    the Docling embedded-pictures path uses (``verification_text`` already
+    appends those chunks for span checks). Vision failures degrade to the
+    placeholder only: ingestion never breaks.
+    """
+    from backend.agents.vision import describe_image
+
+    media_dir = _media_dir_for(path)
+    out: list[Chunk] = []
+    seen = 0
+
+    def _sub(m: re.Match) -> str:
+        nonlocal seen
+        seen += 1
+        ref = m.group(1)
+        size_kb = (len(m.group(0)) * 3) // 4 // 1024
+        img_path = media_dir / f"{ref}.png"
+        try:
+            media_dir.mkdir(parents=True, exist_ok=True)
+            raw = base64.b64decode(m.group(0).split("base64,", 1)[1], validate=False)
+            img_path.write_bytes(raw)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("No se pudo materializar %s de %s: %s", ref, path.name, exc)
+        description = ""
+        cap = settings.vision_max_pictures_per_doc
+        if settings.supports_vision and seen <= cap:
+            try:
+                description = describe_image(img_path) or ""
+                description = " ".join(description.split())[:2000]
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Vision fallo para %s/%s: %s", path.name, ref, exc)
+        if description:
+            out.append(Chunk(
+                text=description,
+                document_id=document_id,
+                section_path=f"Imagen embebida {ref}",
+                element_kinds=("image_description",),
+            ))
+        return f"\n[imagen: {ref} ~{size_kb} KB — ver descripción al final del documento]\n"
+
+    clean = _DATA_URI_RE.sub(_sub, text)
+    if seen:
+        logger.info(
+            "plaintext media: %d data-URIs reemplazadas en %s (%d descripciones)",
+            seen, path.name, len(out),
+        )
+    return clean, out
+
+
 def _parse_plaintext(path: Path):
     """Rama plaintext como ``ParsedDoc`` (para el router, Fase C)."""
     from backend.agents.parsers.base import ParsedDoc
 
     document_id = str(path)
-    chunks = _chunk_plaintext(path, document_id)
-    # Full text drives span verification — keep the file verbatim, not a
-    # chunk join (chunk packing drops blank-line separators).
-    full_text = path.read_text(encoding="utf-8", errors="replace")
+    # Data-URIs first: the verbatim file can carry megabytes of base64 in
+    # single lines, which defeats the line-based chunker (session-14).
+    raw_text = path.read_text(encoding="utf-8", errors="replace")
+    full_text, image_chunks = _sanitize_plaintext_media(path, raw_text, document_id)
+    chunks = _chunk_plaintext_text(full_text, document_id, path.name)
+    chunks.extend(image_chunks)
     smap = StructureMap(
         document_id=document_id,
         sections=_plaintext_sections(full_text, path.name),
