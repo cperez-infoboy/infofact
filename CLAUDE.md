@@ -207,4 +207,8 @@ These are not suggestions — run each step at the trigger.
 7. For any refactor, **call** `get_edit_plan` then `batch_edit` to apply atomically.
 8. Verify with the project's real build/test. Reserve `check_guards` for guard-relevant changes and `get_test_targets` to find the tests covering a substantive change — not mechanically after every edit.
 
+### Sub-agent scope (verified 2026-09-02)
+
+PreToolUse hooks apply to the main agent only — sub-agent tool calls are NOT hook-guarded (verified empirically). DEFAULT delegation rule (not optional): source-code exploration and impact questions in indexed repos go to the global custom agents `gortex-search` (locate/trace/architecture + engram mem_search/mem_save) and `gortex-impact` (blast radius/contracts/tests), defined in `~/.zcode/agents/` with toolset exclusively `mcp__gortex__*` — NOT to Explore. Explore is reserved for docs, configs, data, or non-indexed repos. When delegating to an agent without MCP tools, pass the exact CLI syntax in the prompt: `gortex call search --arg operation=symbols --arg query='<name>'`, `gortex context --task '<desc>'`, `engram search '<query>' --project <p> --limit N` (there is NO bare `gortex search`; `gortex context` requires `--task`).
+
 <!-- gortex:communities:end -->
