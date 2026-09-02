@@ -126,11 +126,16 @@ class SrsStatus(str, Enum):
     CANDIDATE  generado por el agente, pendiente de revisión humana.
     IN_REVIEW  el usuario edita la prosa y marca pendientes.
     LOCKED     snapshot inmutable consumido por la fase de diseño (fase 2).
+    DISCARDED  descartada por el usuario o el agente: la fila queda (la UI la
+               lista etiquetada) pero ``get_latest_srs`` la ignora, así que
+               nunca es la «última» ni base de versiones nuevas. LOCKED no
+               admite el descarte.
     """
 
     CANDIDATE = "candidate"
     IN_REVIEW = "in_review"
     LOCKED = "locked"
+    DISCARDED = "discarded"
 
 
 # --- Hallazgos de calidad ---------------------------------------------------

@@ -28,7 +28,13 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 import backend.models  # noqa: F401 — registra todas las tablas en Base.metadata
 from backend.agents.llm import StructuredOutputTruncatedError
 from backend.models import Base, Priority, Project, ReqType, RequirementItem
-from backend.models.srs import Goal, GoalLink
+from backend.models.srs import (
+    Goal,
+    GoalKind,
+    GoalLink,
+    GoalStatus,
+    LinkRelation,
+)
 from backend.services import goals_engine as ge
 
 _THINKING_OFF = {"thinking": {"type": "disabled"}}
@@ -584,6 +590,148 @@ async def test_progress_counts_failed_units_too(monkeypatch):
             ("chunks de goals", 2, 2),  # el caído también se reporta
             ("lotes de links", 1, 1),
         ]
+    finally:
+        await engine.dispose()
+        tmp.cleanup()
+
+
+# ---------------------------------------------------------------------------
+# Upsert + camino incremental (sesión 9 de Planitrack: re-correr la etapa
+# reasignaba códigos GOAL-XXXX y huérfanaba los links hechos a mano).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reinfer_preserves_goal_codes(monkeypatch):
+    """Dos corridas con la misma inferencia: los códigos GOAL-XXXX no cambian."""
+    plans = _plans(
+        ge.GoalGoals(goals=[_goal("G1"), _goal("G2")]),
+        [_links([("G1", "REQ-0000"), ("G2", "REQ-0001")])],
+    )
+    _patch_llm(monkeypatch, plans)
+    sm, tmp, engine = await _fresh_db()
+    try:
+        async with sm() as session:
+            pid = await _seed(session, n=2)
+            first = await ge.infer_goals(session, pid)
+        async with sm() as session:
+            codes_1 = {
+                g.code: g for g in (
+                    await session.execute(sa_select(Goal))
+                ).scalars()
+            }
+        async with sm() as session:
+            second = await ge.infer_goals(session, pid)
+            rows = {
+                g.code: g for g in (
+                    await session.execute(sa_select(Goal))
+                ).scalars()
+            }
+
+        assert first["goals"] == 2
+        assert second["goals"] == 2
+        assert set(rows) == set(codes_1)  # SIN churn de código
+        # La fila preservada no se recrea: mismo id, status intacto.
+        assert all(
+            rows[c].id == codes_1[c].id
+            and rows[c].status == GoalStatus.PROPOSED
+            for c in rows
+        )
+    finally:
+        await engine.dispose()
+        tmp.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_infer_goal_links_incremental_is_idempotent(monkeypatch):
+    """Solo los reqs pedidos; la arista que ya existe no se duplica."""
+    monkeypatch.setattr(ge, "_LINK_BATCH_SIZE", 2)
+    monkeypatch.setattr(ge, "DEFAULT_CONCURRENCY", 1)
+    plans = {
+        ge.GoalLinks: [
+            ge.GoalLinks(
+                links=[
+                    # REQ-0001 ya está linkeado: created=False (existing).
+                    ge.InferredLink(
+                        goal_code="GOAL-ZZ", req_code="REQ-0001",
+                        relation="realizes",
+                    ),
+                    ge.InferredLink(
+                        goal_code="GOAL-ZZ", req_code="REQ-0002",
+                        relation="realizes",
+                    ),
+                    # Duplicada dentro de la misma salida: fuera.
+                    ge.InferredLink(
+                        goal_code="GOAL-ZZ", req_code="REQ-0002",
+                        relation="realizes",
+                    ),
+                ]
+            )
+        ]
+    }
+    _patch_llm(monkeypatch, plans)
+    sm, tmp, engine = await _fresh_db()
+    try:
+        async with sm() as session:
+            pid = await _seed(session, n=4)
+            goal = Goal(
+                project_id=pid,
+                code="GOAL-ZZ",
+                statement="Servir pedidos",
+                kind=GoalKind.FUNCTIONAL_GOAL,
+                status=GoalStatus.PROPOSED,
+                confidence=0.7,
+                created_by="agent",
+            )
+            session.add(goal)
+            await session.flush()
+            req1 = (
+                await session.execute(
+                    sa_select(RequirementItem.id).where(
+                        RequirementItem.code == "REQ-0001"
+                    )
+                )
+            ).scalar_one()
+            session.add(
+                GoalLink(
+                    goal_id=goal.id, req_id=req1,
+                    relation=LinkRelation.REALIZES,
+                )
+            )
+            await session.commit()
+            gid = goal.id
+
+            summary = await ge.infer_goal_links_incremental(
+                session, pid, ["REQ-0001", "REQ-0002", "REQ-9999"]
+            )
+
+        assert summary["reqs"] == 2  # REQ-9999 no existe
+        assert summary["reqs_missing"] == ["REQ-9999"]
+        assert summary["links_added"] == 1  # solo REQ-0002
+        assert summary["links_existing"] == 1  # REQ-0001 ya estaba
+        assert summary["batches_failed"] == 0
+        async with sm() as session:
+            links = (
+                await session.execute(sa_select(GoalLink))
+            ).scalars().all()
+            assert len(links) == 2  # preexistente + el nuevo; sin duplicados
+            assert all(l.goal_id == gid for l in links)
+    finally:
+        await engine.dispose()
+        tmp.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_incremental_links_require_existing_goals():
+    """Sin goals en el proyecto: error explícito, no una inferencia vacía."""
+    sm, tmp, engine = await _fresh_db()
+    try:
+        async with sm() as session:
+            pid = await _seed(session, n=2)
+            with pytest.raises(ge.GoalsInferenceError, match="infer_goals"):
+                await ge.infer_goal_links_incremental(
+                    session, pid, ["REQ-0000"]
+                )
     finally:
         await engine.dispose()
         tmp.cleanup()

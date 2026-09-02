@@ -59,6 +59,7 @@ from typing import Any, Awaitable, Callable, Literal
 from rapidfuzz import fuzz
 
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.agents.llm import disable_thinking_body, structured_llm
@@ -68,9 +69,15 @@ from backend.agents.pipelines._resilience import (
     invoke_structured_resilient,
 )
 from backend.models.requirement import ReqStatus
-from backend.models.srs import GoalKind
+from backend.models.requirement import RequirementItem
+from backend.models.srs import GoalKind, LinkRelation
 from backend.services.requirement_store import list_requirements
-from backend.services.srs_store import replace_goals
+from backend.services.srs_store import (
+    add_goal_link,
+    list_goals,
+    replace_goals,
+    upsert_goals,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -219,7 +226,7 @@ async def infer_goals(
     project_id: int,
     on_progress: Callable[[str, int, int], Awaitable[None]] | None = None,
 ) -> dict[str, Any]:
-    """Infiere el modelo de goals en dos fases y lo persiste (replace_goals).
+    """Infiere el modelo de goals en dos fases y lo persiste (upsert_goals).
 
     Devuelve un resumen {goals, links, softgoals, obstacles,
     link_batches_failed, links_partial}. Levanta ``GoalsInferenceError`` si
@@ -389,7 +396,10 @@ async def infer_goals(
                 }
             )
 
-    result = await replace_goals(
+    # Upsert (no replace): los goals que ya existían conservan id/código y el
+    # status de curación humana; los links a mano de goals fuera de la nueva
+    # inferencia sobreviven. El churn GOAL-XXXX entre corridas era el bug.
+    result = await upsert_goals(
         session,
         project_id,
         [
@@ -431,6 +441,156 @@ async def infer_goals(
         len(batches),
     )
     return summary
+
+
+async def infer_goal_links_incremental(
+    session: AsyncSession,
+    project_id: int,
+    req_codes: list[str],
+    *,
+    on_progress: Callable[[str, int, int], Awaitable[None]] | None = None,
+) -> dict[str, Any]:
+    """Re-infiere links SOLO para los reqs pedidos, contra los goals existentes.
+
+    Camino quirúrgico (sesión 9 de Planitrack): completar la trazabilidad de
+    unos pocos requerimientos no justifica re-correr ``infer_goals`` entera
+    (reemplazo de cientos de links sanos). El catálogo de goals es el YA
+    PERSISTIDO (códigos GOAL-XXXX reales, curación humana incluida) y solo se
+    consultan los reqs pedidos. Idempotente: la arista que ya existe no se
+    duplica (``add_goal_link``), y un lote caído no arrastra al resto.
+
+    Levanta ``GoalsInferenceError`` si el proyecto aún no tiene goals: correr
+    ``infer_goals`` primero. Devuelve {reqs, reqs_missing, links_added,
+    links_existing, batches_failed, links_partial}.
+    """
+    goals = await list_goals(session, project_id)
+    if not goals:
+        raise GoalsInferenceError(
+            "no hay goals en el proyecto: correr infer_goals antes de inferir "
+            "links incrementales"
+        )
+    wanted = [c for c in dict.fromkeys(req_codes or []) if c]
+    empty: dict[str, Any] = {
+        "reqs": 0,
+        "reqs_missing": [],
+        "links_added": 0,
+        "links_existing": 0,
+        "batches_failed": 0,
+        "links_partial": False,
+    }
+    if not wanted:
+        return empty
+
+    rows = (
+        await session.scalars(
+            select(RequirementItem).where(
+                RequirementItem.project_id == project_id,
+                RequirementItem.code.in_(wanted),
+            )
+        )
+    ).all()
+    missing = [c for c in wanted if c not in {it.code for it in rows}]
+    # Solo reqs vivos: un rechazado no alimenta trazabilidad nueva (mismo
+    # criterio que infer_goals).
+    linkable = {
+        it.code: it for it in rows if it.status in _LIVE_STATUSES
+    }
+    items = [linkable[c] for c in wanted if c in linkable]
+    if not items:
+        empty["reqs_missing"] = missing
+        return empty
+
+    async def _report(phase: str, done: int, total: int) -> None:
+        if on_progress is None:
+            return
+        try:
+            await on_progress(phase, done, total)
+        except Exception:  # noqa: BLE001 — el progreso nunca rompe la etapa
+            pass
+
+    goals_brief = "\n".join(
+        f"- {g.code} ({g.kind.value}): {g.statement}" for g in goals
+    )
+    batches = list(_chunk(items, _LINK_BATCH_SIZE))
+    sem = asyncio.Semaphore(max(1, DEFAULT_CONCURRENCY))
+    batch_done = 0
+
+    async def _link_batch(batch: list) -> GoalLinks:
+        nonlocal batch_done
+        reqs_text = "\n".join(
+            f"- {it.code} [{it.type.value}]: {it.statement}" for it in batch
+        )
+        msgs = [
+            ("system", _LINKS_SYSTEM),
+            (
+                "human",
+                f"GOALS:\n{goals_brief}\n\n"
+                f"PROJECT REQUIREMENTS (LINK ONLY THESE):\n{reqs_text}",
+            ),
+        ]
+        async with sem:
+            try:
+                return await _invoke_unit(
+                    GoalLinks,
+                    msgs,
+                    label=(
+                        f"links incrementales {batch[0].code}..{batch[-1].code}"
+                    ),
+                    extra={"max_tokens": GOALS_MAX_TOKENS},
+                )
+            finally:
+                batch_done += 1
+                await _report("lotes de links", batch_done, len(batches))
+
+    outcomes = await asyncio.gather(
+        *(_link_batch(b) for b in batches), return_exceptions=True
+    )
+
+    goal_id_by_code = {g.code: g.id for g in goals}
+    added = 0
+    already = 0
+    failed_batches = 0
+    seen_edges: set[tuple[str, str, str]] = set()
+    for batch, out in zip(batches, outcomes):
+        if isinstance(out, BaseException):
+            failed_batches += 1
+            logger.warning(
+                "links incrementales lote %s..%s falló (%s); el resto persiste",
+                batch[0].code,
+                batch[-1].code,
+                type(out).__name__,
+            )
+            continue
+        for l in out.links:
+            goal_id = goal_id_by_code.get(l.goal_code)
+            item = linkable.get(l.req_code)
+            if goal_id is None or item is None:
+                continue  # código inexistente: anti-alucinación
+            edge = (l.goal_code, l.req_code, l.relation)
+            if edge in seen_edges:
+                continue  # arista duplicada del LLM
+            seen_edges.add(edge)
+            res = await add_goal_link(
+                session,
+                project_id,
+                goal_id=goal_id,
+                req_id=item.id,
+                relation=_safe_relation(l.relation),
+                rationale=l.rationale,
+            )
+            if res["created"]:
+                added += 1
+            else:
+                already += 1
+
+    return {
+        "reqs": len(items),
+        "reqs_missing": missing,
+        "links_added": added,
+        "links_existing": already,
+        "batches_failed": failed_batches,
+        "links_partial": failed_batches > 0,
+    }
 
 
 def _valid_goals(raw: list[InferredGoal]) -> list[InferredGoal]:
@@ -524,6 +684,13 @@ def _safe_kind(value: str) -> Any:
         if k.value == value:
             return k
     return GoalKind.FUNCTIONAL_GOAL
+
+
+def _safe_relation(value: str) -> Any:
+    for r in LinkRelation:
+        if r.value == value:
+            return r
+    return LinkRelation.REALIZES
 
 
 _LIVE_STATUSES = frozenset(
