@@ -105,6 +105,17 @@ calidad, cobertura, trazabilidad y un preview del markdown)."""
         return {"traceability": trace}
 
     @tool
+    async def goal_coverage() -> dict:
+        """Devuelve la cobertura del MODELO de goals: reqs vivos con y sin link.
+
+        ``without_goal_codes`` es la cola de trabajo: requerimientos vivos que
+        no aportan a ningún goal (sin justificación de «por qué» en el
+        modelo). ``per_goal`` lleva el conteo de links por goal.
+        """
+        async with AsyncSessionLocal() as session:
+            return await srs_store.goal_coverage(session, project_id)
+
+    @tool
     async def get_requirement_findings(req_code: str) -> dict:
         """Devuelve los hallazgos de calidad de un requerimiento por su código \
 (p. ej. REQ-AB12)."""
@@ -132,8 +143,9 @@ calidad, cobertura, trazabilidad y un preview del markdown)."""
         Para secciones ``projected`` indica cuántos requerimientos pertenecen.
         Útil para navecar el SRS sin cargar el documento completo.
         """
-        from backend.services.srs_builder import SECTION_REQTYPE_MAP
+        from backend.services.srs_builder import SECTION_REQTYPE_MAP, ACTORS_SECTION_ID
         from backend.services.requirement_store import list_requirements
+        from backend.services.actor_store import list_actors
 
         async with AsyncSessionLocal() as session:
             srs = await srs_store.get_latest_srs(session, project_id)
@@ -149,6 +161,7 @@ calidad, cobertura, trazabilidad y un preview del markdown)."""
                 it for it in all_items
                 if it.status.value in ("validated", "approved", "draft")
             ]
+            actor_count = len(await list_actors(session, project_id))
 
         sections: list[dict[str, Any]] = []
         for section in srs.structure:
@@ -162,7 +175,11 @@ calidad, cobertura, trazabilidad y un preview del markdown)."""
                     {
                         "id": sub["id"],
                         "title": sub["title"],
-                        "has_content": bool(srs.narrative.get(sub["id"])),
+                        "has_content": (
+                            actor_count > 0
+                            if sub["id"] == ACTORS_SECTION_ID
+                            else bool(srs.narrative.get(sub["id"]))
+                        ),
                     }
                     for sub in section["subsections"]
                 ]
@@ -180,10 +197,12 @@ calidad, cobertura, trazabilidad y un preview del markdown)."""
 
         Para ``authored`` (e.g. ``intro.definitions``, ``overall.users``):
         el texto de la narrativa.
-        Para ``projected`` (e.g. ``functional``, ``nfr``, ``constraints``):
-        lista de RequirementItem con code, statement, priority, type.
+        Para ``projected`` (e.g. ``functional``, ``nfr``, ``constraints``,
+        ``overall.actors``): lista tipada — RequirementItem con code,
+        statement, priority, type; para ``overall.actors`` el catálogo
+        de actores con code, name, channel, synonyms.
         """
-        from backend.services.srs_builder import SECTION_REQTYPE_MAP
+        from backend.services.srs_builder import SECTION_REQTYPE_MAP, ACTORS_SECTION_ID
         from backend.services.requirement_store import list_requirements
 
         async with AsyncSessionLocal() as session:
@@ -207,6 +226,26 @@ calidad, cobertura, trazabilidad y un preview del markdown)."""
                     target_kind = "authored"
                     target_title = sub["title"]
                     break
+
+        if section_id == ACTORS_SECTION_ID:
+            from backend.services.actor_store import list_actors
+
+            async with AsyncSessionLocal() as session:
+                actors = await list_actors(session, project_id)
+            return {
+                "section_id": section_id,
+                "title": target_title,
+                "kind": "projected",
+                "items": [
+                    {
+                        "code": a.code,
+                        "name": a.name,
+                        "channel": a.channel,
+                        "synonyms": list(a.synonyms or []),
+                    }
+                    for a in actors
+                ],
+            }
 
         if target_kind == "authored":
             content = srs.narrative.get(section_id, "")
@@ -259,6 +298,7 @@ calidad, cobertura, trazabilidad y un preview del markdown)."""
         get_coverage,
         list_goals,
         get_traceability,
+        goal_coverage,
         get_requirement_findings,
         list_srs_sections,
         read_srs_section,

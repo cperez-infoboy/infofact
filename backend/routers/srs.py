@@ -6,6 +6,9 @@ Endpoints (todos project-scoped, bajo /api/projects/{id}/...):
   GET    /srs/versions                        lista versiones del proyecto
   GET    /srs/versions/{version}              detalle de una versión
   PATCH  /srs/versions/{version}              estado / narrativa / pendientes
+  DELETE /srs/versions/{version}              descarta la versión (soft: queda
+                                               listada como discarded y deja de
+                                               ser la «última»)
   POST   /srs/versions/{version}/reproject    refresca solo las secciones proyectadas
   GET    /quality                             resumen de calidad + hallazgos
   GET    /coverage                            matriz de cobertura
@@ -31,6 +34,7 @@ from backend.deps import get_current_user
 from backend.models import Project, User
 from backend.models.srs import FindingStatus, GoalStatus, LinkStatus, SrsStatus
 from backend.services import srs_store
+from backend.services.actor_store import list_actors
 from backend.services.srs_assembler import assemble_srs
 from backend.services.srs_builder import build_srs
 
@@ -265,6 +269,32 @@ async def patch_srs_version(
     return _srs_out(srs)
 
 
+@router.delete(
+    "/projects/{project_id}/srs/versions/{version}",
+    response_model=SrsVersionOut,
+)
+async def discard_srs_version(
+    project_id: int,
+    version: int,
+    user: User = Depends(get_current_user),
+) -> SrsVersionOut:
+    """Descarta una versión del SRS (soft delete).
+
+    La fila queda en estado ``discarded`` (numeración nunca reutilizada) y
+    ``get_latest_srs`` la ignora: descartar la última restaura a la previa
+    como «última», base del próximo seed del agente. LOCKED no se descarta.
+    """
+    async with AsyncSessionLocal() as db:
+        await _load_owned_project(db, project_id, user)
+        try:
+            srs = await srs_store.discard_srs_version(db, project_id, version)
+        except KeyError:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "not_found")
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
+    return _srs_out(srs)
+
+
 @router.post(
     "/projects/{project_id}/srs/versions/{version}/reproject",
     response_model=SrsVersionOut,
@@ -347,7 +377,7 @@ async def list_srs_sections(
     Para secciones ``authored`` indica si cada subsection tiene contenido.
     Para secciones ``projected`` indica cuántos requerimientos pertenecen.
     """
-    from backend.services.srs_builder import SECTION_REQTYPE_MAP
+    from backend.services.srs_builder import SECTION_REQTYPE_MAP, ACTORS_SECTION_ID
     from backend.services.requirement_store import list_requirements
 
     async with AsyncSessionLocal() as db:
@@ -361,6 +391,7 @@ async def list_srs_sections(
             it for it in all_items
             if it.status.value in ("validated", "approved", "draft")
         ]
+        actor_count = len(await list_actors(db, project_id))
 
     result: list[SectionOut] = []
     for section in srs.structure:
@@ -372,6 +403,15 @@ async def list_srs_sections(
         if section.get("kind") == "authored" and section.get("subsections"):
             sec.subsections = []
             for sub in section["subsections"]:
+                if sub["id"] == ACTORS_SECTION_ID:
+                    # Subsección proyectada: su contenido vive en el
+                    # catálogo de actores, no en narrative.
+                    sec.subsections.append(SectionSubsectionOut(
+                        id=sub["id"],
+                        title=sub["title"],
+                        has_content=actor_count > 0,
+                    ))
+                    continue
                 sec.subsections.append(SectionSubsectionOut(
                     id=sub["id"],
                     title=sub["title"],
@@ -401,7 +441,7 @@ async def get_srs_section(
     Para ``authored``: el texto de ``narrative[section_id]``.
     Para ``projected``: los RequirementItem de esa sección.
     """
-    from backend.services.srs_builder import SECTION_REQTYPE_MAP
+    from backend.services.srs_builder import SECTION_REQTYPE_MAP, ACTORS_SECTION_ID
     from backend.services.requirement_store import list_requirements
 
     async with AsyncSessionLocal() as db:
@@ -422,8 +462,31 @@ async def get_srs_section(
         for sub in section.get("subsections", []):
             if sub["id"] == section_id:
                 target_title = sub["title"]
-                target_kind = section.get("kind", "authored")
+                target_kind = (
+                    sub.get("kind", "authored")
+                    if section.get("kind") == "authored"
+                    else section.get("kind", "authored")
+                )
                 break
+
+    if section_id == ACTORS_SECTION_ID:
+        # Subsección proyectada: proyección tipada del catálogo de actores.
+        async with AsyncSessionLocal() as db:
+            actors = await list_actors(db, project_id)
+        return SectionContentOut(
+            id=section_id,
+            title=target_title or "Actores del sistema",
+            kind="projected",
+            items=[
+                {
+                    "code": a.code,
+                    "name": a.name,
+                    "channel": a.channel,
+                    "synonyms": list(a.synonyms or []),
+                }
+                for a in actors
+            ],
+        )
 
     if target_kind == "authored":
         content = srs.narrative.get(section_id, "")

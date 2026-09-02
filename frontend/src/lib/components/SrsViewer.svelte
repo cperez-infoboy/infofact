@@ -14,6 +14,7 @@
     listSrsVersions,
     getSrsVersion,
     getQuality,
+    discardSrsVersion,
     type SrsVersion,
     type Finding
   } from '$lib/api/srs';
@@ -41,6 +42,7 @@
   let tab = $state<Tab>('document');
   let loading = $state(false);
   let error = $state<string | null>(null);
+  let discarding = $state(false);
   // Hallazgos detallados (lazy: solo al abrir la pestaña Calidad). La versión
   // trae el resumen; la lista completa vive en GET /quality (por proyecto).
   let findings = $state<Finding[] | null>(null);
@@ -100,7 +102,11 @@
     try {
       versions = await listSrsVersions(projectId);
       if (versions.length > 0) {
-        selVersion = versions[0].version; // la más reciente primero
+        // La más reciente NO descartada primero: las descartadas siguen
+        // listadas (etiquetadas) pero no son base de nada.
+        const first =
+          versions.find((v) => v.status !== 'discarded') ?? versions[0];
+        selVersion = first.version;
         await loadDetail();
       } else {
         active = null;
@@ -152,6 +158,31 @@
       return new Date(iso).toLocaleString();
     } catch {
       return iso;
+    }
+  }
+
+  // Descarte soft de la versión activa: la fila queda (etiqueta discarded) y
+  // deja de ser la «última», así que el próximo /srs siembra desde la previa.
+  async function discardActive(): Promise<void> {
+    if (projectId === null || !active) return;
+    const v = active.version;
+    if (
+      !confirm(
+        `¿Descartar la v${v}? Queda listada pero deja de ser la última: ` +
+          'el próximo /srs sembrará desde la versión anterior.'
+      )
+    ) {
+      return;
+    }
+    discarding = true;
+    error = null;
+    try {
+      await discardSrsVersion(projectId, v);
+      await loadVersions();
+    } catch (e) {
+      error = (e as Error).message;
+    } finally {
+      discarding = false;
     }
   }
 
@@ -224,7 +255,9 @@
         >
           {#each versions as v (v.id)}
             <option value={v.version}>
-              v{v.version} · {v.status} · {v.requirement_count} reqs
+              v{v.version} · {v.status === 'discarded'
+                ? 'descartada'
+                : v.status} · {v.requirement_count} reqs
             </option>
           {/each}
         </select>
@@ -240,6 +273,16 @@
         <span class="text-accent font-mono animate-pulse" title={$srsStage?.message ?? ''}>
           ⟳ {$srsStage?.stage ?? 'generando'}…
         </span>
+      {/if}
+      {#if active && active.status !== 'discarded' && active.status !== 'locked'}
+        <button
+          type="button"
+          class="px-2 py-0.5 text-text-dim hover:text-danger font-mono disabled:opacity-50"
+          onclick={discardActive}
+          disabled={discarding}
+          title="Descartar esta versión (queda listada, deja de ser la última)"
+          aria-label="Descartar versión del SRS">🗑</button
+        >
       {/if}
       <button
         type="button"
@@ -285,6 +328,16 @@
         >
       {/each}
     </nav>
+  {/if}
+
+  <!-- Aviso de versión descartada: visible pero fuera del ciclo de vida. -->
+  {#if active?.status === 'discarded'}
+    <div
+      class="px-3 py-1 border-b border-warning/40 bg-warning/5 text-warning text-xs font-mono"
+    >
+      Versión descartada: el agente la ignora y no se usa como base de nuevas
+      versiones.
+    </div>
   {/if}
 
   <!-- Body -->

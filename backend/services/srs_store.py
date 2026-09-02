@@ -19,6 +19,7 @@ import secrets
 from datetime import datetime
 from typing import Any
 
+from rapidfuzz import fuzz
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -44,6 +45,17 @@ _MAX_ATTEMPTS = 10
 _LIVE_STATUSES = frozenset(
     {ReqStatus.VALIDATED, ReqStatus.APPROVED, ReqStatus.DRAFT}
 )
+
+# token_sort_ratio mínimo (0-100) para considerar que un goal re-inferido es
+# el mismo objetivo que uno ya persistido (upsert_goals). Mismo umbral alto
+# del dedupe del merge en goals_engine: fusiona reformulaciones evidentes del
+# mismo objetivo, no objetivos vecinos legítimos.
+_GOAL_MATCH_RATIO = 90
+
+
+def _norm_stmt(statement: str) -> str:
+    """Normaliza un statement para el matching difuso (minúsculas + espacios)."""
+    return " ".join((statement or "").lower().split())
 
 
 # --- helpers ----------------------------------------------------------------
@@ -537,6 +549,285 @@ async def replace_goals(
     }
 
 
+async def upsert_goals(
+    session: AsyncSession,
+    project_id: int,
+    goals: list[dict[str, Any]],
+    links: list[dict[str, Any]],
+    *,
+    req_by_code: dict[str, int],
+) -> dict[str, Any]:
+    """Upsert idempotente de goals + links: preserva los códigos GOAL-XXXX.
+
+    Diferencia clave con ``replace_goals`` (que borra TODO y reasigna códigos:
+    re-correr la inferencia huérfanaba los links escritos a mano y hacía
+    cambiar los códigos de la matriz de trazabilidad entre corridas). Acá:
+
+    - El goal cuya frase (normalizada) y kind ya existen CONSERVA su fila
+      (id, code y el status de curación humana); se actualizan
+      statement/rationale/confidence y el parent resuelto del payload.
+    - El goal nuevo se inserta con ``gen_goal_code``.
+    - El goal PROPOSED que la nueva inferencia ya no menciona se elimina con
+      sus links; CONFIRMED/REJECTED (decisión humana) se conservan intactos,
+      con sus links.
+    - Los links de los goals que volvieron en el payload se reemplazan por la
+      nueva inferencia; los de los goals preservados fuera del payload no se
+      tocan.
+
+    Dedupe de aristas por (goal_id, req_id, relation), igual que
+    ``replace_goals``. Devuelve {goals, links, goals_kept, goals_added,
+    goals_removed}.
+    """
+    existing = {g.id: g for g in await list_goals(session, project_id)}
+    reserved: set[str] = set()
+    alias_to_id: dict[str, int] = {}
+    code_to_id: dict[str, int] = {}
+    rows_by_id: dict[int, Goal] = {}
+    payload_parent: dict[int, str | None] = {}
+    matched_ids: set[int] = set()
+
+    # Raíces primero (misma convención de replace_goals): la resolución de
+    # parents corre DESPUÉS del loop completo, así que el orden solo fija el
+    # orden de inserción de los goals nuevos.
+    ordered = sorted(goals, key=lambda g: g.get("parent_code") is not None)
+    for gd in ordered:
+        kind = gd["kind"]
+        kind_val = kind.value if hasattr(kind, "value") else str(kind)
+        stmt_norm = _norm_stmt(gd["statement"])
+        target: Goal | None = None
+        for g in existing.values():
+            if g.id in matched_ids or g.kind.value != kind_val:
+                continue
+            if (
+                fuzz.token_sort_ratio(_norm_stmt(g.statement), stmt_norm)
+                >= _GOAL_MATCH_RATIO
+            ):
+                target = g
+                break
+        if target is None:
+            code = await gen_goal_code(session, project_id, reserved=reserved)
+            row = Goal(
+                project_id=project_id,
+                code=code,
+                statement=gd["statement"],
+                kind=kind,
+                rationale=gd.get("rationale"),
+                source=gd.get("source"),
+                confidence=gd.get("confidence", 0.0),
+                status=GoalStatus.PROPOSED,
+                created_by="agent",
+            )
+            session.add(row)
+            await session.flush()  # necesita el id
+            target = row
+            code_to_id[code] = row.id
+        else:
+            # Mismo objetivo: la fila (id/code/status humano) no se toca;
+            # solo se refresca lo que la nueva inferencia trae.
+            matched_ids.add(target.id)
+            target.statement = gd["statement"]
+            if gd.get("rationale"):
+                target.rationale = gd["rationale"]
+            if gd.get("confidence") is not None:
+                target.confidence = gd["confidence"]
+            code_to_id[target.code] = target.id
+        rows_by_id[target.id] = target
+        if gd.get("code"):
+            alias_to_id[gd["code"]] = target.id
+        payload_parent[target.id] = gd.get("parent_code")
+
+    # Jerarquía: parent por alias del payload (resuelve a match o a nuevo);
+    # fantasma o auto-referencia -> raíz, igual que en replace_goals.
+    for gid, parent_alias in payload_parent.items():
+        parent_id = alias_to_id.get(parent_alias) if parent_alias else None
+        rows_by_id[gid].parent_id = None if parent_id == gid else parent_id
+
+    # Links: los de los goals del payload se reemplazan por la nueva
+    # inferencia; los de los preservados fuera del payload quedan intactos.
+    payload_goal_ids = set(rows_by_id)
+    if payload_goal_ids:
+        await session.execute(
+            delete(GoalLink).where(GoalLink.goal_id.in_(payload_goal_ids))
+        )
+    link_rows: list[GoalLink] = []
+    seen_edges: set[tuple[int, int, str]] = set()
+    for ld in links:
+        goal_id = alias_to_id.get(ld["goal_code"]) or code_to_id.get(
+            ld["goal_code"]
+        )
+        req_id = req_by_code.get(ld["req_code"])
+        if goal_id is None or req_id is None:
+            continue  # referencia no resuelta: se descarta silenciosamente
+        relation = ld["relation"]
+        relation_val = (
+            relation.value if hasattr(relation, "value") else str(relation)
+        )
+        edge = (goal_id, req_id, relation_val)
+        if edge in seen_edges:
+            continue  # arista duplicada del LLM
+        seen_edges.add(edge)
+        link_rows.append(
+            GoalLink(
+                goal_id=goal_id,
+                req_id=req_id,
+                relation=relation,
+                rationale=ld.get("rationale"),
+            )
+        )
+    session.add_all(link_rows)
+
+    # Stale: el PROPOSED que la inferencia ya no menciona se va con sus links;
+    # el confirmado/rechazado por un humano es decisión persistente y queda.
+    removed = 0
+    for gid, g in existing.items():
+        if gid in matched_ids:
+            continue
+        if g.status == GoalStatus.PROPOSED:
+            await session.execute(
+                delete(GoalLink).where(GoalLink.goal_id == gid)
+            )
+            await session.delete(g)
+            removed += 1
+
+    await session.commit()
+    return {
+        # Total de goals vivos tras el upsert (re-inferidos + nuevos + stale
+        # humanos conservados).
+        "goals": len(rows_by_id) + (len(existing) - len(matched_ids) - removed),
+        "links": len(link_rows),
+        "goals_kept": len(matched_ids),
+        "goals_added": len(rows_by_id) - len(matched_ids),
+        "goals_removed": removed,
+    }
+
+
+async def add_goal_link(
+    session: AsyncSession,
+    project_id: int,
+    *,
+    goal_id: int,
+    req_id: int,
+    relation,
+    rationale: str | None = None,
+    detected_by: str = "agent",
+) -> dict[str, Any]:
+    """Crea (o refresca) un vínculo goal <-> req; idempotente por la tripleta.
+
+    Si la arista (goal_id, req_id, relation) ya existe, no se duplica: se
+    actualiza el rationale provisto y se devuelve ``created=False``.
+    """
+    goal = await get_goal(session, goal_id, project_id=project_id)
+    relation_val = (
+        relation.value if hasattr(relation, "value") else str(relation)
+    )
+    links = await list_goal_links(session, project_id)
+    existing = next(
+        (
+            l
+            for l in links
+            if l.goal_id == goal.id
+            and l.req_id == req_id
+            and l.relation.value == relation_val
+        ),
+        None,
+    )
+    if existing is not None:
+        if rationale:
+            existing.rationale = rationale
+        await session.commit()
+        return {"link": goal_link_to_dict(existing), "created": False}
+    row = GoalLink(
+        goal_id=goal.id,
+        req_id=req_id,
+        relation=relation,
+        rationale=rationale,
+        detected_by=detected_by,
+    )
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return {"link": goal_link_to_dict(row), "created": True}
+
+
+async def remove_goal_link(
+    session: AsyncSession,
+    project_id: int,
+    *,
+    goal_id: int,
+    req_id: int,
+    relation,
+) -> bool:
+    """Borra el vínculo (goal, req, relation) del proyecto. True si existía."""
+    goal = await get_goal(session, goal_id, project_id=project_id)
+    relation_val = (
+        relation.value if hasattr(relation, "value") else str(relation)
+    )
+    links = await list_goal_links(session, project_id)
+    target = next(
+        (
+            l
+            for l in links
+            if l.goal_id == goal.id
+            and l.req_id == req_id
+            and l.relation.value == relation_val
+        ),
+        None,
+    )
+    if target is None:
+        return False
+    await session.delete(target)
+    await session.commit()
+    return True
+
+
+async def goal_coverage(session: AsyncSession, project_id: int) -> dict[str, Any]:
+    """Cobertura goal <-> req: reqs vivos con y sin al menos un link.
+
+    La vista que faltaba: ``srs_coverage`` mira el DOCUMENTO (secciones vs
+    reqs); esta mira el MODELO de goals. Un req vivo sin ningún link no
+    aporta a ningún objetivo — no tiene justificación de «por qué» en el
+    modelo — y es la cola de trabajo para completar la trazabilidad.
+    """
+    goals = await list_goals(session, project_id)
+    links = await list_goal_links(session, project_id)
+    linked_req_ids = {l.req_id for l in links}
+    rows = (
+        await session.execute(
+            select(RequirementItem.id, RequirementItem.code)
+            .where(
+                RequirementItem.project_id == project_id,
+                RequirementItem.status.in_(_LIVE_STATUSES),
+            )
+            .order_by(RequirementItem.code)
+        )
+    ).all()
+    total = len(rows)
+    without = [code for rid, code in rows if rid not in linked_req_ids]
+    per_goal = []
+    for g in goals:
+        g_links = [l for l in links if l.goal_id == g.id]
+        per_goal.append(
+            {
+                "code": g.code,
+                "kind": g.kind.value,
+                "status": g.status.value,
+                "statement": g.statement,
+                "links": len(g_links),
+                "realizes": sum(
+                    1 for l in g_links if l.relation.value == "realizes"
+                ),
+            }
+        )
+    return {
+        "goals": len(goals),
+        "live_requirements": total,
+        "with_goal_link": total - len(without),
+        "without_goal_link": len(without),
+        "without_goal_codes": without,
+        "per_goal": per_goal,
+    }
+
+
 async def update_goal(
     session: AsyncSession,
     goal_id: int,
@@ -653,10 +944,17 @@ def srs_to_dict(
 async def get_latest_srs(
     session: AsyncSession, project_id: int
 ) -> SrsDocument | None:
-    """La versión más reciente del SRS del proyecto (o None)."""
+    """La versión más reciente del SRS del proyecto, ignorando descartadas.
+
+    Las DISCARDED no cuentan: descartar v11 hace que la «última» vuelva a ser
+    la v10 previa, que es la base del seed y de la cobertura del router.
+    """
     return await session.scalar(
         select(SrsDocument)
-        .where(SrsDocument.project_id == project_id)
+        .where(
+            SrsDocument.project_id == project_id,
+            SrsDocument.status != SrsStatus.DISCARDED,
+        )
         .order_by(SrsDocument.version.desc())
         .limit(1)
     )
@@ -720,6 +1018,32 @@ async def create_srs(
     return row
 
 
+async def discard_srs_version(
+    session: AsyncSession, project_id: int, version: int
+) -> SrsDocument:
+    """Descarta (soft) una versión del SRS: estado DISCARDED, la fila queda.
+
+    Soft y no hard delete por dos razones: ``create_srs`` numera con
+    max(version)+1 sobre TODAS las filas, así que el número jamás se reutiliza
+    (con hard delete, descartar v9-v11 haría que la próxima versión vuelva a
+    llamarse v9); y la fila preservada mantiene la auditoría. ``get_latest_srs``
+    filtra las DISCARDED, así que descartar la última restaura a la versión
+    previa como base del seed. LOCKED no se descarta (snapshot inmutable que
+    consume la fase de diseño).
+    """
+    s = await get_srs_version(session, project_id, version)
+    if s is None:
+        raise KeyError(f"srs version {version} not found")
+    if s.status == SrsStatus.LOCKED:
+        raise ValueError("LOCKED SRS no se puede descartar")
+    if s.status == SrsStatus.DISCARDED:
+        raise ValueError("SRS version already discarded")
+    s.status = SrsStatus.DISCARDED
+    await session.commit()
+    await session.refresh(s)
+    return s
+
+
 async def update_srs(
     session: AsyncSession,
     project_id: int,
@@ -742,6 +1066,10 @@ async def update_srs(
         raise KeyError(f"srs version {version} not found")
     if s.status == SrsStatus.LOCKED and status is None:
         raise ValueError("LOCKED SRS is immutable")
+    if status is SrsStatus.DISCARDED:
+        # El descarte tiene sus propias guardas (LOCKED no se descarta,
+        # re-discard rechazado): solo pasa por discard_srs_version.
+        raise ValueError("use discard_srs_version to discard a version")
     if status is not None:
         s.status = status
         if status == SrsStatus.IN_REVIEW and s.reviewed_at is None:

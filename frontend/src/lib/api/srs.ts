@@ -5,7 +5,7 @@ import { apiFetch } from './client';
 
 // --- Tipos (espejo de los response models de srs.py) -----------------------
 
-export type SrsStatus = 'candidate' | 'in_review' | 'locked';
+export type SrsStatus = 'candidate' | 'in_review' | 'locked' | 'discarded';
 export type GoalKind = 'functional_goal' | 'softgoal' | 'obstacle';
 export type GoalStatus = 'proposed' | 'confirmed' | 'rejected';
 export type FindingSeverity = 'blocker' | 'major' | 'minor' | 'info';
@@ -159,6 +159,17 @@ export function reprojectSrs(
   return apiFetch<SrsVersion>(
     `/api/projects/${projectId}/srs/versions/${version}/reproject`,
     { method: 'POST' }
+  );
+}
+
+/** Descarta una versión (soft): queda listada y deja de ser la última. */
+export function discardSrsVersion(
+  projectId: number,
+  version: number
+): Promise<SrsVersion> {
+  return apiFetch<SrsVersion>(
+    `/api/projects/${projectId}/srs/versions/${version}`,
+    { method: 'DELETE' }
   );
 }
 
