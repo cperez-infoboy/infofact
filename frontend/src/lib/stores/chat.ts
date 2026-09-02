@@ -290,14 +290,25 @@ export async function sendMessage(sessionId: number, content: string): Promise<b
   // Segmento de texto actual (lazy: se abre con el primer token).
   let currentAssistantId: string | null = null;
   // Thinking interno en curso (lazy: se abre con el primer delta de
-  // reasoning_content). Cualquier transición (texto, tool, cierre) lo cierra:
-  // la siguiente llamada al modelo abre un bloque nuevo.
+  // reasoning_content). Cualquier transición (texto, tool) lo cierra
+  // visualmente, PERO el bloque del turno se puede REABRIR: con delegación
+  // via task el orquestador y el subagente stremeane en paralelo
+  // (subgraphs=True) y sus eventos se intercalan a mitad de palabra; cerrar
+  // y abrir un bloque nuevo por cada intercalado fragmentaba el razonamiento
+  // en decenas de "Pensamiento interno" diminutos (sesión 15). Ahora hay UN
+  // bloque por TURNO: turnThinkingId sobrevive hasta completed/failed.
   let currentThinkingId: string | null = null;
+  let turnThinkingId: string | null = null;
   const closeThinking = () => {
     if (currentThinkingId !== null) {
       closeThinkingMessage(currentThinkingId);
       currentThinkingId = null;
     }
+  };
+  // Fin lógico del turno: el bloque deja de ser reabrible.
+  const endTurnThinking = () => {
+    closeThinking();
+    turnThinkingId = null;
   };
   // Mapping name -> toolId del tool message que estamos llenando.
   // El backend puede emitir varios tool_start antes de su tool_end
@@ -308,7 +319,8 @@ export async function sendMessage(sessionId: number, content: string): Promise<b
     const controller = await streamMessage(sessionId, content, {
       onThinking: (delta) => {
         if (currentThinkingId === null) {
-          currentThinkingId = openThinkingMessage();
+          currentThinkingId = turnThinkingId ?? openThinkingMessage();
+          turnThinkingId = currentThinkingId;
         }
         appendThinking(currentThinkingId, delta);
       },
@@ -419,7 +431,7 @@ export async function sendMessage(sessionId: number, content: string): Promise<b
         onGroupingDone(e);
       },
       onCompleted: () => {
-        closeThinking();
+        endTurnThinking();
         if (currentAssistantId !== null) {
           closeAssistantMessage(currentAssistantId, true);
           currentAssistantId = null;
@@ -428,7 +440,7 @@ export async function sendMessage(sessionId: number, content: string): Promise<b
       onFailed: (err) => {
         chatError.set(err);
         endGrouping();
-        closeThinking();
+        endTurnThinking();
         if (currentAssistantId !== null) {
           closeAssistantMessage(currentAssistantId, true);
           currentAssistantId = null;

@@ -412,23 +412,51 @@ describe('chat store - thinking interno (evento SSE thinking)', () => {
     );
   });
 
-  it('tool_start cierra el thinking y tool_end cierra el thinking del subagente', async () => {
+  it('thinking intercalado con tools reabre el MISMO bloque del turno', async () => {
     await sendMessage(42, 'delega');
     const h = handlersHolder.handlers!;
 
-    // Thinking del orquestador cerrado por la tool call;
-    // el thinking del subagente (dentro de task) lo cierra tool_end.
+    // Orquestador y subagente stremean en paralelo (subgraphs=True): sus
+    // eventos se intercalan. El bloque del turno se cierra visualmente en
+    // cada transición pero se REABRE con el siguiente thinking: UN bloque
+    // con todo el razonamiento del turno (sesión 15).
     h.onThinking?.('pienso que…');
     h.onToolStart?.('task', { task: 'x' });
     h.onThinking?.('pensamiento del subagente');
     h.onToolEnd?.('task', 'ok');
+    h.onThinking?.('más razonamiento del orquestador');
     h.onCompleted?.();
 
     let list: any[] = [];
     messages.subscribe((v) => (list = v))();
     const thinking = list.filter((m) => m.kind === 'thinking');
-    expect(thinking).toHaveLength(2);
-    expect(thinking.every((m) => m.streaming === false)).toBe(true);
+    expect(thinking).toHaveLength(1);
+    expect(thinking[0].content).toBe(
+      'pienso que…pensamiento del subagentemás razonamiento del orquestador'
+    );
+    expect(thinking[0].streaming).toBe(false);
+  });
+
+  it('el razonamiento intercalado con tokens no se fragmenta', async () => {
+    await sendMessage(42, 'hola');
+    const h = handlersHolder.handlers!;
+
+    // El caso del screenshot: thinking → token (otro agente) → thinking con
+    // cortes a mitad de palabra. Todo cae en el mismo bloque.
+    h.onThinking?.('I should check ');
+    h.onToken?.('texto del otro agente');
+    h.onThinking?.('capture_status first');
+    h.onToken?.('más texto');
+    h.onThinking?.(' to confirm');
+    h.onCompleted?.();
+
+    let list: any[] = [];
+    messages.subscribe((v) => (list = v))();
+    const thinking = list.filter((m) => m.kind === 'thinking');
+    expect(thinking).toHaveLength(1);
+    expect(thinking[0].content).toBe(
+      'I should check capture_status first to confirm'
+    );
   });
 
   it('completed cierra un thinking que quedó abierto', async () => {

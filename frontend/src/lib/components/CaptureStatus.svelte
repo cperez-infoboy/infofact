@@ -42,6 +42,7 @@
   const STAGE_LABELS: Record<string, string> = {
     ingest: 'Ingesta',
     conventions: 'Convenciones',
+    actors: 'Actores',
     extract: 'Extracción',
     consolidate: 'Consolidación',
     critique: 'Crítica',
@@ -58,6 +59,7 @@
   const STAGE_ORDER = [
     'ingest',
     'conventions',
+    'actors',
     'extract',
     'consolidate',
     'critique',
