@@ -88,6 +88,11 @@ PHASE_PROMPTS: dict[str, str] = {
         "siguiente.\n"
         "- Si una tarea termina vacía o fallida, re-delega SOLO el alcance "
         "que faltó, no la tanda completa.\n"
+        "- Si la directiva trae [SCOPE] (el usuario pidió capturar una "
+        "carpeta concreta), copia ese valor LITERAL en cada delegación `task` "
+        "y NUNCA lo amplíes: los documentos fuera de la carpeta pedida no "
+        "existen para esta captura, y las tools rechazan mecánicamente "
+        "ingesta u orientación fuera del alcance registrado.\n"
     ),
     "analysis": (
         "Eres el orquestador de la fase de analisis y diseno de InfoFact. "
@@ -141,6 +146,63 @@ def _workspace_paths_block(project_slug: str) -> str:
         f"- Solo si necesita una ruta absoluta, la raíz del proyecto es "
         f"`/workspaces/{project_slug}/`."
     )
+
+
+def _project_rules_capability_block() -> str:
+    """Capacidad de reglas persistentes, anexada al prompt del orquestador.
+
+    Sin este bloque el modelo desconocía sus propias tools de reglas y
+    respondía "no tengo una herramienta dedicada" cuando el usuario le
+    preguntaba por convenciones (sesión 11 de planitrack2-0): las tools
+    estaban registradas solo en los subagentes y ningún prompt las
+    mencionaba. Igual que ``_workspace_paths_block``, existe porque lo que
+    ya funciona hay que decírselo explícitamente al modelo.
+    """
+    return (
+        "\n\n## Reglas persistentes del proyecto\n"
+        "Cuenta con las tools `add_project_rule`, `list_project_rules` y "
+        "`retire_project_rule` para mantener las convenciones y observaciones "
+        "duraderas del proyecto. Cuando el usuario indique una consideración "
+        "permanente (\"de ahora en más...\", \"siempre trate X como...\"), "
+        "regístrela con `add_project_rule` en lugar de guardarla solo en "
+        "archivos del workspace; consulte `list_project_rules` antes de "
+        "agregar para evitar duplicados, y `retire_project_rule` si el "
+        "usuario la revoca. Los pipelines de captura, análisis y SRS inyectan "
+        "automáticamente las reglas activas de su ámbito en sus prompts "
+        "(scope: capture | analysis | srs | all)."
+    )
+
+
+def make_orchestrator_tools(project_id: int | None) -> list:
+    """Superficie de tools del agente de chat (orquestador).
+
+    Web + tools de lectura del proyecto (requirements, SRS, documentos con
+    búsqueda semántica) para responder preguntas sin delegar, MÁS el harness
+    de reglas persistentes: el agente de chat debe poder almacenar
+    convenciones que el usuario indica en la conversación, no solo los
+    subagentes durante los stages (sesión 11 de planitrack2-0). Sin
+    ``project_id`` quedan solo las web: no hay proyecto al cual atribuir
+    reglas. ``project_id`` va cerrado en las closures — mismo contrato de
+    aislamiento que las fábricas de tools de los subagentes.
+    """
+    tools: list[Any] = [web_search, fetch_url]
+    if project_id is None:
+        return tools
+    from backend.agents.tools.requirements_tools import (
+        make_requirements_read_tools,
+    )
+    tools.extend(make_requirements_read_tools(project_id))
+    from backend.agents.tools.srs_tools import make_srs_read_tools
+    tools.extend(make_srs_read_tools(project_id))
+    from backend.agents.tools.documents_tools import (
+        make_document_read_tools,
+    )
+    tools.extend(make_document_read_tools(project_id))
+    from backend.agents.tools.project_rules_tools import (
+        make_project_rules_tools,
+    )
+    tools.extend(make_project_rules_tools(project_id))
+    return tools
 
 
 async def build_checkpointer() -> AsyncSqliteSaver:
@@ -254,21 +316,11 @@ def build_agent(
             )
         )
 
-    # Read-only tools for the orchestrator: requirements, SRS, and documents
-    # (including RAG semantic search) are always available so the orchestrator
-    # can answer questions about the project without delegating to a subagent.
-    orchestrator_tools: list[Any] = [web_search, fetch_url]
+    orchestrator_tools = make_orchestrator_tools(project_id)
     if project_id is not None:
-        from backend.agents.tools.requirements_tools import (
-            make_requirements_read_tools,
-        )
-        orchestrator_tools.extend(make_requirements_read_tools(project_id))
-        from backend.agents.tools.srs_tools import make_srs_read_tools
-        orchestrator_tools.extend(make_srs_read_tools(project_id))
-        from backend.agents.tools.documents_tools import (
-            make_document_read_tools,
-        )
-        orchestrator_tools.extend(make_document_read_tools(project_id))
+        # El bloque va solo cuando hay proyecto: sin project_id las tools de
+        # reglas no existen y el bloque mentiría sobre la superficie real.
+        system_prompt += _project_rules_capability_block()
 
     return create_deep_agent(
         model=_build_model(),

@@ -128,17 +128,18 @@ def stage_tools(monkeypatch):
 
 
 async def _run_all_pre_commit(stage_tools) -> None:
-    # 0=ingest, 1=conventions, 2=extract, 3=consolidate, 4=critique, 5=classify
+    # 0=ingest, 1=conventions, 2=identify_actors, 3=extract, 4=consolidate,
+    # 5=critique, 6=classify
     for idx, payload in enumerate(
-        [{"target_subpath": ""}, {}, {}, {}, {}, {}]
+        [{"target_subpath": ""}, {}, {}, {}, {}, {}, {}]
     ):
         await stage_tools[idx].ainvoke(payload)
 
 
-# Indices: 0=ingest, 1=conventions, 2=extract, 3=consolidate, 4=critique,
-# 5=classify, 6=commit.
-COMMIT_IDX = 6
-EXTRACT_IDX = 2
+# Indices: 0=ingest, 1=conventions, 2=identify_actors, 3=extract,
+# 4=consolidate, 5=critique, 6=classify, 7=commit.
+COMMIT_IDX = 7
+EXTRACT_IDX = 3
 
 
 @pytest.mark.asyncio

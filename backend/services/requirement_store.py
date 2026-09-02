@@ -35,6 +35,7 @@ from backend.models.requirement import (
     RequirementRelation,
     RequirementRevision,
 )
+from backend.models.srs import FindingStatus, RequirementFinding
 from backend.services._req_codes import gen_opaque_code
 
 from backend.services.doc_id import rebase_document_id
@@ -102,6 +103,31 @@ async def _append_revision(
             change_reason=reason[:_CHANGE_REASON_MAX],
         )
     )
+
+
+async def _close_open_findings(session: AsyncSession, req_ids: list[int]) -> int:
+    """Cierra (OPEN -> FIXED) los hallazgos de los items dados, en la misma
+    transacción del caller. Devuelve cuántos cerró.
+
+    Una transición de ciclo de vida ES la corrección del hallazgo: rechazar
+    un requerimiento resuelve sus smells, absorberlo en un merge resuelve los
+    de los duplicados, el split resuelve el de atomicidad del original. Los
+    FIXED/WAIVED (curación humana) no se tocan; los hallazgos de conjunto
+    (req_id NULL) quedan fuera por el filtro.
+    """
+    if not req_ids:
+        return 0
+    rows = await session.scalars(
+        select(RequirementFinding).where(
+            RequirementFinding.req_id.in_(req_ids),
+            RequirementFinding.status == FindingStatus.OPEN,
+        )
+    )
+    closed = 0
+    for f in rows:
+        f.status = FindingStatus.FIXED
+        closed += 1
+    return closed
 
 
 async def _get_item(
@@ -229,6 +255,66 @@ async def update_requirement(
     return item
 
 
+async def update_requirements_bulk(
+    session: AsyncSession,
+    project_id: int,
+    updates: list[dict[str, Any]],
+    *,
+    changed_by: str = "agent",
+) -> dict[str, Any]:
+    """Edita N items en UNA transacción (antídoto del N+1 de update_requirement).
+
+    Cada entrada: {req_id, statement?, type?, priority?, reason?}. La fase de
+    resolución (item existe y pertenece al proyecto) corre primero: una
+    entrada inválida no aborta el lote, vuelve en ``errors``. La fase de
+    mutación no puede fallar a mitad de camino; una sola revisión por item
+    editado y UN commit al final. Devuelve {updated, errors}.
+    """
+    resolved: list[tuple[RequirementItem, dict[str, Any]]] = []
+    errors: list[dict[str, Any]] = []
+    for upd in updates:
+        try:
+            item = await _get_item(
+                session, upd["req_id"], project_id=project_id
+            )
+        except KeyError as exc:
+            errors.append(
+                {
+                    "req_id": upd.get("req_id"),
+                    "code": upd.get("code"),
+                    "error": str(exc),
+                }
+            )
+            continue
+        resolved.append((item, upd))
+
+    updated: list[dict[str, Any]] = []
+    for item, upd in resolved:
+        if upd.get("statement") is not None:
+            item.statement = upd["statement"]
+        if upd.get("type") is not None:
+            item.type = upd["type"]
+        if upd.get("priority") is not None:
+            item.priority = upd["priority"]
+        await _append_revision(
+            session, item,
+            reason=upd.get("reason") or "bulk_update",
+            changed_by=changed_by,
+        )
+        updated.append(
+            {
+                "req_id": item.id,
+                "code": item.code,
+                "statement": item.statement,
+                "type": item.type.value,
+                "priority": item.priority.value,
+            }
+        )
+    if updated:
+        await session.commit()
+    return {"updated": updated, "errors": errors}
+
+
 async def add_acceptance_criterion(
     session: AsyncSession,
     req_id: int,
@@ -325,6 +411,10 @@ async def reject_requirement(
             "reject_requirement: detached %d children of %s (status=REJECTED)",
             len(children), item.code,
         )
+
+    # El hallazgo cuya corrección era "este requerimiento sobra" queda resuelto.
+    # Los hijos desprendidos siguen vivos: conservan sus propios hallazgos.
+    await _close_open_findings(session, [item.id])
 
     await session.commit()
     await session.refresh(item)
@@ -475,6 +565,10 @@ async def merge_requirements(
             session, other, reason=f"merged_into_{kept.code}",
             changed_by=changed_by,
         )
+    # Los smells de los absorbidos desaparecen con ellos; los del keeper
+    # siguen abiertos porque siguen aplicando.
+    await _close_open_findings(session, [other.id for other in others])
+
     await session.commit()
     await session.refresh(kept)
     return kept
@@ -532,6 +626,8 @@ async def split_requirement(
     await _append_revision(
         session, original, reason=reason, changed_by=changed_by
     )
+    # El split ES la corrección del smell de atomicidad del original: se cierra.
+    await _close_open_findings(session, [original.id])
 
     await session.commit()
     for child in created:
