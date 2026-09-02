@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from backend.models.project_actor import ActorStatus
 from backend.models.requirement import Priority, ReqStatus, ReqType
 from backend.services.srs_assembler import _draft_narrative
 from backend.services.srs_builder import (
@@ -16,6 +17,7 @@ from backend.services.srs_builder import (
     _fmt_criteria,
     _fmt_source,
     _flags_label,
+    _render_actors_table,
     _render_authored,
     _render_goals,
     _render_requirements,
@@ -143,6 +145,27 @@ def test_draft_narrative_features_shows_moscow_and_type():
     n = _draft_narrative("Test", "", {}, {}, {}, 1, live_items=[mock_item])
     features = n["overall.features"]
     assert "(MUST · Requerimientos funcionales)" in features
+
+
+def test_draft_narrative_users_with_actors_block():
+    """Con catálogo, el fallback determinista lista los actores en users."""
+    block = "\n".join([
+        "PROJECT_ACTORS (canonical actors):",
+        "- R1 Coordinador de terreno (humano)",
+        "- R2 Sistema meteorológico (sistema_externo) [aka: API clima]",
+    ])
+    n = _draft_narrative("Test", "", {}, {}, {}, 0, actors_block_text=block)
+    users = n["overall.users"]
+    assert "- R1 Coordinador de terreno (humano)" in users
+    assert "- R2 Sistema meteorológico" in users
+    assert "Actores definidos durante la captura:" in users
+    assert "_Editor:" in users  # privilegios/frecuencia siguen pendientes
+
+
+def test_draft_narrative_users_without_actors_block_is_placeholder():
+    n = _draft_narrative("Test", "", {}, {}, {}, 0)
+    assert "clases de usuario" in n["overall.users"]
+    assert "R1" not in n["overall.users"]
 
 
 # ---------------------------------------------------------------------------
@@ -428,11 +451,72 @@ def test_srs_structure_intro_has_5_subsections():
     assert "intro.overview" in sub_ids
 
 
-def test_srs_structure_overall_has_5_subsections():
+def test_srs_structure_overall_has_6_subsections():
     overall = next(s for s in SRS_STRUCTURE if s["id"] == "overall")
-    assert len(overall["subsections"]) == 5
+    assert len(overall["subsections"]) == 6
     sub_ids = [s["id"] for s in overall["subsections"]]
+    assert "overall.actors" in sub_ids
     assert "overall.features" in sub_ids
     assert "overall.users" in sub_ids
     assert "overall.environment" in sub_ids
     assert "overall.assumptions" in sub_ids
+    # La de actores es proyectada y va antes de las authored.
+    actors_sub = next(s for s in overall["subsections"] if s["id"] == "overall.actors")
+    assert actors_sub["kind"] == "projected"
+    assert sub_ids.index("overall.actors") < sub_ids.index("overall.users")
+
+
+# --------------------------------------------------------------------------- #
+# _render_actors_table / subsection projected                                  #
+# --------------------------------------------------------------------------- #
+
+
+def _mock_actor(
+    code: str = "R1",
+    name: str = "Coordinador de terreno",
+    channel: str | None = "humano",
+    status: ActorStatus = ActorStatus.ACTIVE,
+):
+    return SimpleNamespace(
+        code=code, name=name, channel=channel, status=status
+    )
+
+
+def test_render_actors_table_with_actors():
+    lines = _render_actors_table([_mock_actor(), _mock_actor("R2", "Auditor", None)])
+    md = "\n".join(lines)
+    assert "| Código | Actor | Canal |" in md
+    assert "`R1` | Coordinador de terreno | humano" in md
+    # Canal ausente se renderiza con guion, no con None.
+    assert "`R2` | Auditor | —" in md
+
+
+def test_render_actors_table_skips_retired_and_empty():
+    retired = _mock_actor("R3", "Consultor", status=ActorStatus.RETIRED)
+    assert "R3" not in "\n".join(_render_actors_table([retired]))
+    assert "Sin actores definidos" in "\n".join(_render_actors_table([]))
+
+
+def test_render_authored_projects_actors_subsection():
+    """La subsección proyectada overall.actors renderiza la tabla aunque no
+    haya narrative keys (el contenido no es editable)."""
+    section = next(s for s in SRS_STRUCTURE if s["id"] == "overall")
+    lines = _render_authored(
+        section,
+        {"overall.users": "Prosa de usuarios."},
+        actors=[_mock_actor()],
+    )
+    md = "\n".join(lines)
+    assert "### 2.3 Actores del sistema" in md
+    assert "`R1` | Coordinador de terreno" in md
+    assert "### 2.4 Clases y características de usuarios" in md
+    assert "Prosa de usuarios." in md
+
+
+def test_render_authored_actors_table_without_narrative_keys():
+    """Legacy (sin subsection keys en narrative): la tabla igual aparece."""
+    section = next(s for s in SRS_STRUCTURE if s["id"] == "overall")
+    lines = _render_authored(section, {}, actors=[_mock_actor()])
+    md = "\n".join(lines)
+    assert "### 2.3 Actores del sistema" in md
+    assert "`R1`" in md

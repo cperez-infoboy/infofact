@@ -47,6 +47,7 @@ from backend.agents.pipelines.consolidation import consolidate, drop_duplicit_im
 from backend.agents.pipelines.critique import critique_all
 from backend.agents.pipelines.extraction import (
     extract_conventions,
+    extract_actors,
     merge_conventions,
     enrich_structure_map,
     extract_all,
@@ -58,6 +59,7 @@ from backend.agents.pipelines.ingestion import discover_documents, verification_
 from backend.agents.pipelines.parse_cache import parse_document_cached
 from backend.services.document_service import parser_hint_map
 from backend.agents.subagents.capture_run_holder import (
+    STAGE_ACTORS,
     STAGE_CLASSIFY,
     STAGE_COMMIT,
     STAGE_CONSOLIDATE,
@@ -66,18 +68,23 @@ from backend.agents.subagents.capture_run_holder import (
     STAGE_EXTRACT,
     STAGE_INGEST,
     StageLoopExceeded,
+    clear_capture_scope,
     clear_run,
+    get_capture_scope,
     get_or_create_run,
     get_run,
+    scope_mismatch,
 )
 from backend.agents.llm_retry_guard import EmptyResponseRetryMiddleware
 from backend.agents.size_guard import SizeGuardMiddleware
 from backend.agents.tools.grouping_tools import make_grouping_tools
+from backend.agents.tools.actor_tools import make_actor_tools
 from backend.agents.tools.project_rules_tools import make_project_rules_tools
 from backend.agents.tools.requirements_tools import make_requirements_tools
 from backend.agents.tools.vision_tools import make_vision_tools
+from backend.models.project_actor import ActorSource
 from backend.models.project_rule import RuleScope, RuleSource
-from backend.services import project_rules_store
+from backend.services import actor_store, project_rules_store
 
 
 REQUIREMENTS_CAPTURE_AGENT_PROMPT = """\
@@ -93,6 +100,10 @@ anterior, guardada en memoria):
   2. discover_conventions      descubre la leyenda de prioridad del cliente,
                                etiquetas de campo y marcadores de alcance del
                                documento (reglas literales verbatim)
+  2b. identify_actors          determina los ACTORES del sistema (roles
+                               humanos y sistemas externos) y los persiste en
+                               el catalogo del proyecto (R1..Rn). Opcional y
+                               best-effort: si falla, sigue el flujo normal
   3. extract_requirements      extraccion guiada (verify_spans anti-alucinacion)
   4. consolidate_requirements  deduplicacion + contradicciones
   5. critique_requirements     revision critica (rechaza leyendas / alucinaciones)
@@ -105,7 +116,9 @@ commit_capture rechaza si falta alguna etapa previa: no puedes saltear etapas.
 Flujo:
 
 1. ORIENTAR. Llama a orient_documents para inventariar los documentos del
-   proyecto (tipo, tamanho, ruta). Con ese panorama, piensa en voz alta:
+   alcance pedido (si la directiva trae [SCOPE], pasa target_subpath con ese
+   valor EXACTO: la tool lo verifica y rechaza otra cosa; sin [SCOPE], ""
+   inventaria todo el proyecto). Con ese panorama, piensa en voz alta:
    - Que clase de documento es cada uno (RFP, minuta, spec tecnica, contrato,
      diccionario de datos, schema de DB, mockup)?
    - Hay secciones de RUIDO/boilerplate que el pipeline puede confundir con
@@ -117,7 +130,8 @@ Flujo:
    - Esta mezclado el idioma? El pipeline preserva el idioma del source_span.
 
 2. PLANIFICAR. Con el inventario, cuenta al usuario en 2-4 frases que vas a
-   hacer (que documentos, en que orden, algun foco). Si el usuario paso
+   hacer (que documentos, en que orden, algun foco). La carpeta de un [SCOPE]
+   es un CONTRATO: el plan cubre unicamente esos documentos. Si el usuario paso
    INSTRUCCIONES DEL USUARIO, considera como sesgan tu plan: atencion (p.ej.
    enfocate en restricciones), heuristicas (este doc es un RFP, filtra las
    instrucciones al licitante) u orden de presentacion del listado final.
@@ -128,10 +142,13 @@ Flujo:
 4. ORQUESTAR LAS ETAPAS. Ejecuta las siete tools en orden, razonando entre cada
    una (1-3 frases: que viste, que sigue, alguna duda). Cada una devuelve un
    resumen con conteos.
-   - ingest_documents(target_subpath, on_existing): arranca la captura. Usa ""
-     para todo el proyecto o la carpeta que definiste en la planificacion. Si
-     ya habia una captura en curso, la reinicia (empieza de cero). Si no
-     encuentra documentos, reporta y pide al usuario que los suba.
+   - ingest_documents(target_subpath, on_existing): arranca la captura. Con
+     [SCOPE] en la directiva, target_subpath es OBLIGATORIO y debe ser
+     EXACTAMENTE el valor del scope (las tools lo verifican mecanicamente y
+     rechazan una llamada sin el o con otro valor con un error scope_violation:
+     reinvoca con el valor pedido). Usa "" solo cuando no hay scope (todo el
+     proyecto). Si ya habia una captura en curso, la reinicia (empieza de
+     cero). Si no encuentra documentos, reporta y pide al usuario que los suba.
      * Si devuelve pending_confirmation (ya existen requerimientos), AVISA al
        usuario cuantos hay y el ultimo codigo (p.ej. REQ-7K3F), y pregunta si
        prefiere resetear todo o agregar a los existentes. Segun su respuesta,
@@ -145,8 +162,19 @@ Flujo:
      prioridad, marcadores de alcance, glosario). Es una lectura literal
      (verbatim) del documento, no una interpretacion. Es best-effort: si falla,
      el pipeline sigue con los valores por defecto basados en verbos.
+   - identify_actors: determina QUIEN usa el sistema (roles concretos como
+     "Coordinador de terreno", no el "usuario" generico) y lo persiste en el
+     catalogo del proyecto. Correla justo despues de discover_conventions; si
+     falla, segui sin ella. El catalogo alimenta los prompts de extraccion,
+     critica y clasificacion y los pre-checks de actor; si el usuario corrige
+     un actor en el chat, curalo con las tools de actores (list/add/retire)
+     para que valga para esta captura y las futuras.
    - extract_requirements: extrae requerimientos del material ingerido. TODO
-     item nace aca, verificado por source_span. No inventes items.
+     item nace aca, verificado por source_span. No inventes items. Los
+     enunciados de requerimientos funcionales deben arrancar con el rol
+     canonico del catalogo (nunca "El usuario debe..." ni "El sistema debe..."
+     para comportamiento cara al usuario; [ROL-PENDIENTE] solo si la fuente
+     no permite resolver el rol).
    - consolidate_requirements: detecta duplicados y contradicciones y los
      propone (eventos conflict.found en vivo). No los resuelvas solo.
      * Si devuelve judge_degraded=true, el juez LLM fallo para algunos lotes:
@@ -186,8 +214,11 @@ saltear):
   Excepcion: reset_capture es un hard-delete destructivo e irreversible; solo
   tras un si explicito del usuario.
 - Las INSTRUCCIONES DEL USUARIO dirigen tu RAZONAMIENTO, no los parametros
-  internos del pipeline (thresholds, chunk size son de config). Si el usuario
-  pide algo que no aplica, dilo con honestidad.
+  internos del pipeline (thresholds, chunk size son de config). EXCEPCION: el
+  alcance de documentos si es parametro — un [SCOPE] en la directiva es un
+  contrato: pasa ese target_subpath EXACTO en orient_documents e
+  ingest_documents; las tools lo verifican. Si el usuario pide algo que no
+  aplica, dilo con honestidad.
 - No repitas una etapa mas de 3 veces (tope de loop). Si algo no converge,
   reporta y espera al usuario en vez de iterar en vano.
 - Habla en espanol neutro. Se conciso y tecnico. Narra tu razonamiento en 1-3
@@ -401,12 +432,14 @@ def _human_size(num_bytes: int) -> str:
     return f"{size:.1f}GB"
 
 
-def _make_orient_tool(host_workspace: Path):
+def _make_orient_tool(project_id: int, host_workspace: Path):
     """Build the orient_documents tool (lightweight inventory, no parsing).
 
     Lists every client document under the target with type/size heuristics so
     the agent can reason about the corpus BEFORE the long capture. Does NOT
-    extract text -- that is Docling job inside ``ingest_documents``.
+    extract text -- that is Docling job inside ``ingest_documents``. When a
+    folder scope was requested for this project, the tool enforces it
+    mechanically (scope_violation) instead of inventorying the whole workspace.
     """
 
     @tool
@@ -417,8 +450,13 @@ def _make_orient_tool(host_workspace: Path):
         the resolved target. Use this to orient yourself BEFORE running
         ingest_documents: decide document order, flag likely noise/boilerplate
         sections, and note diagrams. This does NOT parse the documents -- text
-        extraction happens inside ingest_documents via Docling.
+        extraction happens inside ingest_documents via Docling. When the
+        directive carries a [SCOPE], target_subpath is REQUIRED and verified
+        mechanically: an omitted or different folder is rejected.
         """
+        mismatch = scope_mismatch(project_id, target_subpath)
+        if mismatch is not None:
+            return mismatch
         try:
             target = _resolve_target(host_workspace, target_subpath)
         except ValueError as exc:
@@ -508,6 +546,28 @@ async def _project_rules_block(project_id: int) -> str:
 
         logging.getLogger(__name__).warning(
             "project rules unavailable; stage runs without PROJECT_RULES",
+            exc_info=True,
+        )
+        return ""
+
+
+async def _actors_block(project_id: int) -> str:
+    """Fetch the PROJECT_ACTORS block from the persistent actor catalog.
+
+    Best-effort, same contract as ``_project_rules_block``: additive steering —
+    sin catálogo (o si el store no está disponible) la etapa corre con el
+    léxico base de ``detect_actor``, nunca aborta.
+    """
+    try:
+        from backend.database import AsyncSessionLocal
+
+        async with AsyncSessionLocal() as session:
+            return await actor_store.actors_block(session, project_id)
+    except Exception:  # noqa: BLE001 — additive steering only
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "actor catalog unavailable; stage runs without PROJECT_ACTORS",
             exc_info=True,
         )
         return ""
@@ -659,6 +719,9 @@ def _make_stage_tools(
                   user explicitly chose to start over.
                 - "append": keep existing requirements and add the new ones.
         """
+        mismatch = scope_mismatch(project_id, target_subpath)
+        if mismatch is not None:
+            return mismatch
         try:
             target = _resolve_target(host_workspace, target_subpath)
         except ValueError as exc:
@@ -846,6 +909,85 @@ def _make_stage_tools(
         }
 
     @tool
+    async def identify_actors() -> dict:
+        """Determina los ACTORES del sistema desde los documentos ingeridos.
+
+        Una pasada LLM por documento (best-effort, espejo de
+        discover_conventions) que extrae los roles que interactúan con el
+        sistema (humanos y sistemas externos, NUNCA el «usuario» genérico) y
+        los persiste en el catálogo ProjectActor del proyecto (códigos R1..Rn,
+        idempotente: re-correr consolida sinónimos, no duplica). El catálogo
+        se inyecta como bloque PROJECT_ACTORS en extract/critique/classify y
+        alimenta los pre-checks de actor (smell.actor_missing reconoce los
+        roles del catálogo). No es obligatoria para commit: si falla, la
+        captura sigue con el léxico base. Requiere ingest_documents.
+        """
+        run = get_run(project_id)
+        if run is None:
+            return _no_run("ingest_documents")
+        try:
+            run.bump(STAGE_ACTORS)
+        except StageLoopExceeded as exc:
+            return _loop_err(exc)
+
+        import logging
+
+        on_progress, _on_event = _make_emitters()
+        await on_progress(
+            STAGE_ACTORS, "identificación de actores", {"phase": "start"}
+        )
+        t0 = time.perf_counter()
+
+        candidates: list[dict] = []
+        for chunks, smap in run.per_doc:
+            catalog = await extract_actors(
+                smap,
+                project_name=run.project_name,
+                project_description=run.project_description,
+            )
+            candidates.extend(c.model_dump() for c in catalog.actors)
+
+        if not candidates:
+            # Sin evidencia de actores no hay transacción que abrir.
+            res = {"created": 0, "updated": 0, "actors": []}
+        else:
+            from backend.database import AsyncSessionLocal
+
+            try:
+                async with AsyncSessionLocal() as session:
+                    res = await actor_store.upsert_actors(
+                        session,
+                        project_id,
+                        candidates,
+                        source=ActorSource.ACTORS_STAGE,
+                    )
+                    await session.commit()
+            except Exception:  # noqa: BLE001 — best-effort, nunca aborta
+                logging.getLogger(__name__).exception(
+                    "identify_actors: persistencia del catálogo falló"
+                )
+                res = {"created": 0, "updated": 0, "actors": []}
+
+        run.actor_catalog = res.get("actors", [])
+        run.timings[STAGE_ACTORS] = (time.perf_counter() - t0) * 1000
+        run.stages_done.add(STAGE_ACTORS)
+        await on_progress(
+            STAGE_ACTORS, "actores listos",
+            {
+                "phase": "end",
+                "elapsed_ms": round(run.timings[STAGE_ACTORS]),
+                "actors": len(run.actor_catalog),
+            },
+        )
+        return {
+            "actors": len(run.actor_catalog),
+            "created": res.get("created", 0),
+            "updated": res.get("updated", 0),
+            "names": [a["name"] for a in run.actor_catalog],
+            "stages_done": sorted(run.stages_done),
+        }
+
+    @tool
     async def extract_requirements() -> dict:
         """Stage 3/7: extract raw requirements from the ingested chunks.
 
@@ -871,6 +1013,12 @@ def _make_stage_tools(
         # Persistent project rules (scope capture + all): fetched per stage so
         # a rule added mid-run applies from the next stage.
         project_rules_block = await _project_rules_block(project_id)
+        # Catálogo de actores: misma línea de inyección que PROJECT_RULES.
+        actors_block = await _actors_block(project_id)
+        if actors_block:
+            project_rules_block = (
+                f"{project_rules_block}\n\n{actors_block}".strip()
+            )
 
         async def _extract_progress(done: int, total: int):
             await on_progress(
@@ -1028,6 +1176,12 @@ def _make_stage_tools(
             )
 
         project_rules_block = await _project_rules_block(project_id)
+        # Catálogo de actores: misma línea de inyección que PROJECT_RULES.
+        actors_block = await _actors_block(project_id)
+        if actors_block:
+            project_rules_block = (
+                f"{project_rules_block}\n\n{actors_block}".strip()
+            )
 
         crit = await critique_all(
             run.cons.items, rules=run.document_rules,
@@ -1078,6 +1232,12 @@ def _make_stage_tools(
         t0 = time.perf_counter()
 
         project_rules_block = await _project_rules_block(project_id)
+        # Catálogo de actores: misma línea de inyección que PROJECT_RULES.
+        actors_block = await _actors_block(project_id)
+        if actors_block:
+            project_rules_block = (
+                f"{project_rules_block}\n\n{actors_block}".strip()
+            )
 
         cls = await classify_all(
             run.crit.items, rules=run.document_rules,
@@ -1169,11 +1329,13 @@ def _make_stage_tools(
             {"timings": dict(run.timings), "total_ms": total_ms},
         )
         clear_run(project_id)
+        clear_capture_scope(project_id)
         return summary
 
     return [
         ingest_documents,
         discover_conventions,
+        identify_actors,
         extract_requirements,
         consolidate_requirements,
         critique_requirements,
@@ -1210,7 +1372,7 @@ def make_requirements_capture_agent_subagent(
     host_workspace = settings.workspaces_root / profile / project_slug
 
     health_tool = _make_check_health_tool()
-    orient_tool = _make_orient_tool(host_workspace)
+    orient_tool = _make_orient_tool(project_id, host_workspace)
     stage_tools = _make_stage_tools(
         project_id, host_workspace, project_name, project_description
     )
@@ -1218,6 +1380,7 @@ def make_requirements_capture_agent_subagent(
     grouping_tools = make_grouping_tools(project_id)
     vision_tools = make_vision_tools(profile, project_slug)
     rules_tools = make_project_rules_tools(project_id)
+    actor_tools = make_actor_tools(project_id)
 
     return {
         "name": "requirements-capture-agent",
@@ -1243,6 +1406,7 @@ def make_requirements_capture_agent_subagent(
             *grouping_tools,
             *vision_tools,
             *rules_tools,
+            *actor_tools,
         ],
         # deepagents NO propaga el middleware del orquestador a los
         # subagentes (pero SI les inyecta FilesystemMiddleware): cada spec

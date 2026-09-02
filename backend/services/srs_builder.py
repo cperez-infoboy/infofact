@@ -23,6 +23,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.models.project_actor import ActorStatus, ProjectActor
 from backend.models.requirement import (
     Priority,
     ReqStatus,
@@ -32,6 +33,7 @@ from backend.models.requirement import (
     RelationKind,
 )
 from backend.models.srs import Goal, GoalLink
+from backend.services.actor_store import list_actors
 from backend.services.requirement_store import _source_list, list_requirements
 
 
@@ -72,13 +74,20 @@ SRS_STRUCTURE: list[dict[str, Any]] = [
                 "title": "2.2 Funcionalidades del producto",
             },
             {
-                "id": "overall.users",
-                "title": "2.3 Clases y características de usuarios",
+                "id": "overall.actors",
+                "title": "2.3 Actores del sistema",
+                # Subsección proyectada: tabla determinista del catálogo
+                # ProjectActor definido en la captura (sin prosa de LLM).
+                "kind": "projected",
             },
-            {"id": "overall.environment", "title": "2.4 Entorno operativo"},
+            {
+                "id": "overall.users",
+                "title": "2.4 Clases y características de usuarios",
+            },
+            {"id": "overall.environment", "title": "2.5 Entorno operativo"},
             {
                 "id": "overall.assumptions",
-                "title": "2.5 Supuestos y dependencias",
+                "title": "2.6 Supuestos y dependencias",
             },
         ],
     },
@@ -146,6 +155,10 @@ _LINK_RELATION_LABELS: dict[str, str] = {
 # Annex section IDs — stored as structured JSON in SrsDocument, not in
 # the markdown body (the frontend renders them in dedicated tabs).
 _ANNEX_IDS = frozenset({"quality", "coverage", "traceability"})
+
+# Subsección proyectada con el catálogo de actores (readers del SRS: router
+# y tools consultan esta subsección del store, no narrative).
+ACTORS_SECTION_ID = "overall.actors"
 
 
 # --------------------------------------------------------------------------- #
@@ -237,11 +250,37 @@ def _flags_label(item: RequirementItem) -> str:
 # --------------------------------------------------------------------------- #
 
 
+def _render_actors_table(actors: list[ProjectActor]) -> list[str]:
+    """Tabla determinista del catálogo ProjectActor (subsección 2.3).
+
+    Proyección pura del store: solo actores ACTIVE, en orden de código.
+    Sin actores deja la nota explícita (el catálogo vacío es un estado
+    válido del proyecto, no un error de render).
+    """
+    active = [a for a in actors if a.status is ActorStatus.ACTIVE and a.name]
+    if not active:
+        return ["_Sin actores definidos en la captura._", ""]
+    lines = [
+        "| Código | Actor | Canal |",
+        "|---|---|---|",
+    ]
+    for a in active:
+        lines.append(f"| `{a.code}` | {a.name} | {a.channel or '—'} |")
+    lines.append("")
+    return lines
+
+
 def _render_authored(
     section: dict[str, Any],
     narrative: dict[str, str] | None,
+    actors: list[ProjectActor] | None = None,
 ) -> list[str]:
-    """Render an authored section, weaving subsection text from narrative."""
+    """Render an authored section, weaving subsection text from narrative.
+
+    Las subsections marcadas ``kind: "projected"`` (hoy solo
+    ``overall.actors``) no leen narrative: se proyectan del catálogo
+    de actores que ``build_srs`` carga del store.
+    """
     narrative = narrative or {}
     sid = section["id"]
     subsections = section.get("subsections")
@@ -255,6 +294,9 @@ def _render_authored(
         if has_sub_keys:
             for sub in subsections:
                 lines += [f"### {sub['title']}", ""]
+                if sub.get("kind") == "projected":
+                    lines += _render_actors_table(actors or [])
+                    continue
                 text = narrative.get(sub["id"], "")
                 if text:
                     lines += [text, ""]
@@ -270,11 +312,14 @@ def _render_authored(
                 lines += [text, ""]
             else:
                 # No narrative at all: render subsection headers with
-                # placeholders so the structure is visible.
+                # placeholders so the structure is visible. Las proyectadas
+                # (actores) siguen mostrando su tabla, no un placeholder.
                 for sub in subsections:
+                    lines += [f"### {sub['title']}", ""]
+                    if sub.get("kind") == "projected":
+                        lines += _render_actors_table(actors or [])
+                        continue
                     lines += [
-                        f"### {sub['title']}",
-                        "",
                         "_Sin contenido. Completar desde el editor._",
                         "",
                     ]
@@ -523,6 +568,9 @@ async def build_srs(
     live = [it for it in items if it.status in _LIVE_STATUSES]
     soft_deleted = [it for it in items if it.status not in _LIVE_STATUSES]
 
+    # Catálogo de actores de la captura (para la subsección proyectada 2.3).
+    actors = await list_actors(session, project_id)
+
     # Relaciones no resueltas (status PROPOSED o CONFIRMED con kind != duplicate
     # porque los duplicates se resuelven vía merge y no son conflictos abiertos).
     rel_rows = await session.scalars(
@@ -585,7 +633,7 @@ async def build_srs(
                 continue
 
             if kind == "authored":
-                lines += _render_authored(section, narrative)
+                lines += _render_authored(section, narrative, actors=actors)
             elif sid == "goals":
                 lines += _render_goals(goals, goal_links, id_to_code)
             else:

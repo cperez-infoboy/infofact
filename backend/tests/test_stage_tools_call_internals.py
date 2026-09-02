@@ -8,9 +8,10 @@ and we assert the tool stores its typed output on the per-project
 context: the emitters are no-ops outside a LangGraph run (see
 ``_make_emitters``).
 
-Stage tool indices (after the CONVENTIONS stage insertion):
-  0=ingest, 1=conventions, 2=extract, 3=consolidate, 4=critique, 5=classify,
-  6=commit.
+Stage tool indices (after the ACTORS stage insertion; identify_actors is
+optional/best-effort and stubbed here to return an empty catalog):
+  0=ingest, 1=conventions, 2=identify_actors, 3=extract, 4=consolidate,
+  5=critique, 6=classify, 7=commit.
 """
 from __future__ import annotations
 
@@ -20,6 +21,7 @@ from pathlib import Path
 import pytest
 
 import backend.agents.subagents.requirements_capture_agent as mod
+from backend.agents.pipelines.extraction import ActorCatalog
 from backend.agents.subagents import capture_run_holder as holder
 
 PROJECT_ID = 4201
@@ -117,6 +119,12 @@ def _stub_pipeline(monkeypatch, calls: dict) -> None:
     monkeypatch.setattr(mod, "enrich_structure_map", fake_enrich)
     monkeypatch.setattr(mod, "extract_conventions", fake_extract_conventions)
     monkeypatch.setattr(mod, "merge_conventions", fake_merge_conventions)
+    # identify_actors (opcional, best-effort): catálogo vacío sin LLM ni DB.
+    async def fake_extract_actors(smap, **kw):
+        calls["extract_actors"] = True
+        return ActorCatalog()
+
+    monkeypatch.setattr(mod, "extract_actors", fake_extract_actors)
     monkeypatch.setattr(mod, "extract_all", fake_extract_all)
     monkeypatch.setattr(mod, "gap_pass", fake_gap_pass)
     monkeypatch.setattr(mod, "implicit_pass", fake_implicit_pass)
@@ -176,7 +184,7 @@ async def test_extract_calls_extract_all_gap_implicit_and_drops_duplicit(
     stage_tools, calls
 ):
     await stage_tools[0].ainvoke({"target_subpath": ""})
-    out = await stage_tools[2].ainvoke({})  # index 2 = extract
+    out = await stage_tools[3].ainvoke({})  # index 3 = extract
     run = holder.get_run(PROJECT_ID)
     assert len(run.extracted) == 3  # 2 explicit + 1 implicit kept
     assert out["raw_items"] == 3
@@ -191,8 +199,8 @@ async def test_extract_calls_extract_all_gap_implicit_and_drops_duplicit(
 @pytest.mark.asyncio
 async def test_consolidate_calls_consolidate_and_counts_conflicts(stage_tools, calls):
     await stage_tools[0].ainvoke({"target_subpath": ""})
-    await stage_tools[2].ainvoke({})  # extract (skip conventions)
-    out = await stage_tools[3].ainvoke({})  # index 3 = consolidate
+    await stage_tools[3].ainvoke({})  # extract (skip conventions + actors)
+    out = await stage_tools[4].ainvoke({})  # index 4 = consolidate
     run = holder.get_run(PROJECT_ID)
     assert run.cons is not None
     assert len(run.cons.items) == 2
@@ -204,12 +212,12 @@ async def test_consolidate_calls_consolidate_and_counts_conflicts(stage_tools, c
 
 @pytest.mark.asyncio
 async def test_critique_calls_critique_all_and_reports_verdict(stage_tools, calls):
-    # Run ingest + conventions + extract + consolidate (indices 0..3).
+    # Run ingest + conventions + actors + extract + consolidate (indices 0..4).
     for idx, payload in enumerate(
-        [{"target_subpath": ""}, {}, {}, {}]
+        [{"target_subpath": ""}, {}, {}, {}, {}]
     ):
         await stage_tools[idx].ainvoke(payload)
-    out = await stage_tools[4].ainvoke({})  # index 4 = critique
+    out = await stage_tools[5].ainvoke({})  # index 5 = critique
     run = holder.get_run(PROJECT_ID)
     assert run.crit is not None
     assert out["kept"] == 2
@@ -223,12 +231,13 @@ async def test_critique_calls_critique_all_and_reports_verdict(stage_tools, call
 
 @pytest.mark.asyncio
 async def test_classify_calls_classify_all(stage_tools, calls):
-    # Run ingest + conventions + extract + consolidate + critique (0..4).
+    # Run ingest + conventions + actors + extract + consolidate + critique
+    # (indices 0..5).
     for idx, payload in enumerate(
-        [{"target_subpath": ""}, {}, {}, {}, {}]
+        [{"target_subpath": ""}, {}, {}, {}, {}, {}]
     ):
         await stage_tools[idx].ainvoke(payload)
-    out = await stage_tools[5].ainvoke({})  # index 5 = classify
+    out = await stage_tools[6].ainvoke({})  # index 6 = classify
     run = holder.get_run(PROJECT_ID)
     assert run.cls is not None
     assert out["classified"] == 1

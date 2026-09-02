@@ -90,8 +90,9 @@ class SrsNarrativeDraft(BaseModel):
     )
     users: str = Field(
         description=(
-            "Sección 2.3 Usuarios: roles detectados con privilegios y "
-            "frecuencia estimada."
+            "Sección 2.4 Usuarios: los actores del catálogo provisto, con "
+            "privilegios y frecuencia estimada SOLO si hay respaldo en los "
+            "requerimientos o fragmentos."
         )
     )
     environment: str = Field(
@@ -109,12 +110,19 @@ _NARRATIVE_SYSTEM = (
     "Eres un analista de requerimientos de software que redacta secciones "
     "de una Especificación de Requerimientos de Software (SRS) conforme a "
     "ISO/IEC/IEEE 29148:2018. Recibirás el nombre del proyecto, su "
-    "descripción, una muestra de requerimientos y fragmentos de documentos fuente.\n"
+    "descripción, una muestra de requerimientos, fragmentos de documentos "
+    "fuente y, cuando exista, el catálogo de actores del sistema definido "
+    "durante la captura.\n"
     "Reglas:\n"
     "- IDIOMA: español neutro y profesional. Sin regionalismos.\n"
     "- TONO: objetivo, técnico, impersonal (tercera persona).\n"
     "- No inventes funcionalidades que no estén respaldadas por los "
     "requerimientos o fragmentos proporcionados.\n"
+    "- Si el contexto incluye el bloque PROJECT_ACTORS, la sección de "
+    "usuarios debe describir EXACTAMENTE esos actores (usando su rol "
+    "canónico) y NINGÚN otro; los sinónimos solo para referenciar la misma "
+    "clase. Privilegios y frecuencia estimada SOLO si los requerimientos o "
+    "fragmentos los respaldan.\n"
     "- Para definitions: extrae términos técnicos y acrónimos del dominio "
     "que aparezcan en los requerimientos o fragmentos.\n"
     "- Para references: cita ISO/IEC/IEEE 29148:2018, ISO/IEC 25010:2011 y "
@@ -122,6 +130,81 @@ _NARRATIVE_SYSTEM = (
     "- Cada sección debe ser prosa coherente, excepto definitions y "
     "references que pueden usar viñetas Markdown.\n"
 )
+
+# Marcador del bloque de conteos de §2.1: lo arma el determinista y se
+# reapende tras la prosa para que el resumen de alcance nunca quede desfasado.
+_COUNTS_MARKER = "\n**Resumen del alcance especificado:**"
+
+# Subsecciones authored cuyo TEXTO carry-forward preserva de la versión
+# previa (la perspectiva va aparte: hay que separarle el bloque de conteos).
+_AUTHORED_PROSE_KEYS = (
+    "intro.purpose",
+    "intro.scope",
+    "intro.definitions",
+    "intro.references",
+    "overall.users",
+    "overall.environment",
+    "overall.assumptions",
+)
+
+_LEGACY_KEYS = {
+    "intro": (
+        "intro.purpose",
+        "intro.scope",
+        "intro.definitions",
+        "intro.references",
+        "intro.overview",
+    ),
+    "overall": (
+        "overall.perspective",
+        "overall.features",
+        "overall.users",
+        "overall.environment",
+        "overall.assumptions",
+    ),
+}
+
+
+def _split_counts_block(perspective: str) -> tuple[str, str]:
+    """Separa una §2.1 en (prosa, bloque de conteos). El bloque puede ser ''."""
+    if _COUNTS_MARKER in perspective:
+        idx = perspective.index(_COUNTS_MARKER)
+        return perspective[:idx], perspective[idx:]
+    return perspective, ""
+
+
+def _carryover_narrative(
+    previous: dict[str, str], det: dict[str, str]
+) -> dict[str, str]:
+    """Combina la prosa authored de la versión previa con el determinista fresco.
+
+    El texto authored (7 subsecciones + perspectiva sin su bloque de conteos)
+    se conserva VERBATIM de ``previous``; los deterministas (``intro.overview``,
+    ``overall.features``, bloque de conteos) salen de ``det`` y reflejan el
+    store vivo. Así «refrescá el SRS tras una curación» preserva el texto
+    curado sin redactar de nuevo: sin este canal el redactor re-draftaba de
+    cero y marcaba el documento con notas provisionales (sesión 53 v11).
+    Tolera narrativas previas parciales (versiones viejas sin alguna clave).
+    """
+    carried = dict(det)
+    for key in _AUTHORED_PROSE_KEYS:
+        text = previous.get(key)
+        if isinstance(text, str) and text.strip():
+            carried[key] = text
+    prev_prose, _ = _split_counts_block(
+        previous.get("overall.perspective") or ""
+    )
+    _, fresh_block = _split_counts_block(det.get("overall.perspective", ""))
+    carried["overall.perspective"] = (
+        prev_prose.rstrip() + "\n\n" + fresh_block.lstrip("\n")
+        if fresh_block
+        else prev_prose.rstrip()
+    )
+    for legacy, parts in _LEGACY_KEYS.items():
+        carried[legacy] = "\n\n".join(
+            text for text in (carried.get(k, "") for k in parts) if text
+        )
+    return carried
 
 
 def _feature_line(it: Any) -> str:
@@ -145,6 +228,7 @@ def _draft_narrative(
     live_count: int,
     live_items: list | None = None,
     goal_groups: list[tuple[str, str, list]] | None = None,
+    actors_block_text: str | None = None,
 ) -> dict[str, str]:
     """Borrador de la prosa editable por subsection.
 
@@ -232,10 +316,25 @@ def _draft_narrative(
     else:
         overall_features = "_Sin requerimientos funcionales para listar._"
 
-    overall_users = (
-        "_Editor: describir las clases de usuario, su frecuencia de uso, "
-        "privilegios y nivel de experiencia._"
-    )
+    # Con catálogo de actores, el fallback determinista ya lista los roles
+    # (sin LLM): el texto solo queda pendiente de privilegios/frecuencia.
+    if actors_block_text:
+        actor_lines = [
+            line
+            for line in actors_block_text.splitlines()
+            if line.startswith("- ")
+        ]
+        overall_users = (
+            "Actores definidos durante la captura:\n"
+            + "\n".join(actor_lines)
+            + "\n\n_Editor: completar frecuencia de uso, privilegios y "
+            "nivel de experiencia de cada actor._"
+        )
+    else:
+        overall_users = (
+            "_Editor: describir las clases de usuario, su frecuencia de uso, "
+            "privilegios y nivel de experiencia._"
+        )
     overall_environment = (
         "_Editor: describir el entorno operativo (plataforma, sistema "
         "operativo, navegadores, integraciones)._"
@@ -366,6 +465,29 @@ async def _build_narrative_context(
             exc_info=True,
         )
 
+    # Catálogo de actores definido en la captura: §2.4 (usuarios) se ancla a
+    # estos roles en vez de re-inferirlos por RAG. Best-effort igual que
+    # reglas — si el catálogo no existe o el harness falla, la narrativa
+    # sigue y el redactor vuelve a inferir de fragmentos.
+    try:
+        from backend.database import AsyncSessionLocal
+        from backend.services import actor_store
+
+        async with AsyncSessionLocal() as session:
+            actors_block = await actor_store.actors_block(session, project_id)
+        if actors_block:
+            parts.append(
+                "\n## Actores del proyecto (catálogo definido en la captura)\n"
+                + actors_block
+            )
+    except Exception:  # noqa: BLE001 — best-effort
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "narrative: no se pudo cargar el catálogo de actores",
+            exc_info=True,
+        )
+
     # Top-20 requerimientos por prioridad.
     parts.append("\n## Requerimientos (muestra)")
     sorted_items = sorted(
@@ -418,6 +540,7 @@ async def draft_narrative_llm(
     coverage: dict[str, Any],
     goals_summary: dict[str, Any],
     instructions: str | None = None,
+    previous_narrative: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """Enriquece la narrativa determinista con prosa generada por LLM.
 
@@ -432,8 +555,15 @@ async def draft_narrative_llm(
     Sin este canal las indicaciones conversacionales NUNCA llegan al
     redactor: el prompt se arma solo desde store + RAG.
 
-    Si la llamada LLM falla, devuelve ``narrative`` sin cambios (fallback
-    determinista).
+    ``previous_narrative`` (opcional) es el texto authored de la versión
+    anterior (runs sembrados): se incluye como base a REVISAR, para que con
+    instrucciones el redactor preserve verbatim lo no alcanzado por ellas en
+    vez de re-draftar de cero (sesión 53 v11: sin la base, reemplazó prosa
+    curada por notas provisionales).
+
+    Si la llamada LLM falla, devuelve ``narrative`` sin cambios (la base que
+    el caller pasó: carry-forward en runs sembrados, determinista puro en
+    pipeline completo).
     """
     try:
         user_msg = await _build_narrative_context(
@@ -445,6 +575,34 @@ async def draft_narrative_llm(
             coverage,
             goals_summary,
         )
+        if previous_narrative:
+            parts = [
+                "\n\n## NARRATIVA AUTHORED ACTUAL "
+                "(texto vigente de la versión anterior; es tu base)"
+            ]
+            for key in (
+                "intro.purpose",
+                "intro.scope",
+                "intro.definitions",
+                "intro.references",
+                "overall.perspective",
+                "overall.users",
+                "overall.environment",
+                "overall.assumptions",
+            ):
+                text = previous_narrative.get(key)
+                if not (isinstance(text, str) and text.strip()):
+                    continue
+                if key == "overall.perspective":
+                    text, _ = _split_counts_block(text)
+                parts.append(f"\n### {key}\n{text.strip()}")
+            parts.append(
+                "\nEl texto anterior ya está curado: REVÍSALO aplicando las "
+                "indicaciones y preserva VERBATIM todo lo que estas no pidan "
+                "cambiar. NO emitas notas provisionales ni marcadores de "
+                "reemplazo."
+            )
+            user_msg += "\n".join(parts)
         if instructions:
             user_msg += (
                 "\n\n## INDICACIONES DEL USUARIO SOBRE LA NARRATIVA "
@@ -466,11 +624,9 @@ async def draft_narrative_llm(
         return narrative
 
     # Extraer el bloque de conteos de la perspectiva determinista.
-    det_perspective = narrative.get("overall.perspective", "")
-    marker = "\n**Resumen del alcance especificado:**"
-    counts_block = ""
-    if marker in det_perspective:
-        counts_block = det_perspective[det_perspective.index(marker):]
+    _, counts_block = _split_counts_block(
+        narrative.get("overall.perspective", "")
+    )
 
     updated = dict(narrative)
     # 8 subsecciones authored -> prosa LLM.
@@ -595,6 +751,11 @@ async def assemble_srs(
     # Agrupación de funcionales por goal para la sección 2.2 (overview).
     goal_groups = await _functional_goal_groups(session, project_id, live)
 
+    # Fallback determinista de §2.4 anclado al catálogo de actores (si hay).
+    from backend.services import actor_store
+
+    actors_block_text = await actor_store.actors_block(session, project_id)
+
     narrative = _draft_narrative(
         project_name,
         project_description,
@@ -604,6 +765,7 @@ async def assemble_srs(
         len(live),
         live_items=live,
         goal_groups=goal_groups,
+        actors_block_text=actors_block_text,
     )
 
     # 8. Cuerpo Markdown (proyección con narrative + structure).

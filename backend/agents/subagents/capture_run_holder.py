@@ -40,6 +40,10 @@ logger = logging.getLogger(__name__)
 # stage below (except commit itself) to have run before it persists.
 STAGE_INGEST = "ingest"
 STAGE_CONVENTIONS = "conventions"
+# Etapa opcional (no requerida por commit): determina los actores del sistema
+# una vez y alimenta el catálogo ProjectActor. Best-effort: si falla, la
+# extracción sigue con el léxico base de detect_actor.
+STAGE_ACTORS = "actors"
 STAGE_EXTRACT = "extract"
 STAGE_CONSOLIDATE = "consolidate"
 STAGE_CRITIQUE = "critique"
@@ -111,6 +115,9 @@ class CaptureRun:
     all_chunks: list = field(default_factory=list)
     # CONVENTIONS output (merged per-doc DocumentRules; None until stage runs)
     document_rules: DocumentRules | None = None
+    # ACTORS output (catálogo persistido en ProjectActor; None hasta que
+    # identify_actors corra; opcional — commit no lo exige).
+    actor_catalog: list[dict] | None = None
     # EXTRACT output
     extracted: list[RawRequirement] = field(default_factory=list)
     # CONSOLIDATE / CRITIQUE / CLASSIFY outputs
@@ -154,6 +161,7 @@ class CaptureRun:
         self.doc_texts = {}
         self.all_chunks = []
         self.document_rules = None
+        self.actor_catalog = None
         self.extracted = []
         self.cons = None
         self.crit = None
@@ -171,6 +179,100 @@ class CaptureRun:
 # commit; the existing-data guard runs before the holder is created, so a
 # blocked/pending capture leaves no run behind.
 _ACTIVE_RUNS: dict[int, CaptureRun] = {}
+
+
+# Requested capture scope, keyed by project_id ("" = whole-project capture).
+# The /captura command parses the folder the user asked for; orient_documents
+# and ingest_documents enforce it mechanically, so a subagent that drops the
+# argument cannot silently widen the capture to the whole workspace (session-13
+# lesson: a scoped request degraded to a full-project inventory).
+_PENDING_SCOPE: dict[int, str] = {}
+
+
+def normalize_scope(subpath: str) -> str:
+    """Canonical form of a requested scope subpath.
+
+    Strips the decorations the chat input adds (@ prefix, surrounding quotes)
+    plus whitespace and leading/trailing slashes, and collapses duplicate
+    slashes. Traversal and absolute-host paths are refused: the scope is a
+    relative folder, and the real containment check lives in
+    ``requirements_capture_agent._resolve_target``.
+    """
+    text = subpath.strip().strip('"').strip("'")
+    if text.startswith("@"):
+        text = text[1:]
+    # One leading slash marks an absolute path (reject); two or more are
+    # sloppy separators — strip them so "//docs/x" normalizes like "docs/x".
+    lead = len(text) - len(text.lstrip("/"))
+    if lead == 1:
+        raise ValueError(
+            "El alcance de captura debe ser una carpeta relativa al workspace "
+            f"del proyecto (recibido: {subpath!r})."
+        )
+    text = text.strip("/").replace("//", "/").strip()
+    if not text or text == ".":
+        return ""
+    if ".." in text.split("/"):
+        raise ValueError(
+            "El alcance de captura debe ser una carpeta relativa al workspace "
+            f"del proyecto (recibido: {subpath!r})."
+        )
+    return text
+
+
+def set_capture_scope(project_id: int, subpath: str) -> str:
+    """Record the requested capture scope for a project; return it normalized.
+
+    An empty subpath clears any previous scope (whole-project capture). Raises
+    ValueError on traversal, mirroring _resolve_target's containment guard.
+    """
+    normalized = normalize_scope(subpath)
+    if normalized:
+        _PENDING_SCOPE[project_id] = normalized
+    else:
+        _PENDING_SCOPE.pop(project_id, None)
+    return normalized
+
+
+def get_capture_scope(project_id: int) -> str:
+    """Return the requested capture scope for a project ("" = none)."""
+    return _PENDING_SCOPE.get(project_id, "")
+
+
+def clear_capture_scope(project_id: int) -> None:
+    """Drop the requested scope (commit accepted or reset wiped the data)."""
+    _PENDING_SCOPE.pop(project_id, None)
+
+
+def scope_mismatch(project_id: int, target_subpath: str) -> dict | None:
+    """Return a corrective-error payload when the call escapes the scope.
+
+    None means the call is in scope. The comparison normalizes both sides so
+    trailing-slash or @-decorated variants of the same folder match. When a
+    scope is registered, an OMITTED target_subpath is also a violation: the
+    default (whole project) is exactly what the scope exists to prevent.
+    """
+    requested = _PENDING_SCOPE.get(project_id, "")
+    if not requested:
+        return None
+    try:
+        got = normalize_scope(target_subpath)
+    except ValueError:
+        got = target_subpath
+    if got == requested:
+        return None
+    return {
+        "error": "scope_violation",
+        "requested": requested,
+        "got": target_subpath,
+        "message": (
+            "La captura esta acotada a la carpeta '" + requested + "' "
+            "(alcance pedido por el usuario). Vuelve a llamar con "
+            "target_subpath='" + requested + "' exactamente; si crees que el "
+            "usuario debe ampliar el alcance, consultalo en tu reporte en vez "
+            "de procesar otras carpetas."
+        ),
+    }
 
 
 def get_or_create_run(

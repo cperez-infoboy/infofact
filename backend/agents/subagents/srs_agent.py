@@ -40,10 +40,12 @@ from backend.agents.tools.documents_tools import make_document_read_tools
 from backend.agents.tools.srs_tools import make_srs_read_tools
 from backend.database import AsyncSessionLocal
 from backend.models.requirement import ReqStatus
+from backend.models.srs import LinkRelation
 from backend.services import goals_engine, srs_coverage, srs_quality, srs_store
 from backend.services.requirement_store import list_requirements
 from backend.services.srs_assembler import (
     SRS_STRUCTURE,
+    _carryover_narrative,
     _draft_narrative,
     _functional_goal_groups,
     draft_narrative_llm,
@@ -72,14 +74,18 @@ los SINTETIZAS y les aplicas análisis de calidad.
 Trabajas por ETAPAS, razonando entre cada una:
 
 0. seed_from_last_srs (CONDICIONAL, va primero) — Si ya existe un SRS y el \
-usuario solo pide revisar o ajustar la NARRATIVA de ese documento (alcance, \
-proposito, terminologia, etc.) sin haber cambiado el store, usa esta tool \
-PRIMERO: reusa los hallazgos, goals y cobertura PERSISTIDOS de la ultima \
-version y sigue directo a draft_narrative + commit_srs (una version nueva \
-en minutos, sin re-juzgar cientos de enunciados). Si devuelve \
-no_previous_srs o stale_store, corre el pipeline completo desde \
-analyze_quality. En ese flujo, pasa las indicaciones narrativas del \
-usuario al parametro `instructions` de `draft_narrative`.
+usuario pide revisar/ajustar la NARRATIVA de ese documento o REFRESCARLO \
+tras una curacion de trazabilidad o edicion de reqs, usa esta tool \
+PRIMERO: reusa los hallazgos, goals, cobertura Y NARRATIVA AUTHORED de la \
+ultima version y sigue directo a draft_narrative + commit_srs (una version \
+nueva en minutos, sin re-juzgar cientos de enunciados). La siembra tolera \
+la curacion del store posterior al documento (merges, ediciones, reqs \
+nuevos, links): descarta los hallazgos de reqs ya no vivos, reporta el \
+diff, y commit_srs re-proyecta trazabilidad y conteos desde el store vivo. \
+Si devuelve no_previous_srs o stale_store (store reemplazado por una \
+captura nueva), corre el pipeline completo desde analyze_quality. En ese \
+flujo, pasa las indicaciones narrativas del usuario al parametro \
+`instructions` de `draft_narrative`.
 1. analyze_quality  — Analiza la calidad de los requerimientos vivos: \
 pre-checks programáticos (INCOSE, requirement smells, EARS) + evaluación LLM \
 de ambigüedad semántica. Produces hallazgos (RequirementFinding) con severidad \
@@ -98,10 +104,32 @@ consultar los documentos con search_documents / get_document_passage antes de \
 redactar. IMPORTANTE: si el usuario dio indicaciones narrativas, pasalas \
 SIEMPRE al parametro `instructions` — es el UNICO canal que llega al \
 redactor (el contexto se arma desde el store + RAG; tu conversacion NO se \
-le pasa). Cargar citas a tu propio contexto NO basta.
+le pasa). Cargar citas a tu propio contexto NO basta. Sobre un run \
+SEMBRADO, sin instrucciones el texto authored previo se conserva VERBATIM \
+(unicamente se re-proyectan conteos y secciones deterministicas) y con \
+instrucciones el redactor lo recibe como base a revisar: NUNCA re-drafta \
+de cero ni emite notas provisionales.
 5. commit_srs       — Persiste el SrsDocument CANDIDATE: combina narrativa \
 + secciones proyectadas + hallazgos + goals + cobertura + matriz de \
 trazabilidad. Solo esta etapa escribe la DB.
+
+Mantenimiento de trazabilidad (sin re-correr el pipeline): si el usuario pide \
+completar o corregir la vinculacion goal <-> requerimiento de reqs concretos, \
+usa goal_coverage (que reqs vivos no aportan a ningun goal) + \
+infer_goal_links(req_codes) (re-infiere links SOLO de esos reqs contra los \
+goals ya persistidos) o link_goal / unlink_goal para aristas puntuales. \
+NO re-corras infer_goals entera para arreglar links puntuales: reemplazaria \
+los links de todo el modelo. Re-correr infer_goals es seguro para los codigos \
+(upsert: los goals existentes conservan GOAL-XXXX y la curacion humana), pero \
+no es el camino para completar trazabilidad de unos pocos reqs.
+Tras una curacion (link_goal/link_goals/unlink_goal/merges/ediciones), \
+refresca el DOCUMENTO con seed_from_last_srs + draft_narrative + commit_srs: \
+la version nueva re-proyecta trazabilidad y conteos desde el store vivo. \
+NUNCA re-corras el pipeline completo por una curacion: infer_goals \
+reemplaza los links de los goals re-inferidos y PISA la curacion recien \
+hecha. Para vincular N pares ya decididos usa link_goals (hasta 40 \
+entradas en un llamado); infer_goal_links(req_codes) es para INFERIR los \
+links de un lote de reqs.
 
 Flujo:
 1. ORIENTAR — Confirma que hay requerimientos vivos (si no,informa al usuario \
@@ -131,6 +159,9 @@ traduzcas). Los mensajes van en español neutro.
 etapa falla reiteradamente, reportalo en vez de entrar en loop.
 - Tras commit_srs el SRS queda en estado CANDIDATE; el usuario lo revisa \
 (edita narrativa, marca pendientes) y lo cierra (LOCKED) desde la UI.
+- Las versiones se pueden DESCARTAR (discard_srs_version o la UI): una \
+versión DISCARDED queda listada pero deja de ser la «última» — el próximo \
+seed_from_last_srs siembra desde la anterior. LOCKED no se puede descartar.
 - REGLAS PERSISTENTES: el proyecto tiene consideraciones duraderas (scope srs \
 + all) que el contexto narrativo inyecta automaticamente como bloque \
 PROJECT_RULES. Si el usuario pide que un criterio de redaccion valga "de \
@@ -173,6 +204,47 @@ def _make_emitters():
             return
 
     return _emit_progress, _emit_event
+
+
+def _refresh_run_metrics(run, live: list) -> None:
+    """Re-proyecta los totales del run sobre el store vivo.
+
+    Tras un seed_from_last_srs, quality_summary/coverage son el snapshot del
+    documento sembrado: la curación posterior (merges, ediciones, reqs
+    nuevos) los deja desfasados. Esos totales alimentan el bloque «Resumen
+    del alcance especificado» de §2.1 (el determinista lo arma y
+    draft_narrative_llm lo reapende) y las métricas del contexto del
+    redactor; commit_srs re-proyecta trazabilidad y requirement_codes desde
+    el store vivo, así que sin este refresh la versión nueva mezclaba
+    conteos viejos con catálogo vivo (sesión 53: §2.1 decía 807/518 con un
+    store de 804/515 en v8, v9 y v10). goals_summary se conserva: la
+    curación de links no altera el modelo de goals; run.findings ya viene
+    filtrado de reqs no vivos por el seed.
+    """
+    coverage = dict(run.coverage or {})
+    totals = dict(coverage.get("totals") or {})
+    functional = nfr = 0
+    for it in live:
+        chars = srs_coverage.REQTYPE_TO_25010.get(it.type, [])
+        if "functional_suitability" in chars:
+            functional += 1
+        elif chars:
+            nfr += 1
+    totals["live"] = len(live)
+    totals["functional"] = functional
+    totals["nfr"] = nfr
+    coverage["totals"] = totals
+    run.coverage = coverage
+
+    findings = run.findings or []
+    summary = dict(run.quality_summary or {})
+    # Recuento real de lo que replace_findings va a persistir (calidad +
+    # cobertura), no el snapshot del documento sembrado.
+    summary["total_findings"] = len(findings)
+    summary["blockers"] = sum(
+        1 for f in findings if f.get("severity") == "blocker"
+    )
+    run.quality_summary = summary
 
 
 def _no_run(first_tool: str) -> dict[str, Any]:
@@ -221,9 +293,11 @@ def _make_stage_tools(
         y marca las etapas 1-3 como hechas, para que sigas directo a
         draft_narrative + commit_srs (una version nueva en minutos, sin
         re-juzgar cientos de enunciados). Los hallazgos conservan la curacion
-        de estado hecha en la UI. Guarda de staleness: si el store cambio
-        (conteo de vivos distinto o filas tocadas tras generated_at), rechaza
-        y pide el pipeline completo.
+        de estado hecha en la UI. Guarda de staleness: rechaza solo si el
+        solape entre los codigos del documento y los reqs vivos cae bajo el
+        50% (captura que reemplazo el store); la curacion posterior (merges,
+        ediciones, reqs nuevos, links) NO bloquea y commit_srs re-proyecta
+        trazabilidad y conteos desde el store vivo.
         """
         run = get_or_create_run(
             project_id,
@@ -237,7 +311,7 @@ def _make_stage_tools(
         except StageLoopExceeded as exc:
             return _loop_err(exc)
 
-        from sqlalchemy import func, select as sa_select
+        from sqlalchemy import select as sa_select
 
         from backend.models.requirement import RequirementItem
 
@@ -252,50 +326,54 @@ def _make_stage_tools(
                         "check_coverage -> draft_narrative -> commit_srs."
                     ),
                 }
-            live_count = await session.scalar(
-                sa_select(func.count())
-                .select_from(RequirementItem)
-                .where(
+            live_rows = await session.execute(
+                sa_select(RequirementItem.code).where(
                     RequirementItem.project_id == project_id,
                     RequirementItem.status.in_(_LIVE_STATUSES),
                 )
             )
-            max_updated = await session.scalar(
-                sa_select(func.max(RequirementItem.updated_at)).where(
-                    RequirementItem.project_id == project_id
-                )
-            )
+            live_codes = {row[0] for row in live_rows.all()}
 
-        stale: list[str] = []
-        if int(live_count or 0) != srs.requirement_count:
-            stale.append(
-                f"requerimientos vivos {int(live_count or 0)} != "
-                f"{srs.requirement_count} de la v{srs.version}"
-            )
-        if (
-            max_updated is not None
-            and srs.generated_at is not None
-            and max_updated > srs.generated_at
-        ):
-            stale.append(
-                "el store fue modificado despues de generar esa version"
-            )
-        if stale:
+        # Diff contra los codigos del documento, no conteos ni timestamps:
+        # la curacion legitima (merges, ediciones, reqs nuevos, links)
+        # cambia ambos y un guard duro bloqueaba el camino quirurgico justo
+        # despues de una curacion exitosa (sesion 53: 220 link_goal a mano,
+        # luego stale_store -> re-run que ademas pisaba los links curados).
+        doc_codes = set(srs.requirement_codes or [])
+        overlap = (
+            len(doc_codes & live_codes) / len(doc_codes) if doc_codes else 1.0
+        )
+        if overlap < 0.5:
             return {
                 "error": "stale_store",
-                "reasons": stale,
+                "reasons": [
+                    f"solape vivos/documento {len(doc_codes & live_codes)}/"
+                    f"{len(doc_codes)} (<50%): el store fue reemplazado y los "
+                    "hallazgos previos ya no representan el proyecto",
+                ],
                 "message": (
-                    "El store cambio desde el ultimo SRS; los hallazgos y goals "
-                    "previos ya no son validos. Corre el pipeline completo "
-                    "desde analyze_quality."
+                    "El store fue reemplazado por una captura nueva. Corre "
+                    "el pipeline completo desde analyze_quality."
                 ),
             }
 
         # Hallazgos PERSISTIDOS (conservan la curacion de estado de la UI).
+        # Los de reqs ya no vivos (fusionados, rechazados) se descartan: sin
+        # anclaje en la version nueva.
         async with AsyncSessionLocal() as session:
             findings = await srs_store.list_findings(session, project_id)
             code_map = await srs_store._req_code_map(session, project_id)
             finding_dicts = srs_store.findings_to_dicts(findings, code_map)
+        kept: list[dict] = []
+        dropped_codes: list[str] = []
+        for f in finding_dicts:
+            req_code = f.get("req_code")
+            if req_code is not None and req_code not in live_codes:
+                dropped_codes.append(req_code)
+                continue
+            kept.append(f)
+        finding_dicts = kept
+        new_codes = sorted(live_codes - doc_codes)
 
         # El payload persistio goals_summary anidado bajo quality_summary
         # (commit_srs lo arma asi); separarlo para el holder.
@@ -305,17 +383,29 @@ def _make_stage_tools(
         run.goals_summary = goals_summary
         run.coverage = srs.coverage
         run.findings = finding_dicts
+        # La prosa authored de la versión previa viaja en el run: sin este
+        # canal el redactor re-draftaba de cero y marcaba el documento con
+        # notas provisionales aunque el usuario pidiera el texto verbatim
+        # (sesión 53 v11). draft_narrative la reutiliza o la revisa.
+        run.narrative = dict(srs.narrative or {})
         run.stages_done.update({STAGE_QUALITY, STAGE_GOALS, STAGE_COVERAGE})
 
         return {
             "stage": STAGE_SEED,
             "reused_from_version": srs.version,
+            "narrative_carried": bool(run.narrative),
             "findings_reused": len(finding_dicts),
+            "findings_dropped": len(dropped_codes),
+            "dropped_finding_codes": dropped_codes[:20],
+            "new_requirements": len(new_codes),
             "stages_done": sorted(run.stages_done),
             "message": (
-                f"Run sembrado desde la v{srs.version}: calidad, goals y "
-                "cobertura reutilizados. Continua con draft_narrative y "
-                "commit_srs para persistir la version nueva."
+                f"Run sembrado desde la v{srs.version}: calidad, goals, "
+                "cobertura y narrativa authored reutilizados. Continua con "
+                "draft_narrative (sin instrucciones conserva el texto "
+                "verbatim; con instrucciones lo revisa sobre esa base) y "
+                "commit_srs: la version nueva re-proyecta trazabilidad, "
+                "conteos y markdown desde el store vivo."
             ),
         }
 
@@ -443,6 +533,217 @@ falla devuelve ``error`` (sin degradar a un modelo vacío).
         }
 
     @tool
+    async def infer_goal_links(req_codes: list[str]) -> dict:
+        """Re-infiere links goal<->req SOLO para los requerimientos pedidos.
+
+        Camino quirúrgico para completar o corregir la trazabilidad de unos
+        pocos requerimientos: usa los goals YA PERSISTIDOS (códigos GOAL-XXXX
+        reales, curación humana incluida) y vincula únicamente esos reqs. NO
+        re-corra infer_goals entera para arreglar links puntuales: el upsert
+        reemplazaría los links de TODOS los goals de la nueva inferencia.
+        Idempotente: la arista que ya existe no se duplica. Requiere goals
+        previos (infer_goals); sin ellos devuelve error.
+
+        Args:
+            req_codes: códigos REQ-XXXX de los requerimientos a vincular.
+        """
+        on_progress, _on_event = _make_emitters()
+
+        async def _report(phase: str, done: int, total: int) -> None:
+            await on_progress(STAGE_GOALS, f"{phase}: {done}/{total}")
+
+        try:
+            async with AsyncSessionLocal() as session:
+                return await goals_engine.infer_goal_links_incremental(
+                    session, project_id, req_codes, on_progress=_report
+                )
+        except goals_engine.GoalsInferenceError as exc:
+            logger.error(
+                "infer_goal_links falló en project %s: %s", project_id, exc
+            )
+            return {"error": f"infer_goal_links: {exc}"}
+
+    @tool
+    async def link_goal(
+        goal_code: str,
+        req_code: str,
+        relation: str,
+        rationale: str | None = None,
+    ) -> dict:
+        """Vincula a mano un goal (GOAL-XXXX) con un requerimiento (REQ-XXXX).
+
+        Idempotente: si la arista ya existe, se actualiza el rationale y
+        devuelve created=False. Para aristas puntuales; para lotes de reqs
+        use infer_goal_links.
+
+        Args:
+            goal_code: código GOAL-XXXX del goal.
+            req_code: código REQ-XXXX del requerimiento.
+            relation: tipo de vínculo (realizes | contributes | conflicts).
+            rationale: motivo breve del vínculo (opcional).
+        """
+        try:
+            rel = LinkRelation(relation)
+        except ValueError:
+            return {
+                "error": "invalid_relation",
+                "message": (
+                    f"relation invalida: {relation!r}. Valores: "
+                    f"{[r.value for r in LinkRelation]}"
+                ),
+            }
+        from backend.agents.tools.requirements_tools import _code_to_id
+
+        async with AsyncSessionLocal() as session:
+            goals = await srs_store.list_goals(session, project_id)
+            goal = next((g for g in goals if g.code == goal_code), None)
+            if goal is None:
+                return {
+                    "error": "goal_not_found",
+                    "message": f"No existe {goal_code} en el proyecto.",
+                }
+            try:
+                req_id = await _code_to_id(session, project_id, req_code)
+            except KeyError:
+                return {
+                    "error": "requirement_not_found",
+                    "message": f"No existe {req_code} en el proyecto.",
+                }
+            result = await srs_store.add_goal_link(
+                session,
+                project_id,
+                goal_id=goal.id,
+                req_id=req_id,
+                relation=rel,
+                rationale=rationale,
+            )
+        return {"goal": goal.code, "requirement": req_code, **result}
+
+    @tool
+    async def link_goals(entries: list[dict]) -> dict:
+        """Vincula en UN llamado un lote de pares goal <-> req ya decididos.
+
+        Camino de lote para la curacion de trazabilidad cuando ya se sabe que
+        aristas crear: cada entrada es {goal_code, req_code, relation,
+        rationale?}. Idempotente por (goal, req, relation): la arista que ya
+        existia se actualiza (rationale) y cuenta como updated. Los errores
+        individuales (relation invalida, goal/req inexistente) se reportan
+        por fila sin abortar el resto del lote. Para INFERIR links de un
+        lote de reqs use infer_goal_links; para una arista suelta, link_goal.
+
+        Args:
+            entries: hasta 40 entradas {goal_code, req_code, relation, rationale?}.
+        """
+        max_entries = 40
+        if len(entries) > max_entries:
+            return {
+                "error": "too_many_entries",
+                "max_entries": max_entries,
+                "message": (
+                    f"Recibidas {len(entries)} entradas; divida el lote en "
+                    f"llamados de hasta {max_entries}."
+                ),
+            }
+        from backend.agents.tools.requirements_tools import _code_to_id
+
+        async with AsyncSessionLocal() as session:
+            goals = await srs_store.list_goals(session, project_id)
+            goal_by_code = {g.code: g for g in goals}
+            created = updated = 0
+            errors: list[dict] = []
+            for i, entry in enumerate(entries):
+                goal_code = entry.get("goal_code")
+                req_code = entry.get("req_code")
+                relation = entry.get("relation")
+                rationale = entry.get("rationale")
+                try:
+                    rel = LinkRelation(relation)
+                except ValueError:
+                    errors.append({
+                        "index": i, "goal": goal_code, "req": req_code,
+                        "error": "invalid_relation",
+                    })
+                    continue
+                goal = goal_by_code.get(goal_code)
+                if goal is None:
+                    errors.append({
+                        "index": i, "goal": goal_code, "req": req_code,
+                        "error": "goal_not_found",
+                    })
+                    continue
+                try:
+                    req_id = await _code_to_id(session, project_id, req_code)
+                except KeyError:
+                    errors.append({
+                        "index": i, "goal": goal_code, "req": req_code,
+                        "error": "requirement_not_found",
+                    })
+                    continue
+                result = await srs_store.add_goal_link(
+                    session,
+                    project_id,
+                    goal_id=goal.id,
+                    req_id=req_id,
+                    relation=rel,
+                    rationale=rationale,
+                )
+                if result["created"]:
+                    created += 1
+                else:
+                    updated += 1
+        return {
+            "linked": created + updated,
+            "created": created,
+            "updated": updated,
+            "errors": errors,
+        }
+
+    @tool
+    async def unlink_goal(goal_code: str, req_code: str, relation: str) -> dict:
+        """Desvincula un goal (GOAL-XXXX) de un requerimiento (REQ-XXXX).
+
+        Args:
+            goal_code: código GOAL-XXXX del goal.
+            req_code: código REQ-XXXX del requerimiento.
+            relation: tipo de vínculo a remover (realizes | contributes | conflicts).
+        """
+        try:
+            rel = LinkRelation(relation)
+        except ValueError:
+            return {
+                "error": "invalid_relation",
+                "message": (
+                    f"relation invalida: {relation!r}. Valores: "
+                    f"{[r.value for r in LinkRelation]}"
+                ),
+            }
+        from backend.agents.tools.requirements_tools import _code_to_id
+
+        async with AsyncSessionLocal() as session:
+            goals = await srs_store.list_goals(session, project_id)
+            goal = next((g for g in goals if g.code == goal_code), None)
+            if goal is None:
+                return {
+                    "error": "goal_not_found",
+                    "message": f"No existe {goal_code} en el proyecto.",
+                }
+            try:
+                req_id = await _code_to_id(session, project_id, req_code)
+            except KeyError:
+                return {
+                    "error": "requirement_not_found",
+                    "message": f"No existe {req_code} en el proyecto.",
+                }
+            removed = await srs_store.remove_goal_link(
+                session,
+                project_id,
+                goal_id=goal.id,
+                req_id=req_id,
+                relation=rel,
+            )
+        return {"goal": goal.code, "requirement": req_code, "removed": removed}
+
+    @tool
     async def check_coverage() -> dict:
         """Etapa 3/4: auditoría de cobertura (ISO 25010 + 29148 + goals).
 
@@ -492,8 +793,13 @@ Acumula hallazgos de cobertura en el holder. Emite ``coverage.report``.
 
         Genera prosa para propósito, alcance, definiciones, referencias, \
 perspectiva, usuarios, entorno operativo y supuestos, usando contexto RAG \
-de los documentos fuente de captura. Preserva las secciones deterministas \
+de los documentos fuente de captura y el catálogo de actores definidos en \
+la captura (la prosa de usuarios se ancla a esos roles). Preserva las \
+secciones deterministas \
 (overview, features) y reapende el bloque de conteos a la perspectiva. \
+Si el run viene sembrado (seed_from_last_srs), SIN instrucciones conserva \
+la prosa authored previa VERBATIM (solo re-proyecta conteos y deterministas; \
+no llama al redactor) y CON instrucciones la revisa sobre esa base. \
 Emite ``narrative.drafted`` al terminar.
 
         Args:
@@ -531,12 +837,21 @@ pidio ajustar.
                 items = await list_requirements(
                     session, project_id, include_deleted=True
                 )
+                from backend.services import actor_store
+
+                actors_block_text = await actor_store.actors_block(
+                    session, project_id
+                )
             live = [it for it in items if it.status in _LIVE_STATUSES]
+            # El bloque de conteos y las métricas del redactor salen del run:
+            # tras un seed, re-proyectarlos al store vivo (sesión 53).
+            _refresh_run_metrics(run, live)
             goal_groups = await _functional_goal_groups(
                 session, project_id, live
             )
 
-            # Narrativa determinista como base/fallback.
+            # Narrativa determinista fresca del store vivo (bloque de conteos,
+            # overview, features 2.2 agrupadas por goals actuales).
             det_narrative = _draft_narrative(
                 run.project_name,
                 run.project_description,
@@ -546,19 +861,38 @@ pidio ajustar.
                 len(live),
                 live_items=live,
                 goal_groups=goal_groups,
+                actors_block_text=actors_block_text,
             )
-            # Enriquecer con LLM (fallback determinista on failure).
-            narrative = await draft_narrative_llm(
-                det_narrative,
-                project_id=project_id,
-                project_name=run.project_name,
-                project_description=run.project_description,
-                live_items=live,
-                quality_summary=run.quality_summary or {},
-                coverage=run.coverage or {},
-                goals_summary=run.goals_summary or {},
-                instructions=instructions,
-            )
+            if run.narrative and not instructions:
+                # Reuso verbatim: prosa authored de la versión sembrada +
+                # deterministas frescos. Sin LLM (sesión 53 v11: el redactor
+                # no tenía la base y marcaba el texto con notas provisionales).
+                narrative = _carryover_narrative(run.narrative, det_narrative)
+                mode = "reused_previous"
+            else:
+                # Con instrucciones sobre un run sembrado el redactor recibe
+                # el texto previo como base a revisar; en pipeline completo
+                # redacta desde cero. El fallback del LLM es la base pasada.
+                base = (
+                    _carryover_narrative(run.narrative, det_narrative)
+                    if run.narrative
+                    else det_narrative
+                )
+                narrative = await draft_narrative_llm(
+                    base,
+                    project_id=project_id,
+                    project_name=run.project_name,
+                    project_description=run.project_description,
+                    live_items=live,
+                    quality_summary=run.quality_summary or {},
+                    coverage=run.coverage or {},
+                    goals_summary=run.goals_summary or {},
+                    instructions=instructions,
+                    previous_narrative=run.narrative,
+                )
+                mode = (
+                    "revised_previous" if run.narrative else "drafted_fresh"
+                )
         except Exception as exc:  # noqa: BLE001 — surface al modelo
             logger.exception("draft_narrative failed")
             return {"error": f"draft_narrative failed: {exc}"}
@@ -578,6 +912,7 @@ pidio ajustar.
 
         return {
             "stage": STAGE_NARRATIVE,
+            "mode": mode,
             "subsections": 8,
             "remaining_placeholders": placeholders,
             "instructions_received": bool(instructions),
@@ -622,6 +957,10 @@ y limpia el holder.
                 traceability = await srs_store.build_traceability(session, project_id)
                 items = await list_requirements(session, project_id, include_deleted=True)
                 live = [it for it in items if it.status in _LIVE_STATUSES]
+                # Mismo refresh: si el store cambió entre draft y commit, el
+                # payload (quality_summary/coverage persistidos) y los números
+                # del srs.ready no quedan del snapshot del seed.
+                _refresh_run_metrics(run, live)
                 # Narrativa editable: usa la del stage narrative si existe,
                 # si no, genera el borrador determinista como fallback.
                 if run.narrative is not None:
@@ -691,13 +1030,52 @@ y limpia el holder.
             ),
         }
 
+    @tool
+    async def discard_srs_version(version: int) -> dict:
+        """Descarta una version del SRS (soft): la fila queda como DISCARDED.
+
+        Usalo cuando el usuario pida descartar/eliminar una version (tipico:
+        versiones con prosa en mal estado que no quiere como base). La fila NO
+        se borra, la numeracion nunca se reutiliza, y la version descartada
+        deja de ser la «ultima»: el proximo seed_from_last_srs siembra desde
+        la version anterior. LOCKED no se puede descartar.
+        """
+        try:
+            async with AsyncSessionLocal() as session:
+                discarded = await srs_store.discard_srs_version(
+                    session, project_id, version
+                )
+                latest = await srs_store.get_latest_srs(session, project_id)
+        except KeyError:
+            return {
+                "error": "not_found",
+                "message": f"No existe la version {version} del SRS.",
+            }
+        except ValueError as exc:
+            return {"error": "discard_rejected", "message": str(exc)}
+        return {
+            "discarded_version": discarded.version,
+            "status": discarded.status.value,
+            "new_latest_version": latest.version if latest else None,
+            "message": (
+                f"Version {discarded.version} descartada. La «ultima» ahora "
+                f"es la v{latest.version if latest else '-'}: el proximo "
+                "seed_from_last_srs siembra desde ahi."
+            ),
+        }
+
     return [
         seed_from_last_srs,
         analyze_quality,
         infer_goals,
+        infer_goal_links,
+        link_goal,
+        link_goals,
+        unlink_goal,
         check_coverage,
         draft_narrative,
         commit_srs,
+        discard_srs_version,
     ]
 
 

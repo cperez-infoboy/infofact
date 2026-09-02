@@ -114,6 +114,102 @@ async def test_no_instructions_no_block(monkeypatch):
     assert "INDICACIONES DEL USUARIO" not in user_msg
 
 
+# --- assembler: el catálogo de actores llega al prompt del redactor ----------
+
+
+async def _make_project_db(monkeypatch):
+    """DB temporal con un proyecto; devuelve el sessionmaker."""
+    tmp = tempfile.TemporaryDirectory()
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{Path(tmp.name) / 't.db'}"
+    )
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    sm = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    monkeypatch.setattr("backend.database.AsyncSessionLocal", sm)
+    async with sm() as session:
+        proj = Project(user_id=1, name="p", slug="p", description="t")
+        session.add(proj)
+        await session.commit()
+        proj_id = proj.id
+    return tmp, engine, sm, proj_id
+
+
+@pytest.mark.asyncio
+async def test_actor_catalog_reaches_the_narrator_prompt(monkeypatch):
+    """Con catálogo, el bloque PROJECT_ACTORS entra al contexto del redactor
+    (§2.4 usuarios se ancla a los roles canonizados en la captura)."""
+    from backend.services import actor_store
+
+    tmp, engine, sm, proj_id = await _make_project_db(monkeypatch)
+    try:
+        async with sm() as session:
+            await actor_store.upsert_actors(
+                session,
+                proj_id,
+                [{
+                    "name": "Coordinador de terreno",
+                    "channel": "humano",
+                    "synonyms": ["Coordinador"],
+                }],
+            )
+            await session.commit()
+
+        captured = {}
+
+        def _fake_structured_llm(schema):
+            runner = _CaptureRunner(schema)
+            captured["runner"] = runner
+            return runner
+
+        monkeypatch.setattr(
+            "backend.services.srs_assembler.structured_llm", _fake_structured_llm
+        )
+
+        await draft_narrative_llm(
+            _full_narrative(),
+            project_id=proj_id, project_name="p", project_description="d",
+            live_items=[], quality_summary={}, coverage={}, goals_summary={},
+        )
+        user_msg = captured["runner"].messages[1][1]
+        assert "Actores del proyecto (catálogo definido en la captura)" in user_msg
+        assert "PROJECT_ACTORS" in user_msg
+        assert "R1 Coordinador de terreno (humano)" in user_msg
+    finally:
+        await engine.dispose()
+        tmp.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_no_actor_catalog_no_block(monkeypatch):
+    """Sin catálogo, el contexto no menciona actores y el redactor sigue
+    infiriendo de fragmentos (comportamiento previo)."""
+    tmp, engine, sm, proj_id = await _make_project_db(monkeypatch)
+    try:
+        captured = {}
+
+        def _fake_structured_llm(schema):
+            runner = _CaptureRunner(schema)
+            captured["runner"] = runner
+            return runner
+
+        monkeypatch.setattr(
+            "backend.services.srs_assembler.structured_llm", _fake_structured_llm
+        )
+
+        await draft_narrative_llm(
+            _full_narrative(),
+            project_id=proj_id, project_name="p", project_description="d",
+            live_items=[], quality_summary={}, coverage={}, goals_summary={},
+        )
+        user_msg = captured["runner"].messages[1][1]
+        assert "Actores del proyecto" not in user_msg
+        assert "PROJECT_ACTORS" not in user_msg
+    finally:
+        await engine.dispose()
+        tmp.cleanup()
+
+
 # --- tool: la instrucción se reenvía al redactor ------------------------------
 
 
@@ -146,7 +242,7 @@ async def test_draft_narrative_tool_forwards_instructions(monkeypatch):
 
         seen: dict = {}
 
-        async def _fake_det(*_a, **_k):
+        def _fake_det(*_a, **_k):
             return {"intro.purpose": "det"}
 
         async def _fake_llm(_narrative, **kwargs):
