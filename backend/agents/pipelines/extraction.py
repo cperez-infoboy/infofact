@@ -683,6 +683,94 @@ async def extract_conventions(
     return rules
 
 
+class ActorCandidate(BaseModel):
+    """Un actor evidenciado por un documento (rol humano o sistema externo)."""
+
+    name: str = Field(
+        description="Canonical role in the document's language, singular "
+        "(e.g. 'Coordinador de terreno').",
+    )
+    synonyms: list[str] = Field(
+        default_factory=list,
+        description="Other names the document uses for the same role.",
+    )
+    channel: str | None = Field(
+        default=None,
+        description="'humano' for a human role, 'sistema_externo' for "
+        "external systems/services.",
+    )
+    rationale: str | None = Field(
+        default=None,
+        description="At most 12 words citing the evidence.",
+    )
+
+
+class ActorCatalog(BaseModel):
+    """Salida de la pasada de actores por documento (vacía si no evidencia)."""
+
+    actors: list[ActorCandidate] = Field(default_factory=list)
+
+
+_ACTORS_SYSTEM = (
+    "You are a requirements analyst identifying the ACTORS of a software "
+    "system (UML actors: human roles and external systems that interact with "
+    "the system under specification).\n\n"
+    "You receive ONE project document. Extract the actors it EVIDENCES:\n"
+    "- name: canonical role in the SAME LANGUAGE as the document, singular "
+    "(e.g. 'Coordinador de terreno').\n"
+    "- synonyms: other names the document uses for the same role.\n"
+    "- channel: 'humano' for a human role; 'sistema_externo' for external "
+    "systems or integration services.\n"
+    "- rationale: at most 12 words citing the evidence.\n\n"
+    "Rules:\n"
+    "- Only actors evidenced by the document text. Never invent roles.\n"
+    "- Do NOT emit 'usuario'/'user' as an actor: that generic label is "
+    "exactly the vagueness this catalog fixes. Resolve it to the concrete "
+    "role the document describes; if the document names no concrete roles, "
+    "return an empty list.\n"
+    "- Do NOT emit the system under specification itself as an actor.\n"
+    "- LANGUAGE: names, synonyms and rationale stay in the document's "
+    "language. Never translate.\n"
+    "- Return ONLY the structured object."
+)
+
+
+async def extract_actors(
+    smap: StructureMap,
+    *,
+    project_name: str,
+    project_description: str,
+) -> ActorCatalog:
+    """Una llamada LLM por documento que identifica los actores que evidencia.
+
+    Espejo de ``extract_conventions`` (misma degradación grácil): lee
+    ``smap.full_text`` y devuelve un :class:`ActorCatalog`; cualquier fallo
+    (LLM, parse, texto ausente) devuelve un catálogo vacío — esta etapa NUNCA
+    rompe el pipeline. Sin catálogo, los consumidores siguen con el léxico
+    base de ``detect_actor``.
+    """
+    if not smap.full_text or not smap.full_text.strip():
+        return ActorCatalog()
+
+    try:
+        llm = _structured_llm(ActorCatalog)
+        body = _truncate_for_conventions(smap.full_text)
+        user = (
+            f"{_project_header(project_name, project_description)}\n"
+            f"DOCUMENT TEXT (markdown export):\n{body}"
+        )
+        return await llm.ainvoke(
+            [("system", _ACTORS_SYSTEM), ("human", user)]
+        )
+    except Exception:
+        logger.exception(
+            "extract_actors failed for %s; returning empty catalog "
+            "(pipeline continues with the base actor lexicon)",
+            smap.document_id,
+        )
+        return ActorCatalog()
+
+
 def merge_conventions(per_doc: list[DocumentRules]) -> DocumentRules:
     """Deterministic merge of per-document rules into one run-level object.
 

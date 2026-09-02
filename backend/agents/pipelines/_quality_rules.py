@@ -61,6 +61,9 @@ VAGUE_TERMS = [
     "user-friendly", "fast", "efficient", "robust", "friendly", "easy",
     "intuitive", "flexible", "appropriate", "adequate", "optimal", "modern",
     " scalable", "reliable", "high performance", "good",
+    # Promesas no accionables (obs_2: «el sistema debe considerar/contemplar X»
+    # no compromete nada verificable).
+    "considerar", "contemplar", "consider", "take into account",
 ]
 
 # NFR que exigen un target medible (número / umbral / unidad), por valor de ReqType.
@@ -73,6 +76,57 @@ _NUMBER_RE = re.compile(
 
 # Enunciado muy largo -> probablemente agrupa varios requerimientos.
 TOO_LONG_CHARS = 220
+
+# --- Actores (obs §1 de Planitrack: roles mal asignados / «el sistema debe») -
+
+# Léxico base de roles canónicos (minúsculas). El catálogo propio del proyecto
+# se suma vía ``role_terms`` (futuro ProjectActor). NO incluye «sistema»: el
+# sistema como ejecutor de una capacidad de usuario es justo el smell que
+# buscamos; si el ejecutor es genuinamente la máquina, el hallazgo pide
+# justificarlo, no lo prohibe.
+ROLE_TERMS = [
+    "administrador del tenant", "administrador", "supervisor", "coordinador",
+    "gestor de terreno", "gestor", "operador de flota", "operador",
+    "personal administrativo", "cliente final", "cliente", "destinatario",
+    "auditor", "gerente", "dueño", "propietario", "visitante", "invitado",
+    "analista", "aprobador", "solicitante", "responsable", "encargado",
+    "conductor", "chofer", "integración externa", "servicio externo",
+]
+
+# Usuario genérico: no identifica ni rol ni canal ni responsabilidad.
+GENERIC_USER_RE = re.compile(
+    r"\b(los\s+usuarios?|el\s+usuario|users?)\b", re.IGNORECASE
+)
+
+# Marcadores de enunciado paraguas: prometen cobertura total en una sola frase.
+UMBRELLA_MARKER_RE = re.compile(
+    r"todos\s+los\s+aspectos|todas\s+las\s+funcionalidades|de\s+manera\s+completa"
+    r"|gesti[oó]n\s+completa|administraci[oó]n\s+completa|todas\s+las\s+tareas",
+    re.IGNORECASE,
+)
+
+# Verbos que inician una capacidad enumerable (infinitivos ES + EN básicos).
+UMBRELLA_VERBS = frozenset({
+    "crear", "editar", "eliminar", "modificar", "consultar", "exportar",
+    "importar", "generar", "enviar", "descargar", "visualizar", "registrar",
+    "asignar", "configurar", "aprobar", "rechazar", "autorizar", "imprimir",
+    "notificar", "buscar", "filtrar", "ordenar", "archivar", "restaurar",
+    "validar", "calcular", "mostrar", "listar", "actualizar", "cargar",
+    "guardar", "firmar", "reenviar", "conciliar", "cruzar", "auditar",
+})
+
+# Umbral: >= 3 capacidades enumeradas en una frase => paraguas.
+UMBRELLA_MIN_ACTIONS = 3
+
+# Reglas deterministas completas: se pueden re-verificar sobre el texto sin
+# LLM. Los consumidores (edición de requerimientos) cierran el hallazgo OPEN
+# cuya regla dejó de disparar tras una edición.
+DETERMINISTIC_RULE_IDS = frozenset({
+    "incose.modal_missing", "smell.negation", "smell.combinator",
+    "smell.vague_term", "smell.pronoun", "smell.absolute",
+    "incose.too_long", "incose.unmeasurable_nfr", "ears.missing_condition",
+    "smell.actor_missing", "actor.generic_user", "smell.umbrella",
+})
 
 
 @dataclass(frozen=True)
@@ -105,13 +159,47 @@ def detect_ears_pattern(statement: str) -> str | None:
     return None
 
 
+def detect_actor(
+    statement: str, role_terms: list[str] | None = None
+) -> str:
+    """Clasifica el actor mencionado: ``named`` | ``generic`` | ``none``.
+
+    ``role_terms`` suma los roles canónicos del proyecto al léxico base. Un
+    rol específico gana aunque el texto también mencione al «usuario» genérico.
+    """
+    lower = statement.lower()
+    for term in ROLE_TERMS + [t.lower() for t in (role_terms or [])]:
+        if re.search(rf"\b{re.escape(term)}\b", lower):
+            return "named"
+    if GENERIC_USER_RE.search(lower):
+        return "generic"
+    return "none"
+
+
+def _enumerated_actions(text: str) -> int:
+    """Segmentos de la enumeración que arrancan con un verbo de acción."""
+    count = 0
+    for seg in re.split(r",|;|\by\b|\be\b|/", text.lower()):
+        words = seg.strip().split(maxsplit=1)
+        if words and words[0] in UMBRELLA_VERBS:
+            count += 1
+    return count
+
+
 def programmatic_findings_for_text(
-    statement: str, *, req_type: str | None = None
+    statement: str,
+    *,
+    req_type: str | None = None,
+    role_terms: list[str] | None = None,
 ) -> list[ProgrammaticFinding]:
     """Pre-checks deterministas sobre el texto de un enunciado. Cero LLM.
 
     ``req_type`` habilita ``incose.unmeasurable_nfr``; ``None`` la omite (caso
-    captura pre-clasificación, donde el tipo aún no existe).
+    captura pre-clasificación, donde el tipo aún no existe). Las reglas de
+    actor (``smell.actor_missing`` / ``actor.generic_user``) exigen además
+    ``req_type == "functional"``: un NFR no lleva actor de negocio, y en
+    captura lo cubre la prevención (PREVENTION_RULES). ``role_terms`` suma el
+    catálogo de roles del proyecto al léxico base.
     """
     text = statement or ""
     findings: list[ProgrammaticFinding] = []
@@ -238,6 +326,66 @@ def programmatic_findings_for_text(
             )
         )
 
+    # Actores: solo funcionales con tipo confirmado (ver docstring).
+    if req_type == "functional":
+        actor = detect_actor(text, role_terms)
+        if actor == "none":
+            findings.append(
+                ProgrammaticFinding(
+                    rule_id="smell.actor_missing",
+                    dimension="requirement_smell",
+                    severity="major",
+                    message=(
+                        "El enunciado no nombra el rol que ejecuta la acción o "
+                        "se beneficia de ella (típico «El sistema debe...»). "
+                        "Nombrar el rol canónico del proyecto; si el ejecutor "
+                        "es genuinamente el sistema (job programado, "
+                        "integración externa), justificarlo en la observación; "
+                        "si la fuente no lo permite, usar [ROL-PENDIENTE] — "
+                        "nunca inventar un rol que el documento no menciona."
+                    ),
+                    suggestion=None,
+                )
+            )
+        elif actor == "generic":
+            findings.append(
+                ProgrammaticFinding(
+                    rule_id="actor.generic_user",
+                    dimension="requirement_smell",
+                    severity="minor",
+                    message=(
+                        "Actor genérico «usuario»: no identifica responsabilidad "
+                        "ni canal. Reemplazar por el rol canónico que corresponda."
+                    ),
+                    suggestion=None,
+                )
+            )
+
+    # Enunciado paraguas: promete varias capacidades en una sola frase.
+    actions = _enumerated_actions(text)
+    if actions >= UMBRELLA_MIN_ACTIONS or UMBRELLA_MARKER_RE.search(text):
+        if actions >= UMBRELLA_MIN_ACTIONS:
+            detail = f"enumera {actions} capacidades"
+        else:
+            detail = (
+                "usa marcadores de cobertura total («todos los aspectos», "
+                "«de manera completa»)"
+            )
+        findings.append(
+            ProgrammaticFinding(
+                rule_id="smell.umbrella",
+                dimension="requirement_smell",
+                severity="major",
+                message=(
+                    f"Enunciado paraguas: {detail}. Un requerimiento por "
+                    "capacidad (dividir con split_requirement). Si el cliente "
+                    "pidió conservarlo agrupado, hacer waive del hallazgo y "
+                    "registrar la decisión como regla del proyecto."
+                ),
+                suggestion=None,
+            )
+        )
+
     # EARS: si parece condicional pero no encaja en una plantilla -> INFO.
     looks_conditional = any(
         w in lower for w in ("cuando ", "when ", "mientras ", "while ", "si ", "if ")
@@ -294,4 +442,18 @@ PREVENTION_RULES = (
     "    * LANGUAGE (MANDATORY): write the statement in the SAME LANGUAGE as the "
     "source_span. Do NOT translate, normalize to English, or mix languages. A "
     "Spanish source_span yields a Spanish statement — including EARS phrasing.\n"
+    "    * ACTOR (MANDATORY in functional requirements): name the canonical role "
+    "that performs the action or receives its benefit — p. ej. «El supervisor "
+    "debe...», «El administrador del tenant debe...». NEVER leave a user-facing "
+    "capability as «El sistema debe...» and NEVER use a bare «usuario»: pick the "
+    "specific role. If the source_span truly does not allow naming the role, "
+    "write [ROL-PENDIENTE] as the actor — NEVER invent a role the documents do "
+    "not mention. Non-functional requirements (performance, security, ...) do "
+    "NOT need a business actor.\n"
+    "    * NO UMBRELLA STATEMENTS: never bundle several capabilities into one "
+    "sentence («gestionar X: crear, editar, eliminar...», «todos los aspectos "
+    "de Y», «de manera completa»). One capability per statement. If the client "
+    "explicitly asked to keep a grouped capability, keep it but add an "
+    "observation saying so — the check flags it as smell.umbrella for an "
+    "explicit keep-or-split decision.\n"
 )

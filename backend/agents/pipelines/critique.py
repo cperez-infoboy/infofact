@@ -528,8 +528,8 @@ def _apply_quality_flags(
     AUTORITATIVA sobre el veredicto del crítico, sin depender de que el LLM los
     detecte. Cero llamadas LLM extra (la crítica ya se ejecutaba por ítem).
 
-    - ``smell.combinator`` fuerza ``atomic="fix"`` (respalda el split que el
-      crítico ya puede proponer).
+    - ``smell.combinator`` / ``smell.umbrella`` fuerzan ``atomic="fix"``
+      (respaldan el split que el crítico ya puede proponer).
     - ``smell.vague_term`` / ``smell.absolute`` / ``incose.unmeasurable_nfr``
       fuerzan ``verifiable="flag"`` (la cuantificación queda para el humano o
       el crítico LLM).
@@ -541,7 +541,9 @@ def _apply_quality_flags(
         return verdict
 
     rule_ids = {f.rule_id for f in flags}
-    atomic = "fix" if "smell.combinator" in rule_ids else verdict.atomic
+    atomic = (
+        "fix" if rule_ids & {"smell.combinator", "smell.umbrella"} else verdict.atomic
+    )
     verifiable = (
         "flag"
         if rule_ids & {"smell.vague_term", "smell.absolute", "incose.unmeasurable_nfr"}

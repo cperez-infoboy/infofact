@@ -24,6 +24,11 @@ from langchain_core.tools import tool
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.agents.pipelines._quality_rules import (
+    DETERMINISTIC_RULE_IDS,
+    detect_actor,
+    programmatic_findings_for_text,
+)
 from backend.database import AsyncSessionLocal
 from backend.models.requirement import (
     Priority,
@@ -32,8 +37,16 @@ from backend.models.requirement import (
     ReqStatus,
     ReqType,
     RequirementItem,
+    RequirementRevision,
 )
-from backend.services import requirement_store as store
+from backend.models.srs import FindingStatus, RequirementFinding
+from backend.services import actor_store, requirement_store as store
+
+# Lotes máximos por llamada: el antídoto del N+1 (la sesión 8 de Planitrack
+# hizo 806 get_requirement + 296 update_requirement item-por-item).
+MAX_BATCH_GET = 100
+MAX_BULK_UPDATE = 50
+DEFAULT_LIST_LIMIT = 100
 
 ReqTypeValue = Literal[
     "functional", "performance", "security", "usability",
@@ -107,8 +120,26 @@ async def _parent_code_map(
     return {row_id: code for row_id, code in rows.all()}
 
 
+async def _catalog_role_terms(
+    session: AsyncSession, project_id: int
+) -> list[str] | None:
+    """Léxico de roles del catálogo ProjectActor (best-effort, None si vacío).
+
+    Detect_actor y los pre-checks lo suman a su léxico base: un enunciado
+    que arranca con un rol del catálogo cuenta como actor nombrado aunque el
+    texto también contenga «usuario».
+    """
+    try:
+        terms = await actor_store.actor_role_terms(session, project_id)
+    except Exception:  # noqa: BLE001
+        return None
+    return terms or None
+
+
 def _item_summary(
-    item: RequirementItem, parent_codes: dict[int, str] | None = None
+    item: RequirementItem,
+    parent_codes: dict[int, str] | None = None,
+    role_terms: list[str] | None = None,
 ) -> dict[str, Any]:
     return {
         "id": item.id,
@@ -124,6 +155,9 @@ def _item_summary(
         "parent_code": (parent_codes or {}).get(item.parent_id),
         "derived": bool(item.derived),
         "confidence": item.confidence,
+        # named (rol específico) | generic («el usuario») | none («el sistema»
+        # o nada): permite al agente ubicar y corregir los actores en lote.
+        "actor": detect_actor(item.statement, role_terms=role_terms),
     }
 
 
@@ -147,16 +181,24 @@ def make_requirements_read_tools(project_id: int) -> list:
         type: ReqTypeValue | None = None,
         priority: PriorityValue | None = None,
         document: str | None = None,
+        query: str | None = None,
+        has_actor: bool | None = None,
+        limit: int = DEFAULT_LIST_LIMIT,
         include_deleted: bool = False,
     ) -> dict:
         """List requirements in the project, optionally filtered.
 
         Soft-deleted rows (rejected / merged / superseded) are hidden unless
         include_deleted is true. `document` filters by source document
-        (substring, case-insensitive) with the same semantics as a scoped
-        grouping review. Each summary carries code, statement, type, priority,
-        status, source_documents, parent_code/derived and confidence — so
-        traceability questions do NOT require one get_requirement per item.
+        (substring, case-insensitive). `query` filters by statement substring
+        (case-insensitive). `has_actor` keeps only items whose statement names
+        a specific role (true), only items without any actor or with a bare
+        «usuario» (false), or all (unset). `limit` caps the returned items
+        while `count` keeps the filter total: when truncated is true, refine
+        the filters instead of paging blindly. Each summary carries code,
+        statement, type, priority, status, actor (named/generic/none),
+        source_documents, parent_code/derived and confidence — traceability
+        questions do NOT require one get_requirement per item.
         """
         try:
             async with AsyncSessionLocal() as session:
@@ -172,10 +214,36 @@ def make_requirements_read_tools(project_id: int) -> list:
                     items = [
                         it for it in items if _item_in_document(it, document)
                     ]
+                if query:
+                    needle = query.strip().lower()
+                    items = [
+                        it for it in items
+                        if needle in (it.statement or "").lower()
+                    ]
+                role_terms = await _catalog_role_terms(session, project_id)
+                if has_actor is not None:
+                    # true = solo los que nombran un rol específico; false =
+                    # la cola de trabajo (actor genérico o ausente).
+                    items = [
+                        it
+                        for it in items
+                        if (
+                            detect_actor(it.statement, role_terms=role_terms)
+                            == "named"
+                        )
+                        == has_actor
+                    ]
+                total = len(items)
+                truncated = total > limit
+                items = items[:limit]
                 parents = await _parent_code_map(session, project_id, items)
                 return {
-                    "count": len(items),
-                    "items": [_item_summary(it, parents) for it in items],
+                    "count": total,
+                    "truncated": truncated,
+                    "items": [
+                        _item_summary(it, parents, role_terms=role_terms)
+                        for it in items
+                    ],
                 }
         except Exception as exc:  # noqa: BLE001
             return {"error": f"list_requirements failed: {exc}"}
@@ -200,6 +268,86 @@ def make_requirements_read_tools(project_id: int) -> list:
                 return detail
         except Exception as exc:  # noqa: BLE001
             return {"error": f"get_requirement failed: {exc}"}
+
+    @tool
+    async def get_requirements(
+        codes: list[str], include_revisions: bool = False
+    ) -> dict:
+        """Batch detail of several requirements in ONE call.
+
+        Returns the same summary shape as list_requirements (statement, type,
+        priority, status, actor, source_documents, parent_code/derived) plus
+        acceptance criteria; unknown codes come back in `not_found`. The batch
+        is capped at 100 codes — for anything bigger, filter with
+        list_requirements first. Use this whenever more than one requirement
+        needs inspection; set include_revisions only when the change history
+        is actually needed (compact, without snapshots).
+        """
+        try:
+            if not codes:
+                return {"items": [], "not_found": []}
+            if len(codes) > MAX_BATCH_GET:
+                return {
+                    "error": (
+                        f"máximo {MAX_BATCH_GET} códigos por llamada "
+                        f"(llegaron {len(codes)}): acotar con "
+                        "list_requirements antes"
+                    )
+                }
+            async with AsyncSessionLocal() as session:
+                rows = (
+                    await session.scalars(
+                        select(RequirementItem).where(
+                            RequirementItem.project_id == project_id,
+                            RequirementItem.code.in_(codes),
+                        )
+                    )
+                ).all()
+                by_code = {it.code: it for it in rows}
+                parents = await _parent_code_map(
+                    session, project_id, list(by_code.values())
+                )
+                items = [
+                    {
+                        **_item_summary(it, parents),
+                        "acceptance_criteria": list(
+                            it.acceptance_criteria or []
+                        ),
+                    }
+                    for it in (by_code[c] for c in codes if c in by_code)
+                ]
+                if include_revisions and by_code:
+                    revs = (
+                        await session.scalars(
+                            select(RequirementRevision)
+                            .where(
+                                RequirementRevision.req_id.in_(
+                                    [it.id for it in by_code.values()]
+                                )
+                            )
+                            .order_by(
+                                RequirementRevision.req_id,
+                                RequirementRevision.version,
+                            )
+                        )
+                    ).all()
+                    by_req: dict[int, list[dict[str, Any]]] = {}
+                    for rev in revs:
+                        by_req.setdefault(rev.req_id, []).append(
+                            {
+                                "version": rev.version,
+                                "changed_by": rev.changed_by,
+                                "change_reason": rev.change_reason,
+                            }
+                        )
+                    for entry in items:
+                        entry["revisions"] = by_req.get(entry["id"], [])
+                return {
+                    "items": items,
+                    "not_found": [c for c in codes if c not in by_code],
+                }
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"get_requirements failed: {exc}"}
 
     @tool
     async def build_srs() -> dict:
@@ -301,7 +449,13 @@ def make_requirements_read_tools(project_id: int) -> list:
         except Exception as exc:  # noqa: BLE001
             return {"error": f"capture_status failed: {exc}"}
 
-    return [list_requirements, get_requirement, build_srs, capture_status]
+    return [
+        list_requirements,
+        get_requirements,
+        get_requirement,
+        build_srs,
+        capture_status,
+    ]
 
 
 def make_requirements_tools(project_id: int) -> list:
@@ -379,6 +533,147 @@ def make_requirements_tools(project_id: int) -> list:
                 return _item_summary(item)
         except Exception as exc:  # noqa: BLE001
             return {"error": f"update_requirement failed: {exc}"}
+
+    @tool
+    async def update_requirements(updates: list[dict]) -> dict:
+        """Edit several requirements in ONE call (statement / type / priority).
+
+        Each entry: {code, statement?, type?, priority?, reason?}; only the
+        passed fields change, one audit revision is appended per edited item,
+        and the whole batch commits in a single transaction — always prefer
+        this over looping update_requirement one code at a time. Entries with
+        an invalid value or an unknown code do NOT abort the batch: they come
+        back in `errors`. When a statement changes, OPEN deterministic
+        findings that no longer apply to the new text (pronoun, vague term,
+        combinator, missing actor, ...) are closed automatically; LLM-only
+        findings stay open for the quality review to decide. Batch cap: 50.
+        """
+        try:
+            if not updates:
+                return {"updated": [], "errors": [], "findings_closed": 0}
+            if len(updates) > MAX_BULK_UPDATE:
+                return {
+                    "error": (
+                        f"máximo {MAX_BULK_UPDATE} ediciones por llamada "
+                        f"(llegaron {len(updates)}): dividir en tandas"
+                    )
+                }
+            errors: list[dict[str, Any]] = []
+            resolved: list[dict[str, Any]] = []
+            async with AsyncSessionLocal() as session:
+                codes = [u.get("code") for u in updates if u.get("code")]
+                rows = (
+                    await session.scalars(
+                        select(RequirementItem).where(
+                            RequirementItem.project_id == project_id,
+                            RequirementItem.code.in_(codes),
+                        )
+                    )
+                ).all()
+                by_code = {it.code: it for it in rows}
+                # Fase 1: resolver y validar TODO antes de tocar nada.
+                for u in updates:
+                    code = u.get("code")
+                    item = by_code.get(code)
+                    if item is None:
+                        errors.append(
+                            {
+                                "code": code,
+                                "error": (
+                                    f"requirement {code} not found in project"
+                                ),
+                            }
+                        )
+                        continue
+                    try:
+                        new_type = (
+                            ReqType(u["type"]) if u.get("type") else None
+                        )
+                    except ValueError:
+                        errors.append(
+                            {
+                                "code": code,
+                                "error": f"type invalido: {u['type']!r}",
+                            }
+                        )
+                        continue
+                    try:
+                        new_priority = (
+                            Priority(u["priority"])
+                            if u.get("priority")
+                            else None
+                        )
+                    except ValueError:
+                        errors.append(
+                            {
+                                "code": code,
+                                "error": f"priority invalido: {u['priority']!r}",
+                            }
+                        )
+                        continue
+                    entry: dict[str, Any] = {
+                        "req_id": item.id,
+                        "code": code,
+                        "reason": u.get("reason") or "bulk_update",
+                    }
+                    if u.get("statement") is not None:
+                        entry["statement"] = str(u["statement"])
+                    if new_type is not None:
+                        entry["type"] = new_type
+                    if new_priority is not None:
+                        entry["priority"] = new_priority
+                    resolved.append(entry)
+
+                # Fase 2: una transacción para todo el lote.
+                result = await store.update_requirements_bulk(
+                    session, project_id, resolved, changed_by="agent"
+                )
+
+                # Fase 3: autocierre determinista. Re-evaluar las reglas sobre
+                # el enunciado NUEVO y cerrar los OPEN cuya regla determinista
+                # dejó de disparar. Los hallazgos que solo puede juzgar el LLM
+                # (o el humano) no se tocan.
+                findings_closed = 0
+                role_terms = await _catalog_role_terms(session, project_id)
+                for entry, res in zip(resolved, result["updated"]):
+                    if entry.get("statement") is None:
+                        continue
+                    firing = {
+                        f.rule_id
+                        for f in programmatic_findings_for_text(
+                            res["statement"],
+                            req_type=res["type"],
+                            role_terms=role_terms,
+                        )
+                    }
+                    open_findings = (
+                        await session.scalars(
+                            select(RequirementFinding).where(
+                                RequirementFinding.project_id == project_id,
+                                RequirementFinding.req_id == res["req_id"],
+                                RequirementFinding.status
+                                == FindingStatus.OPEN,
+                            )
+                        )
+                    ).all()
+                    for f in open_findings:
+                        if (
+                            f.rule_id in DETERMINISTIC_RULE_IDS
+                            and f.rule_id not in firing
+                        ):
+                            f.status = FindingStatus.FIXED
+                            findings_closed += 1
+                if findings_closed:
+                    await session.commit()
+
+                errors.extend(result["errors"])
+                return {
+                    "updated": result["updated"],
+                    "errors": errors,
+                    "findings_closed": findings_closed,
+                }
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"update_requirements failed: {exc}"}
 
     @tool
     async def delete_requirement(code: str, reason: str) -> dict:
@@ -556,16 +851,24 @@ def make_requirements_tools(project_id: int) -> list:
         type: ReqTypeValue | None = None,
         priority: PriorityValue | None = None,
         document: str | None = None,
+        query: str | None = None,
+        has_actor: bool | None = None,
+        limit: int = DEFAULT_LIST_LIMIT,
         include_deleted: bool = False,
     ) -> dict:
         """List requirements in the project, optionally filtered.
 
         Soft-deleted rows (rejected / merged / superseded) are hidden unless
         include_deleted is true. `document` filters by source document
-        (substring, case-insensitive) with the same semantics as a scoped
-        grouping review. Each summary carries code, statement, type, priority,
-        status, source_documents, parent_code/derived and confidence — so
-        traceability questions do NOT require one get_requirement per item.
+        (substring, case-insensitive). `query` filters by statement substring
+        (case-insensitive). `has_actor` keeps only items whose statement names
+        a specific role (true), only items without any actor or with a bare
+        «usuario» (false), or all (unset). `limit` caps the returned items
+        while `count` keeps the filter total: when truncated is true, refine
+        the filters instead of paging blindly. Each summary carries code,
+        statement, type, priority, status, actor (named/generic/none),
+        source_documents, parent_code/derived and confidence — traceability
+        questions do NOT require one get_requirement per item.
         """
         try:
             async with AsyncSessionLocal() as session:
@@ -581,10 +884,36 @@ def make_requirements_tools(project_id: int) -> list:
                     items = [
                         it for it in items if _item_in_document(it, document)
                     ]
+                if query:
+                    needle = query.strip().lower()
+                    items = [
+                        it for it in items
+                        if needle in (it.statement or "").lower()
+                    ]
+                role_terms = await _catalog_role_terms(session, project_id)
+                if has_actor is not None:
+                    # true = solo los que nombran un rol específico; false =
+                    # la cola de trabajo (actor genérico o ausente).
+                    items = [
+                        it
+                        for it in items
+                        if (
+                            detect_actor(it.statement, role_terms=role_terms)
+                            == "named"
+                        )
+                        == has_actor
+                    ]
+                total = len(items)
+                truncated = total > limit
+                items = items[:limit]
                 parents = await _parent_code_map(session, project_id, items)
                 return {
-                    "count": len(items),
-                    "items": [_item_summary(it, parents) for it in items],
+                    "count": total,
+                    "truncated": truncated,
+                    "items": [
+                        _item_summary(it, parents, role_terms=role_terms)
+                        for it in items
+                    ],
                 }
         except Exception as exc:  # noqa: BLE001
             return {"error": f"list_requirements failed: {exc}"}
@@ -609,6 +938,86 @@ def make_requirements_tools(project_id: int) -> list:
                 return detail
         except Exception as exc:  # noqa: BLE001
             return {"error": f"get_requirement failed: {exc}"}
+
+    @tool
+    async def get_requirements(
+        codes: list[str], include_revisions: bool = False
+    ) -> dict:
+        """Batch detail of several requirements in ONE call.
+
+        Returns the same summary shape as list_requirements (statement, type,
+        priority, status, actor, source_documents, parent_code/derived) plus
+        acceptance criteria; unknown codes come back in `not_found`. The batch
+        is capped at 100 codes — for anything bigger, filter with
+        list_requirements first. Use this whenever more than one requirement
+        needs inspection; set include_revisions only when the change history
+        is actually needed (compact, without snapshots).
+        """
+        try:
+            if not codes:
+                return {"items": [], "not_found": []}
+            if len(codes) > MAX_BATCH_GET:
+                return {
+                    "error": (
+                        f"máximo {MAX_BATCH_GET} códigos por llamada "
+                        f"(llegaron {len(codes)}): acotar con "
+                        "list_requirements antes"
+                    )
+                }
+            async with AsyncSessionLocal() as session:
+                rows = (
+                    await session.scalars(
+                        select(RequirementItem).where(
+                            RequirementItem.project_id == project_id,
+                            RequirementItem.code.in_(codes),
+                        )
+                    )
+                ).all()
+                by_code = {it.code: it for it in rows}
+                parents = await _parent_code_map(
+                    session, project_id, list(by_code.values())
+                )
+                items = [
+                    {
+                        **_item_summary(it, parents),
+                        "acceptance_criteria": list(
+                            it.acceptance_criteria or []
+                        ),
+                    }
+                    for it in (by_code[c] for c in codes if c in by_code)
+                ]
+                if include_revisions and by_code:
+                    revs = (
+                        await session.scalars(
+                            select(RequirementRevision)
+                            .where(
+                                RequirementRevision.req_id.in_(
+                                    [it.id for it in by_code.values()]
+                                )
+                            )
+                            .order_by(
+                                RequirementRevision.req_id,
+                                RequirementRevision.version,
+                            )
+                        )
+                    ).all()
+                    by_req: dict[int, list[dict[str, Any]]] = {}
+                    for rev in revs:
+                        by_req.setdefault(rev.req_id, []).append(
+                            {
+                                "version": rev.version,
+                                "changed_by": rev.changed_by,
+                                "change_reason": rev.change_reason,
+                            }
+                        )
+                    for entry in items:
+                        entry["revisions"] = by_req.get(entry["id"], [])
+                return {
+                    "items": items,
+                    "not_found": [c for c in codes if c not in by_code],
+                }
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"get_requirements failed: {exc}"}
 
     @tool
     async def approve_requirement(
@@ -806,7 +1215,14 @@ def make_requirements_tools(project_id: int) -> list:
                 from backend.services.requirements_service import (
                     reset_project_capture,
                 )
-                return await reset_project_capture(session, project_id)
+                result = await reset_project_capture(session, project_id)
+            from backend.agents.subagents.capture_run_holder import (
+                clear_capture_scope,
+            )
+            # A confirmed wipe also drops the pending folder scope: the next
+            # /captura starts from a clean slate (session-13 scope registry).
+            clear_capture_scope(project_id)
+            return result
         except Exception as exc:  # noqa: BLE001
             return {"error": f"reset_capture failed: {exc}"}
 
@@ -820,7 +1236,9 @@ def make_requirements_tools(project_id: int) -> list:
         resolve_conflict,
         set_relation_status,
         list_requirements,
+        get_requirements,
         get_requirement,
+        update_requirements,
         approve_requirement,
         verify_span,
         reject_requirement,

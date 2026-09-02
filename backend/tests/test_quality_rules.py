@@ -220,3 +220,130 @@ def test_prevention_rules_built_from_vague_terms():
     assert all(not t.startswith(" ") and not t.endswith(" ") for t in terms)
     # El término defectuoso " scalable" queda normalizado a "scalable".
     assert "scalable" in terms
+
+
+# --- Actores y enunciados paraguas (sesiones 7-9 de Planitrack) --------------
+
+def test_actor_missing_fires_for_functional_without_role():
+    ids = _ids(programmatic_findings_for_text(
+        "El sistema debe exportar el reporte mensual a PDF.",
+        req_type="functional"))
+    assert "smell.actor_missing" in ids
+
+
+def test_actor_missing_skipped_when_role_named():
+    ids = _ids(programmatic_findings_for_text(
+        "El administrador del tenant debe exportar el reporte mensual a PDF.",
+        req_type="functional"))
+    assert "smell.actor_missing" not in ids
+
+
+def test_actor_missing_skipped_for_non_functional():
+    ids = _ids(programmatic_findings_for_text(
+        "El sistema debe responder el inicio de sesión en menos de 200 ms.",
+        req_type="performance"))
+    assert "smell.actor_missing" not in ids
+
+
+def test_actor_missing_skipped_without_req_type():
+    # En captura (pre-clasificación) el tipo aún no existe: no se marca. Allí
+    # corre la prevención (PREVENTION_RULES), no la detección.
+    ids = _ids(programmatic_findings_for_text(
+        "El sistema debe exportar el reporte mensual a PDF."))
+    assert "smell.actor_missing" not in ids
+
+
+def test_actor_missing_accepts_project_role_terms():
+    stmt = "El despachador debe asignar la ruta del día a cada móvil."
+    # Sin catálogo: "despachador" no está en el léxico base -> dispara.
+    assert "smell.actor_missing" in _ids(
+        programmatic_findings_for_text(stmt, req_type="functional"))
+    # Con el catálogo del proyecto: rol reconocido -> no dispara.
+    assert "smell.actor_missing" not in _ids(
+        programmatic_findings_for_text(
+            stmt, req_type="functional", role_terms=["despachador"]))
+
+
+def test_generic_user_fires_when_no_named_role():
+    ids = _ids(programmatic_findings_for_text(
+        "El usuario debe poder filtrar la grilla por fecha.",
+        req_type="functional"))
+    assert "actor.generic_user" in ids
+    # Un rol específico nombrado gana aunque también se mencione «usuario».
+    ids2 = _ids(programmatic_findings_for_text(
+        "El supervisor debe poder asignar la tarea a un usuario.",
+        req_type="functional"))
+    assert "actor.generic_user" not in ids2
+
+
+def test_umbrella_fires_on_verb_enumeration():
+    ids = _ids(programmatic_findings_for_text(
+        "El administrador debe crear, editar, eliminar, exportar e importar "
+        "los contratos.",
+        req_type="functional"))
+    assert "smell.umbrella" in ids
+
+
+def test_umbrella_fires_on_grouping_marker():
+    # Caso real de Planitrack: «gestionar de manera completa todos los
+    # aspectos... incluyendo la creación, edición, ...».
+    stmt = (
+        "El sistema debe permitir al administrador gestionar de manera completa "
+        "todos los aspectos relacionados con la facturación electrónica."
+    )
+    ids = _ids(programmatic_findings_for_text(stmt, req_type="functional"))
+    assert "smell.umbrella" in ids
+
+
+def test_umbrella_skipped_for_atomic_statement():
+    ids = _ids(programmatic_findings_for_text(
+        "El administrador debe crear un contrato nuevo.",
+        req_type="functional"))
+    assert "smell.umbrella" not in ids
+
+
+def test_considerar_and_contemplar_are_vague():
+    for term in ("considerar", "contemplar"):
+        ids = _ids(programmatic_findings_for_text(
+            f"El sistema debe {term} el huso horario del tenant.",
+            req_type="functional"))
+        assert "smell.vague_term" in ids
+
+
+def test_prevention_rules_cover_actor_and_umbrella():
+    assert "ROL-PENDIENTE" in PREVENTION_RULES
+    assert "umbrella" in PREVENTION_RULES
+
+
+def test_apply_quality_flags_umbrella_forces_atomic_fix():
+    flags = [
+        ProgrammaticFinding(
+            rule_id="smell.umbrella",
+            dimension="requirement_smell",
+            severity="major",
+            message="enunciado paraguas",
+        )
+    ]
+    v = _apply_quality_flags(_clean_verdict(), flags)
+    assert v.atomic == "fix"
+
+
+def test_apply_quality_flags_actor_rules_are_informational():
+    flags = [
+        ProgrammaticFinding(
+            rule_id="smell.actor_missing",
+            dimension="requirement_smell",
+            severity="major",
+            message="falta rol",
+        ),
+        ProgrammaticFinding(
+            rule_id="actor.generic_user",
+            dimension="requirement_smell",
+            severity="minor",
+            message="usuario genérico",
+        ),
+    ]
+    v = _apply_quality_flags(_clean_verdict(), flags)
+    assert v.atomic == "pass"
+    assert v.verifiable == "pass"
+    assert "quality" in v.reasons

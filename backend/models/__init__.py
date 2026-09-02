@@ -6,6 +6,11 @@ from backend.models.document_embedding import DocumentEmbedding
 from backend.models.document_parse import DocumentParse
 from backend.models.project import Project
 from backend.models.project_document import ProjectDocument
+from backend.models.project_actor import (
+    ActorSource,
+    ActorStatus,
+    ProjectActor,
+)
 from backend.models.project_rule import (
     ProjectRule,
     RuleScope,
@@ -62,6 +67,9 @@ __all__ = [
     "User",
     "Project",
     "ProjectDocument",
+    "ProjectActor",
+    "ActorSource",
+    "ActorStatus",
     "ProjectRule",
     "RuleScope",
     "RuleSource",
