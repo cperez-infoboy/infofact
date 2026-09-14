@@ -21,6 +21,7 @@ from backend.models.srs import (
     FindingDimension,
     FindingScope,
     FindingSeverity,
+    GoalStatus,
     LinkRelation,
 )
 from backend.services.requirement_store import list_requirements
@@ -94,17 +95,31 @@ async def compute_coverage(
     )
 
     # ----- Goals coverage --------------------------------------------------
-    goals = await list_goals(session, project_id)
+    all_goals = await list_goals(session, project_id)
+    # Los STALE (parked a decisión) no cuentan como gaps: no son parte del
+    # catálogo vigente, solo auditoría pendiente.
+    goals = [g for g in all_goals if g.status != GoalStatus.STALE]
+    stale_goals = len(all_goals) - len(goals)
     links = await list_goal_links(session, project_id)
     realizes_by_goal: dict[int, list[int]] = defaultdict(list)
     any_link_by_goal: set[int] = set()
+    linked_req_ids: set[int] = set()
     for l in links:
         any_link_by_goal.add(l.goal_id)
+        linked_req_ids.add(l.req_id)
         if l.relation == LinkRelation.REALIZES:
             realizes_by_goal[l.goal_id].append(l.req_id)
 
     functional_goals = [g for g in goals if g.kind.value != "obstacle"]
     obstacles = [g for g in goals if g.kind.value == "obstacle"]
+
+    # Dirección req->goal (la que faltaba): reqs vivos sin ningún link no
+    # aportan a ningún objetivo — es la cola de trazabilidad que el agente
+    # debe cerrar con infer_goal_links antes del commit.
+    unlinked_codes = [
+        it.code for it in live if it.id not in linked_req_ids
+    ]
+    unlinked_count = len(unlinked_codes)
     goal_gaps = [
         g.code for g in functional_goals if not realizes_by_goal.get(g.id)
     ]
@@ -182,6 +197,32 @@ async def compute_coverage(
                 "detected_by": "programmatic",
             }
         )
+    # Reqs vivos sin ningún goal (dirección req->goal): hallazgo AGREGADO de
+    # scope proyecto — antes esta vista solo existía en la tool opt-in
+    # goal_coverage y el pipeline «terminaba bien» con media matriz.
+    if unlinked_count:
+        share = unlinked_count / max(1, len(live))
+        sample = ", ".join(unlinked_codes[:25])
+        more = (
+            f" (y {unlinked_count - 25} más)" if unlinked_count > 25 else ""
+        )
+        findings.append(
+            {
+                "scope": FindingScope.SET,
+                "dimension": FindingDimension.COVERAGE_GAP,
+                "rule_id": "gore.unlinked_requirements",
+                "severity": (
+                    FindingSeverity.MAJOR if share > 0.1 else FindingSeverity.MINOR
+                ),
+                "message": (
+                    f"{unlinked_count} de {len(live)} requerimientos vivos no "
+                    f"aportan a ningún goal ({sample}{more}). Cierra la cola "
+                    "con infer_goal_links(req_codes=...) antes del commit."
+                ),
+                "suggestion": None,
+                "detected_by": "programmatic",
+            }
+        )
 
     coverage = {
         "iso_25010": {
@@ -218,11 +259,14 @@ async def compute_coverage(
         },
         "goals": {
             "total": len(goals),
+            "stale": stale_goals,
             "functional": len(functional_goals),
             "softgoals": sum(1 for g in goals if g.kind.value == "softgoal"),
             "obstacles": len(obstacles),
             "unrealized": goal_gaps,
             "unmitigated_obstacles": unmitigated_obstacles,
+            "unlinked_requirements": unlinked_count,
+            "unlinked_codes": unlinked_codes[:200],
         },
     }
     return coverage, findings

@@ -25,6 +25,16 @@ def _summary(d: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+# Techos anti-overflow (incidente sesión 17: get_quality devolvió 1.9 MB de
+# hallazgos y get_latest_srs 2.9 MB de documento completo en el thread del
+# subagente; el summarizer reenvió la historia intacta y Anthropic rechazó
+# el prompt). Paginación explícita: el resto se pide con offset.
+QUALITY_FINDINGS_PAGE = 40
+SRS_SECTION_TEXT_CAP = 30_000
+GOAL_CODES_CAP = 60
+SECTION_ITEMS_CAP = 120
+
+
 def make_srs_read_tools(project_id: int) -> list:
     """Construye las read tools de SRS cerrando sobre project_id."""
 
@@ -47,26 +57,114 @@ def make_srs_read_tools(project_id: int) -> list:
         }
 
     @tool
-    async def get_latest_srs() -> dict:
-        """Devuelve la versión más reciente del SRS (estructura, resumen de \
-calidad, cobertura, trazabilidad y un preview del markdown)."""
+    async def get_latest_srs(section_id: str | None = None) -> dict:
+        """Devuelve la versión más reciente del SRS.
+
+        SIN argumentos trae SOLO metadatos y resúmenes: id, versión, estado,
+        conteos de requerimientos y hallazgos, goals, cobertura (totals) y el
+        índice de secciones con el tamaño en caracteres de cada una. NUNCA
+        trae la narrativa completa ni los enunciados: en proyectos grandes
+        el documento entero supera la ventana del modelo (incidente de la
+        sesión 17: 2.9 MB en un solo resultado).
+
+        Con ``section_id`` (clave de subsección authored, p. ej.
+        ``intro.purpose``) trae el texto de ESA subsección (recortado a un
+        máximo de 30.000 caracteres). Para secciones proyectadas usa
+        ``read_srs_section``.
+        """
         async with AsyncSessionLocal() as session:
             srs = await srs_store.get_latest_srs(session, project_id)
         if srs is None:
             return {"error": "no_srs", "message": "Aún no hay un SRS generado. Usa /srs para generar uno."}
-        return _summary(srs_store.srs_to_dict(srs, with_markdown=False))
+        if section_id is not None:
+            if section_id not in srs.narrative:
+                return {
+                    "error": "unknown_section",
+                    "message": (
+                        f"La subsección {section_id} no existe. Usa "
+                        "list_srs_sections para ver las disponibles."
+                    ),
+                }
+            content = srs.narrative.get(section_id) or ""
+            truncated = len(content) > SRS_SECTION_TEXT_CAP
+            return {
+                "version": srs.version,
+                "status": srs.status.value,
+                "section_id": section_id,
+                "content": content[:SRS_SECTION_TEXT_CAP],
+                "content_chars": len(content),
+                "truncated": truncated,
+            }
+        d = srs_store.srs_to_dict(srs, with_markdown=False)
+        narrative = d.pop("narrative", {}) or {}
+        structure = d.pop("structure", []) or []
+        d.pop("traceability", None)
+        d.pop("requirement_codes", None)
+        sections_index = [
+            {
+                "id": sec.get("id"),
+                "title": sec.get("title"),
+                "kind": sec.get("kind", "projected"),
+                "subsection_chars": {
+                    sub.get("id"): len(narrative.get(sub.get("id")) or "")
+                    for sub in sec.get("subsections", [])
+                },
+            }
+            for sec in structure
+        ]
+        qs = d.get("quality_summary") or {}
+        out = {
+            "id": d["id"],
+            "version": d["version"],
+            "status": d["status"],
+            "requirement_count": d["requirement_count"],
+            "generated_at": d["generated_at"],
+            "quality_totals": {
+                k: qs.get(k)
+                for k in ("total_findings", "blockers", "major", "minor", "info")
+                if k in qs
+            },
+            "coverage_totals": (d.get("coverage") or {}).get("totals", {}),
+            "goals_summary": (qs.get("goals") or {}),
+            "review_flags": d.get("review_flags") or {},
+            "sections_index": sections_index,
+            "note": (
+                "Payload acotado: para prosa authored usa get_latest_srs"
+                "(section_id=...) o read_srs_section; para secciones "
+                "proyectadas, read_srs_section."
+            ),
+        }
+        return out
 
     @tool
-    async def get_quality() -> dict:
+    async def get_quality(
+        severity: str | None = None, offset: int = 0
+    ) -> dict:
         """Devuelve el resumen de calidad y los hallazgos del proyecto \
-(severidad, dimensión, regla, mensaje, sugerencia)."""
+(severidad, dimensión, regla, mensaje, sugerencia).
+
+        Los hallazgos llegan PAGINADOS (página de 40): el default trae el
+        resumen agregado más la primera página. Usa ``severity``
+        (blocker|major|minor|info) para filtrar y ``offset`` para avanzar.
+        Un proyecto grande tiene cientos: pedirlos todos de una vez supera la
+        ventana del modelo.
+        """
         async with AsyncSessionLocal() as session:
             findings = await srs_store.list_findings(session, project_id)
             # Resuelve req_id -> codigo opaque (REQ-XXXX) por cada hallazgo.
             code_map = await srs_store._req_code_map(session, project_id)
+        sev = severity.strip().lower() if severity else None
+        if sev:
+            findings = [f for f in findings if f.severity.value == sev]
+        total = len(findings)
+        page = findings[offset : offset + QUALITY_FINDINGS_PAGE]
         return {
-            "findings": srs_store.findings_to_dicts(findings, code_map),
-            "count": len(findings),
+            "count": total,
+            "severity_filter": sev,
+            "offset": offset,
+            "page_size": QUALITY_FINDINGS_PAGE,
+            "more_after": offset + QUALITY_FINDINGS_PAGE < total,
+            "findings": srs_store.findings_to_dicts(page, code_map),
         }
 
     @tool
@@ -113,7 +211,17 @@ calidad, cobertura, trazabilidad y un preview del markdown)."""
         modelo). ``per_goal`` lleva el conteo de links por goal.
         """
         async with AsyncSessionLocal() as session:
-            return await srs_store.goal_coverage(session, project_id)
+            cov = await srs_store.goal_coverage(session, project_id)
+        without = cov.get("without_goal_codes") or []
+        if len(without) > GOAL_CODES_CAP:
+            cov["without_goal_codes"] = without[:GOAL_CODES_CAP]
+            cov["without_goal_codes_truncated"] = True
+            cov["without_goal_codes_total"] = len(without)
+            cov["note"] = (
+                f"Cola truncada a {GOAL_CODES_CAP} códigos: ciérrala por "
+                "lotes con infer_goal_links."
+            )
+        return cov
 
     @tool
     async def get_requirement_findings(req_code: str) -> dict:
@@ -284,12 +392,24 @@ calidad, cobertura, trazabilidad y un preview del markdown)."""
             if it.type in reqtypes
             and it.status.value in ("validated", "approved", "draft")
         ]
-        return {
+        out = {
             "section_id": section_id,
             "title": target_title,
             "kind": "projected",
-            "items": items_data,
+            "count": len(items_data),
         }
+        if len(items_data) > SECTION_ITEMS_CAP:
+            out["items"] = items_data[:SECTION_ITEMS_CAP]
+            out["truncated"] = True
+            out["note"] = (
+                f"Lista truncada a {SECTION_ITEMS_CAP} de {len(items_data)} "
+                "requerimientos. Filtra por código con get_requirement_"
+                "findings o consulta rangos concretos; NO pidas la sección "
+                "completa en proyectos grandes."
+            )
+        else:
+            out["items"] = items_data
+        return out
 
     return [
         list_srs_versions,

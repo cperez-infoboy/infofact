@@ -159,6 +159,24 @@ class RequirementItem(Base):
         ForeignKey("requirement_items.id", ondelete="SET NULL"), nullable=True
     )
     created_by: Mapped[str] = mapped_column(String(16), default="agent")
+    # Huella de calidad: hash de (statement, type) que el motor compara para
+    # decidir si un item debe re-juzgarse por LLM (analisis delta) o si
+    # conserva el veredicto previo. NULL = nunca juzgado.
+    quality_fingerprint: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    quality_judged_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
+    # Huella análoga para la inferencia de goals (misma función, sello propio:
+    # calidad sella en su merge; goals sella en su upsert). Permite que la
+    # fase de chunks/links solo procese reqs nuevos o editados.
+    goals_fingerprint: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    goals_judged_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()

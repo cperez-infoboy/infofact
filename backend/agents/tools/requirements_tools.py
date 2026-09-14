@@ -79,6 +79,23 @@ async def _code_to_id(
     return item_id
 
 
+async def _code_to_goal_id(
+    session: AsyncSession, project_id: int, code: str
+) -> int:
+    """Resolve a GOAL-XXXX code to its integer id within the project."""
+    from backend.models.srs import Goal
+
+    goal_id = await session.scalar(
+        select(Goal.id).where(
+            Goal.project_id == project_id,
+            Goal.code == code,
+        )
+    )
+    if goal_id is None:
+        raise KeyError(f"goal {code} not found in project")
+    return goal_id
+
+
 def _source_documents(item: RequirementItem) -> list[str]:
     """Document ids que citan este item, deduplicados (source puede ser dict
     o lista de dicts tras un merge). Se omiten quotes/secciones a propósito:
@@ -136,15 +153,22 @@ async def _catalog_role_terms(
     return terms or None
 
 
+# Enunciado acotado en los summaries de listado (la herramienta reporta
+# statement_chars cuando trunca): con enunciados de varios KB, una página de
+# 100 items pesaba cientos de KB en el thread del agente (sesión 18: write
+# de 471 KB). El texto completo sigue en get_requirement.
+SUMMARY_STATEMENT_CHARS = 500
+
+
 def _item_summary(
     item: RequirementItem,
     parent_codes: dict[int, str] | None = None,
     role_terms: list[str] | None = None,
 ) -> dict[str, Any]:
-    return {
+    statement = item.statement or ""
+    out = {
         "id": item.id,
         "code": item.code,
-        "statement": item.statement,
         "type": item.type.value,
         "priority": item.priority.value,
         "status": item.status.value,
@@ -159,6 +183,12 @@ def _item_summary(
         # o nada): permite al agente ubicar y corregir los actores en lote.
         "actor": detect_actor(item.statement, role_terms=role_terms),
     }
+    if len(statement) > SUMMARY_STATEMENT_CHARS:
+        out["statement"] = statement[:SUMMARY_STATEMENT_CHARS]
+        out["statement_chars"] = len(statement)
+    else:
+        out["statement"] = statement
+    return out
 
 
 def make_requirements_read_tools(project_id: int) -> list:
@@ -198,7 +228,9 @@ def make_requirements_read_tools(project_id: int) -> list:
         the filters instead of paging blindly. Each summary carries code,
         statement, type, priority, status, actor (named/generic/none),
         source_documents, parent_code/derived and confidence — traceability
-        questions do NOT require one get_requirement per item.
+        questions do NOT require one get_requirement per item. The statement
+        is capped at 500 chars (statement_chars carries the real length when
+        truncated): for full text use get_requirement on that code.
         """
         try:
             async with AsyncSessionLocal() as session:
@@ -634,6 +666,7 @@ def make_requirements_tools(project_id: int) -> list:
                 # dejó de disparar. Los hallazgos que solo puede juzgar el LLM
                 # (o el humano) no se tocan.
                 findings_closed = 0
+                llm_findings_pending: list[dict[str, str]] = []
                 role_terms = await _catalog_role_terms(session, project_id)
                 for entry, res in zip(resolved, result["updated"]):
                     if entry.get("statement") is None:
@@ -663,6 +696,17 @@ def make_requirements_tools(project_id: int) -> list:
                         ):
                             f.status = FindingStatus.FIXED
                             findings_closed += 1
+                        elif f.rule_id not in DETERMINISTIC_RULE_IDS:
+                            # Hallazgo de juez LLM sobre el texto re-escrito:
+                            # su veredicto quedó obsoleto y NO hay forma de
+                            # cerrarlo sin re-juzgar. Contarlo en el retorno
+                            # para que el agente reporte la deuda y no crea
+                            # que la cura "limpió" el ítem (sesión 18: la
+                            # cura del capture-agent dejó los sem.* sin
+                            # veredicto y tuvo que inferirlos de revisiones).
+                            llm_findings_pending.append(
+                                {"code": res.get("code"), "rule_id": f.rule_id}
+                            )
                 if findings_closed:
                     await session.commit()
 
@@ -671,6 +715,15 @@ def make_requirements_tools(project_id: int) -> list:
                     "updated": result["updated"],
                     "errors": errors,
                     "findings_closed": findings_closed,
+                    "llm_findings_pending": llm_findings_pending,
+                    "message": (
+                        f"{len(llm_findings_pending)} hallazgo(s) de juez LLM "
+                        "quedan SIN veredicto sobre los enunciados editados: "
+                        "el veredicto llega con el re-análisis delta (/srs -> "
+                        "analyze_quality o close_curation_wave)."
+                    )
+                    if llm_findings_pending
+                    else "",
                 }
         except Exception as exc:  # noqa: BLE001
             return {"error": f"update_requirements failed: {exc}"}
@@ -868,7 +921,9 @@ def make_requirements_tools(project_id: int) -> list:
         the filters instead of paging blindly. Each summary carries code,
         statement, type, priority, status, actor (named/generic/none),
         source_documents, parent_code/derived and confidence — traceability
-        questions do NOT require one get_requirement per item.
+        questions do NOT require one get_requirement per item. The statement
+        is capped at 500 chars (statement_chars carries the real length when
+        truncated): for full text use get_requirement on that code.
         """
         try:
             async with AsyncSessionLocal() as session:

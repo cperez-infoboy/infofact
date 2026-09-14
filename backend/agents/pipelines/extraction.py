@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Awaitable, Callable, Literal
+from typing import Any, Awaitable, Callable, Literal
 
 from pydantic import BaseModel, Field
 
@@ -769,6 +769,178 @@ async def extract_actors(
             smap.document_id,
         )
         return ActorCatalog()
+
+
+class ActorGroup(BaseModel):
+    """Actores granulares que convergen en un rol general (propuesta LLM)."""
+
+    general_name: str = Field(
+        description="General role that covers EVERY member, singular, in the "
+        "members' language (e.g. 'Proveedor de cartografía').",
+    )
+    channel: str | None = Field(
+        default=None,
+        description="'humano' or 'sistema_externo' — must match every member's.",
+    )
+    rationale: str | None = Field(
+        default=None,
+        description="At most 12 words on why these members converge.",
+    )
+    member_codes: list[str] = Field(
+        description="Codes (R1, R3, ...) of the absorbed catalog actors, "
+        "quoted EXACTLY as given. At least 2.",
+    )
+
+
+class ActorConsolidation(BaseModel):
+    """Salida de la pasada de consolidación (vacía si el catálogo ya es general)."""
+
+    groups: list[ActorGroup] = Field(default_factory=list)
+
+
+_ACTOR_CONSOLIDATION_SYSTEM = (
+    "You consolidate a catalog of ACTORS (UML actors) for a software system.\n"
+    "You receive the ACTIVE catalog as rows: code | name | synonyms | channel. "
+    "The catalog is granular on purpose (one discovery pass per source "
+    "document), so it often holds several actors that are really the same "
+    "GENERAL role seen through specific products (e.g. 'Google Maps' and "
+    "'OSRM' both implement 'Proveedor de cartografía'; 'MercadoPago' and "
+    "'Stripe' are both 'Pasarela de pagos').\n\n"
+    "Propose merge groups ONLY where 2+ actors converge on one general role:\n"
+    "- member_codes: quote the codes EXACTLY as given. Never invent codes or "
+    "names.\n"
+    "- general_name: the general role in the SAME LANGUAGE as the members' "
+    "names, singular. It must cover EVERY member.\n"
+    "- Never mix channels in a group: every member must share the same channel "
+    "('humano' or 'sistema_externo').\n"
+    "- Do NOT group actors with genuinely different responsibilities, even "
+    "when they share a domain. When in doubt, do not group.\n"
+    "- Never emit a 1-member group: a single actor is already its own general "
+    "role.\n"
+    "- Returning groups=[] is the right answer when the catalog is already "
+    "general enough.\n"
+    "Return ONLY the structured object."
+)
+
+
+async def consolidate_actors(
+    catalog: list[dict[str, Any]],
+    *,
+    project_name: str,
+    project_description: str,
+    instructions: str = "",
+) -> ActorConsolidation:
+    """Una llamada LLM que agrupa actores granulares en roles generales.
+
+    ``catalog`` son los actores ACTIVOS del proyecto (dicts de
+    ``actor_to_dict``). Espejo de ``extract_actors`` (misma degradación
+    grácil): cualquier fallo (LLM, parse, catálogo con menos de 2 actores)
+    devuelve grupos vacíos — la consolidación NUNCA rompe la etapa; el
+    catálogo queda granular y los consumidores siguen funcionando.
+    """
+    if len(catalog) < 2:
+        return ActorConsolidation()
+    rows = "\n".join(
+        f"- {a.get('code', '?')} | {a.get('name', '')}"
+        f" | aka: {', '.join(a.get('synonyms') or []) or '—'}"
+        f" | {a.get('channel') or '—'}"
+        for a in catalog
+    )
+    user = (
+        f"{_project_header(project_name, project_description)}\n"
+        f"ACTOR CATALOG:\n{rows}"
+    )
+    if instructions.strip():
+        user += f"\n\nHUMAN GUIDANCE: {instructions.strip()}"
+    try:
+        llm = _structured_llm(ActorConsolidation)
+        return await llm.ainvoke(
+            [("system", _ACTOR_CONSOLIDATION_SYSTEM), ("human", user)]
+        )
+    except Exception:
+        logger.exception(
+            "consolidate_actors failed; returning no groups (the catalog "
+            "stays granular)",
+        )
+        return ActorConsolidation()
+
+
+class RewrittenStatement(BaseModel):
+    """Enunciado reescrito: misma obligación, rol general en vez del granular."""
+
+    code: str = Field(
+        description="Opaque REQ code of the statement, exactly as received.",
+    )
+    statement: str = Field(description="The full rewritten statement.")
+
+
+class ActorMentionRewrite(BaseModel):
+    """Lote de enunciados reescritos tras una consolidación de actores."""
+
+    items: list[RewrittenStatement] = Field(default_factory=list)
+
+
+_ACTOR_REWRITE_SYSTEM = (
+    "You rewrite requirement statements after an ACTOR consolidation: several "
+    "granular actors (specific products) were folded into one GENERAL role, "
+    "and the statements must now cite the general role.\n"
+    "You receive the mapping 'granular name -> general role' and a list of "
+    "statements with their codes. Rewrite ONLY the actor mention:\n"
+    "- Replace the granular actor name with the general role, adjusting only "
+    "the grammar around it (articles, number). Keep the obligation verb, the "
+    "language, and every technical detail, threshold and value EXACTLY.\n"
+    "- If one statement names several members of the SAME group, use the "
+    "general role once instead of the list of products.\n"
+    "- If the granular name carries provider-specific detail the requirement "
+    "depends on (e.g. a provider-only API), keep the specific name in "
+    "parentheses after the general role.\n"
+    "- Never change anything else. If a statement mentions none of the mapped "
+    "names, return it unchanged.\n"
+    "Return ONLY the structured object, one entry per received statement, "
+    "same codes."
+)
+
+
+async def rewrite_actor_mentions(
+    items: list[dict[str, str]],
+    mapping: dict[str, str],
+    *,
+    batch_size: int = 20,
+) -> list[dict[str, str]]:
+    """Reescribe enunciados que citan actores absorbidos por una consolidación.
+
+    ``items``: [{code, statement}]; ``mapping``: nombre granular -> rol
+    general. Devuelve [{code, new_statement}] SOLO de los enunciados que
+    cambiaron. Corre en lotes para acotar cada llamada; un lote que falla se
+    omite sin abortar el resto (los enunciados salteados siguen reconocidos
+    por los sinónimos que el actor general absorbió).
+    """
+    if not items or not mapping:
+        return []
+    rules = "\n".join(f"- {k!r} -> {v!r}" for k, v in sorted(mapping.items()))
+    llm = _structured_llm(ActorMentionRewrite)
+    out: list[dict[str, str]] = []
+    for start in range(0, len(items), batch_size):
+        batch = items[start : start + batch_size]
+        listed = "\n".join(f"- [{it['code']}] {it['statement']}" for it in batch)
+        user = f"ACTOR MAPPING:\n{rules}\n\nSTATEMENTS:\n{listed}"
+        try:
+            res = await llm.ainvoke(
+                [("system", _ACTOR_REWRITE_SYSTEM), ("human", user)]
+            )
+        except Exception:
+            logger.exception(
+                "rewrite_actor_mentions: batch at %d failed; skipping its "
+                "rewrites",
+                start,
+            )
+            continue
+        by_code = {it["code"]: it["statement"] for it in batch}
+        for r in res.items:
+            old = by_code.get(r.code)
+            if old is not None and r.statement and r.statement != old:
+                out.append({"code": r.code, "new_statement": r.statement})
+    return out
 
 
 def merge_conventions(per_doc: list[DocumentRules]) -> DocumentRules:

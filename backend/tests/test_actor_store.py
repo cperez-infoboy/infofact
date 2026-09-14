@@ -263,7 +263,9 @@ async def test_actor_tools_add_list_retire(monkeypatch):
     sm, _tmp = await _fresh_db()
     pid = await _seed(sm)
     monkeypatch.setattr(actor_tools_mod, "AsyncSessionLocal", sm)
-    list_actors, add_actors, retire_actor = actor_tools_mod.make_actor_tools(pid)
+    list_actors, add_actors, retire_actor, _consolidate = (
+        actor_tools_mod.make_actor_tools(pid)
+    )
 
     res = await add_actors.ainvoke(
         {"actors": [{"name": "Coordinador de terreno", "channel": "humano"}]}

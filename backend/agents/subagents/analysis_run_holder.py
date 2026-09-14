@@ -84,6 +84,23 @@ class AnalysisRun:
     # Refinement mode: feedback del usuario + version previa para patch_commit.
     feedback: str = ""
     previous_analysis_id: int | None = None
+    # Guarda anti doble despacho (corrida 2026-09-11): un solo pipeline en
+    # vuelo por holder. Con dos runs concurrentes (reenvío del comando), la
+    # segunda etapa se rechaza al instante en vez de duplicar horas de LLM y
+    # pisar resultados (un propose con 25 contratos fue pisado por uno con 0,
+    # y el commit del run A borró el holder que el run B seguía usando).
+    in_flight: bool = False
+
+    def begin_stage(self, stage: str) -> bool:
+        """Reserva el holder para ejecutar ``stage``; False si está ocupado."""
+        if self.in_flight:
+            return False
+        self.in_flight = True
+        return True
+
+    def end_stage(self, stage: str) -> None:
+        """Libera la reserva (llamar siempre en finally)."""
+        self.in_flight = False
 
     def bump(self, stage: str, cap: int = DEFAULT_STAGE_CAP) -> int:
         """Cuenta una llamada de ``stage``; lanza pasada ``cap``.

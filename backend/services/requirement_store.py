@@ -20,6 +20,7 @@ lifecycles; a fresh AsyncSessionLocal per tool call is the intended pattern.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from sqlalchemy import delete, func, select
@@ -906,3 +907,96 @@ async def get_requirement(
             for rev in revisions
         ],
     }
+
+
+# --- actor consolidation: statement rewrite ---------------------------------
+
+
+def _cites_term(statement: str, terms: list[str]) -> bool:
+    """True si el enunciado cita algún término con límites de palabra.
+
+    La insensibilidad a mayúsculas es manual (no ``re.I``) para respetar
+    mayúsculas/minúsculas fuera de ASCII en la comparación; ``\\w`` sí es
+    Unicode, así que los acentos delimitan palabra igual.
+    """
+    text = statement.lower()
+    for t in terms:
+        pat = r"(?<!\w)" + re.escape(t.lower()) + r"(?!\w)"
+        if re.search(pat, text):
+            return True
+    return False
+
+
+async def find_items_citing_terms(
+    session: AsyncSession,
+    project_id: int,
+    terms: list[str],
+) -> list[RequirementItem]:
+    """Items vivos cuyo statement cita algún término (nombre o sinónimo).
+
+    Vivos = no soft-deleted: REJECTED/MERGED/SUPERSEDED son historial y no se
+    reescriben. El filtro de término corre en Python (word-boundary); el
+    volumen por proyecto es acotado, así que se evita el LIKE por término.
+    """
+    clean = [t.strip() for t in terms if t and t.strip()]
+    if not clean:
+        return []
+    rows = list(
+        await session.scalars(
+            select(RequirementItem).where(
+                RequirementItem.project_id == project_id,
+                RequirementItem.status.not_in(_SOFT_DELETED),
+            )
+        )
+    )
+    return [it for it in rows if _cites_term(it.statement or "", clean)]
+
+
+async def rewrite_statements_for_actor_mapping(
+    session: AsyncSession,
+    project_id: int,
+    mapping: dict[str, str],
+    rewrite_fn,
+    *,
+    changed_by: str = "agent",
+) -> list[dict[str, Any]]:
+    """Reescribe enunciados que citan actores absorbidos por la consolidación.
+
+    ``mapping``: término granular -> rol general (el ``mapping`` de
+    ``apply_actor_consolidation``). ``rewrite_fn(items, mapping)`` es la
+    pasada LLM (``rewrite_actor_mentions``), inyectable para testear sin LLM.
+    Cada ítem reescrito anexa su ``RequirementRevision`` (reason
+    ``actor_consolidation``); ``source.quote`` queda intacto — la evidencia no
+    se muta. Commit solo si cambió algo (contrato del módulo). Devuelve
+    ``[{code, before, after}]`` de los enunciados efectivamente cambiados.
+    """
+    if not mapping:
+        return []
+    items = await find_items_citing_terms(
+        session, project_id, list(mapping.keys())
+    )
+    if not items:
+        return []
+    proposals = await rewrite_fn(
+        [{"code": it.code, "statement": it.statement} for it in items],
+        mapping,
+    )
+    by_code = {it.code: it for it in items}
+    rewritten: list[dict[str, Any]] = []
+    for p in proposals:
+        item = by_code.get(p.get("code"))
+        new_statement = (p.get("new_statement") or "").strip()
+        if item is None or not new_statement or new_statement == item.statement:
+            continue
+        before = item.statement
+        await _append_revision(
+            session,
+            item,
+            reason="actor_consolidation",
+            changed_by=changed_by,
+        )
+        item.statement = new_statement
+        rewritten.append({"code": item.code, "before": before, "after": new_statement})
+    if rewritten:
+        await session.commit()
+    return rewritten

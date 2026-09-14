@@ -1,8 +1,10 @@
 """Tests del draft narrativo asistido por LLM (draft_narrative_llm).
 
 Cubre:
-- Validación del schema SrsNarrativeDraft (8 campos).
-- LLM sobrescribe placeholders preservando deterministicos (overview, features).
+- Validación del schema SrsNarrativeDraft (7 campos; §1.4 Referencias es
+  proyección determinista, no prosa LLM).
+- LLM sobrescribe placeholders preservando deterministicos (overview,
+  references, features).
 - Fallback graceful cuando la llamada LLM falla.
 - Reconstrucción de claves legacy (intro, overall).
 
@@ -57,12 +59,11 @@ def _det_narrative() -> dict[str, str]:
 
 
 def _llm_draft() -> SrsNarrativeDraft:
-    """Draft LLM simulado con las 8 secciones authored."""
+    """Draft LLM simulado con las 7 secciones authored."""
     return SrsNarrativeDraft(
         purpose="El propósito de este SRS es especificar Mi Proyecto.",
         scope="El producto incluye módulos de gestión. Quedan fuera los reportes BI.",
         definitions="- **SRS**: Especificación de Requerimientos de Software.\n- **OAuth**: Open Authorization.",
-        references="- ISO/IEC/IEEE 29148:2018\n- ISO/IEC 25010:2011",
         perspective="El sistema se integra con Google OAuth para autenticación.",
         users="- **Administrador**: acceso total, uso diario.\n- **Operador**: acceso limitado, uso semanal.",
         environment="Plataforma web con Docker, FastAPI y SvelteKit.",
@@ -85,7 +86,7 @@ def _patch_retrieval_no_hits(monkeypatch):
 
 
 class TestSrsNarrativeDraftSchema:
-    def test_schema_validates_all_8_fields(self):
+    def test_schema_validates_all_7_fields(self):
         draft = _llm_draft()
         assert isinstance(draft, SrsNarrativeDraft)
         fields = SrsNarrativeDraft.model_fields
@@ -93,13 +94,12 @@ class TestSrsNarrativeDraftSchema:
             "purpose",
             "scope",
             "definitions",
-            "references",
             "perspective",
             "users",
             "environment",
             "assumptions",
         }
-        assert expected.issubset(set(fields.keys()))
+        assert expected == set(fields.keys())
 
     def test_schema_requires_all_fields(self):
         with pytest.raises(Exception):
@@ -111,7 +111,6 @@ class TestSrsNarrativeDraftSchema:
             purpose=long_text,
             scope=long_text,
             definitions=long_text,
-            references=long_text,
             perspective=long_text,
             users=long_text,
             environment=long_text,
@@ -127,7 +126,7 @@ class TestSrsNarrativeDraftSchema:
 
 @pytest.mark.asyncio
 async def test_draft_narrative_llm_overwrites_placeholders(monkeypatch):
-    """El LLM sobrescribe los 8 placeholders 'Editor: completar...'."""
+    """El LLM sobrescribe los placeholders 'Editor: completar...'."""
     _patch_retrieval_no_hits(monkeypatch)
 
     mock_runner = MagicMock()
@@ -149,12 +148,11 @@ async def test_draft_narrative_llm_overwrites_placeholders(monkeypatch):
         goals_summary={"goals": 4, "softgoals": 2, "obstacles": 1},
     )
 
-    # Las 8 secciones authored ya no tienen placeholder.
+    # Las 7 secciones authored ya no tienen placeholder.
     authored_keys = [
         "intro.purpose",
         "intro.scope",
         "intro.definitions",
-        "intro.references",
         "overall.perspective",
         "overall.users",
         "overall.environment",
@@ -163,6 +161,9 @@ async def test_draft_narrative_llm_overwrites_placeholders(monkeypatch):
     for key in authored_keys:
         assert "Editor:" not in result[key], f"{key} aún tiene placeholder"
         assert len(result[key]) > 20, f"{key} está vacío"
+
+    # §1.4 Referencias es proyección determinista: la conservó del base.
+    assert "ISO/IEC/IEEE 29148:2018" in result["intro.references"]
 
     # Contenido específico del mock.
     assert "Mi Proyecto" in result["intro.purpose"]

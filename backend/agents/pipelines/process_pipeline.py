@@ -2,10 +2,11 @@
 
 Multi-pass pipeline (5 passes):
 
-  Pass 1a — lifecycle identification (narrow: which entities have lifecycles).
-  Pass 1b — interaction identification (narrow: which sequence diagrams).
-  Pass 2  — gap pass: re-scan uncovered functional REQ codes.
-  Pass 3  — Mermaid generation (constrained by lifecycles + interactions).
+  Pass 1a — lifecycle identification (narrow, batched over items).
+  Pass 1b — interaction identification (narrow, batched over items).
+  Pass 2  — gap pass: re-scan (batched) functional REQ codes not traced to
+  any diagram.
+  Pass 3  — Mermaid generation (batched over lifecycles + interactions).
   Pass 4  — deterministic checks on structured data (dangling refs, empty
   diagrams). No LLM repair needed — Mermaid is rendered in code.
   Pass 5  — LLM critique (MermaidSeqBench dimensions + process-specific).
@@ -35,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -51,17 +53,31 @@ from backend.agents.pipelines._diagram_colors import (
 )
 from backend.agents.pipelines._resilience import (
     DEFAULT_CONCURRENCY,
+    _chunk,
     _format_feedback,
     _format_goals,
     _invoke_with_retry,
     _sanitize_mermaid_id,
     _sanitize_mermaid_label,
+    invoke_structured_resilient,
 )
 
 if TYPE_CHECKING:
     from backend.agents.pipelines.mer_pipeline import MerResult
 
 logger = logging.getLogger(__name__)
+
+# Batch size for the discovery / gap passes (identification over items).
+# Env-tunable.
+_PROCESS_BATCH_SIZE = int(os.environ.get("INFOFACT_PROCESS_BATCH", "25"))
+
+# Batch size for the generation pass (Pass 3). The OUTPUT per diagram unit is
+# fat (states/transitions or participants/messages per diagram), so large
+# batches overflow the completion budget and truncate the JSON — same failure
+# the MER detail pass hit in session 19 of Planitrack2.0. Env-tunable.
+_PROCESS_GEN_BATCH_SIZE = int(
+    os.environ.get("INFOFACT_PROCESS_GEN_BATCH", "10")
+)
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +215,13 @@ class LifecycleCandidate(BaseModel):
         default="",
         description="Descripcion breve del ciclo de vida (estados principales)",
     )
+    traced_req_codes: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Codigos REQ-XXXX de los requerimientos que justifican este ciclo "
+            "de vida. Tomarlos literalmente del input."
+        ),
+    )
 
 
 class LifecycleSchema(BaseModel):
@@ -218,6 +241,13 @@ class InteractionCandidate(BaseModel):
     interaction_summary: str = Field(
         default="",
         description="Descripcion breve de la interaccion",
+    )
+    traced_req_codes: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Codigos REQ-XXXX de los requerimientos que justifican esta "
+            "interaccion. Tomarlos literalmente del input."
+        ),
     )
 
 
@@ -540,6 +570,72 @@ def _render_sequence_diagram(sq: "SequenceDiagramSchema") -> str:
 # ---------------------------------------------------------------------------
 
 
+class ProcessGapSchema(BaseModel):
+    """Combined schema for the gap pass (Pass 2)."""
+
+    lifecycles: list[LifecycleCandidate] = Field(default_factory=list)
+    interactions: list[InteractionCandidate] = Field(default_factory=list)
+
+
+async def _gather_batches(batches, worker, concurrency: int) -> list:
+    """Run ``worker`` per batch with bounded concurrency, absorbing failures.
+
+    A failed batch is logged and dropped instead of aborting the pass (same
+    graceful degradation as the NFR pipeline batches).
+    """
+    sem = asyncio.Semaphore(concurrency)
+
+    async def _guarded(batch):
+        async with sem:
+            return await worker(batch)
+
+    results = await asyncio.gather(
+        *[_guarded(b) for b in batches], return_exceptions=True
+    )
+    ok: list = []
+    for i, r in enumerate(results):
+        if isinstance(r, Exception):
+            logger.warning(
+                "_gather_batches: batch %d/%d failed: %s",
+                i + 1, len(batches), r,
+            )
+            continue
+        ok.append(r)
+    return ok
+
+
+def _dedupe_lifecycles(
+    found: list[LifecycleCandidate],
+) -> list[LifecycleCandidate]:
+    """Merge lifecycle candidates across batches by entity name (first wins)."""
+    merged: dict[str, LifecycleCandidate] = {}
+    for lc in found:
+        key = lc.entity_name.lower().strip()
+        if key in merged:
+            for code in lc.traced_req_codes:
+                if code not in merged[key].traced_req_codes:
+                    merged[key].traced_req_codes.append(code)
+        else:
+            merged[key] = lc
+    return list(merged.values())
+
+
+def _dedupe_interactions(
+    found: list[InteractionCandidate],
+) -> list[InteractionCandidate]:
+    """Merge interaction candidates across batches by name (first wins)."""
+    merged: dict[str, InteractionCandidate] = {}
+    for cand in found:
+        key = cand.name.lower().strip()
+        if key in merged:
+            for code in cand.traced_req_codes:
+                if code not in merged[key].traced_req_codes:
+                    merged[key].traced_req_codes.append(code)
+        else:
+            merged[key] = cand
+    return list(merged.values())
+
+
 async def _identify_lifecycles(
     items,
     mer_result: "MerResult | None" = None,
@@ -548,22 +644,62 @@ async def _identify_lifecycles(
     project_description: str = "",
     goals: list[Any] | None = None,
     feedback: str = "",
+    concurrency: int = DEFAULT_CONCURRENCY,
+    on_progress=None,
 ) -> list[LifecycleCandidate]:
-    """Pass 1a: identify which entities have lifecycles."""
-    user_text = _build_process_items_text(
-        items, mer_result, project_name, project_description,
-        goals=goals, feedback=feedback,
-    )
-    msgs = [("system", _LIFECYCLE_DISCOVERY_PROMPT), ("human", user_text)]
-    llm = structured_llm(LifecycleSchema)
-    try:
-        result = await _invoke_with_retry(
-            llm, msgs, context_label="process_lifecycle"
+    """Pass 1a: identify which entities have lifecycles (batched over items)."""
+
+    async def _scan(batch):
+        user_text = _build_process_items_text(
+            batch, mer_result, project_name, project_description,
+            goals=goals, feedback=feedback,
         )
-        return list(result.lifecycles)
-    except Exception:
-        logger.exception("_identify_lifecycles: all retries exhausted")
-        return []
+        msgs = [("system", _LIFECYCLE_DISCOVERY_PROMPT), ("human", user_text)]
+        try:
+            result = await invoke_structured_resilient(
+                lambda **kw: structured_llm(LifecycleSchema, **kw),
+                msgs,
+                context_label=f"process_lifecycle ({len(batch)} items)",
+            )
+            return list(result.lifecycles)
+        except Exception:
+            logger.exception(
+                "_identify_lifecycles: all retries exhausted for %d items",
+                len(batch),
+            )
+            return []
+
+    batches = list(_chunk(items, _PROCESS_BATCH_SIZE))
+    total = len(batches)
+    if total <= 1:
+        found = await _gather_batches(batches, _scan, concurrency)
+        return _dedupe_lifecycles([lc for sub in found for lc in sub])
+
+    state = {"done": 0}
+
+    async def _guarded(batch):
+        async with _sem:
+            result = await _scan(batch)
+            state["done"] += 1
+            if on_progress is not None:
+                await on_progress(
+                    f"ciclos de vida ({state['done']}/{total} lotes)"
+                )
+            return result
+
+    _sem = asyncio.Semaphore(concurrency)
+    found = await asyncio.gather(
+        *[_guarded(b) for b in batches], return_exceptions=True
+    )
+    ok = [r for r in found if isinstance(r, list)]
+    for r in found:
+        if isinstance(r, BaseException) and not isinstance(r, list):
+            continue
+    logger.info(
+        "process_lifecycle: %d/%d lotes completados sobre %d items",
+        len(ok), total, len(items),
+    )
+    return _dedupe_lifecycles([lc for sub in ok for lc in sub])
 
 
 # ---------------------------------------------------------------------------
@@ -579,22 +715,59 @@ async def _identify_interactions(
     project_description: str = "",
     goals: list[Any] | None = None,
     feedback: str = "",
+    concurrency: int = DEFAULT_CONCURRENCY,
+    on_progress=None,
 ) -> list[InteractionCandidate]:
-    """Pass 1b: identify which sequence diagrams to produce."""
-    user_text = _build_process_items_text(
-        items, mer_result, project_name, project_description,
-        goals=goals, feedback=feedback,
-    )
-    msgs = [("system", _INTERACTION_DISCOVERY_PROMPT), ("human", user_text)]
-    llm = structured_llm(InteractionSchema)
-    try:
-        result = await _invoke_with_retry(
-            llm, msgs, context_label="process_interaction"
+    """Pass 1b: identify which sequence diagrams to produce (batched over items)."""
+
+    async def _scan(batch):
+        user_text = _build_process_items_text(
+            batch, mer_result, project_name, project_description,
+            goals=goals, feedback=feedback,
         )
-        return list(result.interactions)
-    except Exception:
-        logger.exception("_identify_interactions: all retries exhausted")
-        return []
+        msgs = [("system", _INTERACTION_DISCOVERY_PROMPT), ("human", user_text)]
+        try:
+            result = await invoke_structured_resilient(
+                lambda **kw: structured_llm(InteractionSchema, **kw),
+                msgs,
+                context_label=f"process_interaction ({len(batch)} items)",
+            )
+            return list(result.interactions)
+        except Exception:
+            logger.exception(
+                "_identify_interactions: all retries exhausted for %d items",
+                len(batch),
+            )
+            return []
+
+    batches = list(_chunk(items, _PROCESS_BATCH_SIZE))
+    total = len(batches)
+    if total <= 1:
+        found = await _gather_batches(batches, _scan, concurrency)
+        return _dedupe_interactions([i for sub in found for i in sub])
+
+    state = {"done": 0}
+
+    async def _guarded(batch):
+        async with _sem:
+            result = await _scan(batch)
+            state["done"] += 1
+            if on_progress is not None:
+                await on_progress(
+                    f"interacciones ({state['done']}/{total} lotes)"
+                )
+            return result
+
+    _sem = asyncio.Semaphore(concurrency)
+    found = await asyncio.gather(
+        *[_guarded(b) for b in batches], return_exceptions=True
+    )
+    ok = [r for r in found if isinstance(r, list)]
+    logger.info(
+        "process_interaction: %d/%d lotes completados sobre %d items",
+        len(ok), total, len(items),
+    )
+    return _dedupe_interactions([i for sub in ok for i in sub])
 
 
 # ---------------------------------------------------------------------------
@@ -612,55 +785,67 @@ async def _gap_pass_process(
     project_description: str = "",
     goals: list[Any] | None = None,
     feedback: str = "",
+    concurrency: int = DEFAULT_CONCURRENCY,
 ) -> tuple[list[LifecycleCandidate], list[InteractionCandidate]]:
-    """Pass 2: detect uncovered REQ codes and re-scan them.
+    """Pass 2: re-scan (batched) REQ codes not traced to any diagram.
+
+    Coverage is measured exactly on ``traced_req_codes``: only the uncovered
+    items are re-scanned. The old heuristic (coverage when diagrams >= 30%
+    of items) silently skipped real gaps on large corpora.
 
     Returns (extra_lifecycles, extra_interactions).
     """
     input_codes = {it.code for it in items}
-    covered_codes: set[str] = set()
-    # Lifecycles and interactions don't carry req codes in the narrow schema;
-    # we can't do a precise gap pass on codes. Instead, check if the total
-    # number of lifecycles + interactions seems to cover the input items.
-    # If there are many items but zero diagrams identified, re-scan everything.
     if not input_codes:
         return ([], [])
-
-    total_diagrams = len(lifecycles) + len(interactions)
-    if total_diagrams > 0 and total_diagrams >= len(items) * 0.3:
-        # Reasonable coverage — no gap pass needed.
+    covered = (
+        {c for lc in lifecycles for c in lc.traced_req_codes}
+        | {c for i in interactions for c in i.traced_req_codes}
+    )
+    uncovered = input_codes - covered
+    if not uncovered:
         return ([], [])
 
-    # Re-scan all items for additional lifecycles and interactions.
-    user_text = _build_process_items_text(
-        items, mer_result, project_name, project_description,
-        goals=goals, feedback=feedback,
-    )
+    uncovered_items = [it for it in items if it.code in uncovered]
     existing_lc = ", ".join(
         lc.entity_name for lc in lifecycles if lc.has_lifecycle
     ) or "(ninguna)"
     existing_int = ", ".join(i.name for i in interactions) or "(ninguna)"
-    user_text += (
-        f"\nCICLOS DE VIDA YA IDENTIFICADOS: {existing_lc}\n"
-        f"INTERACCIONES YA IDENTIFICADAS: {existing_int}\n"
-        "Revisa los requerimientos y determina si hay ciclos de vida o "
-        "interacciones NUEVAS que se hayan pasado por alto.\n"
-    )
-    msgs = [("system", _PROCESS_GAP_PASS_PROMPT), ("human", user_text)]
-    # Use a combined schema for the gap pass.
-    class _GapSchema(BaseModel):
-        lifecycles: list[LifecycleCandidate] = Field(default_factory=list)
-        interactions: list[InteractionCandidate] = Field(default_factory=list)
 
-    llm = structured_llm(_GapSchema)
-    try:
-        result = await _invoke_with_retry(
-            llm, msgs, context_label="process_gap_pass"
+    async def _scan(batch):
+        user_text = _build_process_items_text(
+            batch, mer_result, project_name, project_description,
+            goals=goals, feedback=feedback,
         )
-        return (list(result.lifecycles), list(result.interactions))
-    except Exception:
-        logger.exception("_gap_pass_process: all retries exhausted")
-        return ([], [])
+        user_text += (
+            f"\nCICLOS DE VIDA YA IDENTIFICADOS: {existing_lc}\n"
+            f"INTERACCIONES YA IDENTIFICADAS: {existing_int}\n"
+            "Revisa SOLO los requerimientos anteriores y determina si hay "
+            "ciclos de vida o interacciones NUEVAS que se hayan pasado por "
+            "alto.\n"
+        )
+        msgs = [("system", _PROCESS_GAP_PASS_PROMPT), ("human", user_text)]
+        try:
+            result = await invoke_structured_resilient(
+                lambda **kw: structured_llm(ProcessGapSchema, **kw),
+                msgs,
+                context_label=f"process_gap_pass ({len(batch)} items)",
+            )
+            return (list(result.lifecycles), list(result.interactions))
+        except Exception:
+            logger.exception(
+                "_gap_pass_process: all retries exhausted for %d items",
+                len(batch),
+            )
+            return ([], [])
+
+    batches = list(_chunk(uncovered_items, _PROCESS_BATCH_SIZE))
+    found = await _gather_batches(batches, _scan, concurrency)
+    extra_lc = _dedupe_lifecycles([lc for lcs, _ in found for lc in lcs])
+    extra_int = _dedupe_interactions(
+        [i for _, ints in found for i in ints]
+    )
+    return (extra_lc, extra_int)
 
 
 # ---------------------------------------------------------------------------
@@ -678,39 +863,136 @@ async def _generate_mermaid_diagrams(
     project_description: str = "",
     goals: list[Any] | None = None,
     feedback: str = "",
+    concurrency: int = DEFAULT_CONCURRENCY,
+    on_progress=None,
 ) -> ProcessResultSchema | None:
-    """Pass 3: generate Mermaid diagrams constrained by the identified lifecycles + interactions."""
-    user_text = _build_process_items_text(
-        items, mer_result, project_name, project_description,
-        goals=goals, feedback=feedback,
-    )
-    lc_lines = []
-    for lc in lifecycles:
-        if lc.has_lifecycle:
-            lc_lines.append(
-                f"- {lc.entity_name}: {lc.lifecycle_summary}"
-            )
-    int_lines = []
-    for i in interactions:
-        parts = ", ".join(i.participants) if i.participants else "(sin participantes)"
-        int_lines.append(f"- {i.name} ({parts}): {i.interaction_summary}")
+    """Pass 3: Mermaid generation, batched over lifecycles + interactions.
 
-    user_text += (
-        "\nENTIDADES CON CICLO DE VIDA (genera stateDiagram-v2 para cada una):\n"
-        + ("\n".join(lc_lines) if lc_lines else "(ninguna)")
-        + "\n\nINTERACCIONES (genera sequenceDiagram para cada una):\n"
-        + ("\n".join(int_lines) if int_lines else "(ninguna)")
-        + "\n"
-    )
-    msgs = [("system", _MERMAID_GENERATION_PROMPT), ("human", user_text)]
-    llm = structured_llm(ProcessResultSchema)
-    try:
-        return await _invoke_with_retry(
-            llm, msgs, context_label="process_generate"
+    The batch size is ``_PROCESS_GEN_BATCH_SIZE`` (small on purpose: the
+    structured OUTPUT is what overflows the completion budget). Each batch
+    receives only the requirements traced to its own diagrams (lookup by
+    ``traced_req_codes``), so acceptance criteria no longer travel en masse
+    in a single call. A failed batch drops its diagrams; the pass returns
+    None only when every batch failed.
+
+    ``on_progress`` (optional) is awaited with a short human message after
+    each batch so callers (the agentic tool) can stream live progress.
+    """
+    items_by_code = {it.code: it for it in items}
+
+    units: list[tuple[str, Any]] = [
+        ("lc", lc) for lc in lifecycles if lc.has_lifecycle
+    ] + [("int", i) for i in interactions]
+    if not units:
+        return ProcessResultSchema()
+
+    def _unit_codes(unit: tuple[str, Any]) -> set[str]:
+        return set(getattr(unit[1], "traced_req_codes", []) or [])
+
+    batches = list(_chunk(units, _PROCESS_GEN_BATCH_SIZE))
+    total_batches = len(batches)
+    state: dict[str, int] = {"done": 0, "failed": 0}
+
+    async def _gen(batch):
+        batch_reqs = [
+            items_by_code[code]
+            for unit in batch
+            for code in sorted(_unit_codes(unit))
+            if code in items_by_code
+        ]
+        user_text = _build_process_items_text(
+            batch_reqs, mer_result, project_name, project_description,
+            goals=goals, feedback=feedback,
         )
-    except Exception:
-        logger.exception("_generate_mermaid_diagrams: all retries exhausted")
+        lc_lines = [
+            f"- {obj.entity_name}: {obj.lifecycle_summary}"
+            for kind, obj in batch
+            if kind == "lc"
+        ]
+        int_lines = []
+        for kind, obj in batch:
+            if kind != "int":
+                continue
+            parts = (
+                ", ".join(obj.participants) if obj.participants
+                else "(sin participantes)"
+            )
+            int_lines.append(
+                f"- {obj.name} ({parts}): {obj.interaction_summary}"
+            )
+        user_text += (
+            "\nENTIDADES CON CICLO DE VIDA (genera stateDiagram-v2 para cada una):\n"
+            + ("\n".join(lc_lines) if lc_lines else "(ninguna)")
+            + "\n\nINTERACCIONES (genera sequenceDiagram para cada una):\n"
+            + ("\n".join(int_lines) if int_lines else "(ninguna)")
+            + "\n"
+        )
+        msgs = [("system", _MERMAID_GENERATION_PROMPT), ("human", user_text)]
+        try:
+            return await invoke_structured_resilient(
+                lambda **kw: structured_llm(ProcessResultSchema, **kw),
+                msgs,
+                context_label=f"process_generate ({len(batch)} diagramas)",
+            )
+        except Exception:
+            logger.exception(
+                "_generate_mermaid_diagrams: batch de %d diagramas fallo",
+                len(batch),
+            )
+            return None
+
+    async def _guarded(batch):
+        async with _sem:
+            result = await _gen(batch)
+            state["done"] += 1
+            if result is None:
+                state["failed"] += 1
+            if on_progress is not None:
+                detail = (
+                    f"lote {state['done']}/{total_batches} completado"
+                    if result is not None
+                    else f"lote {state['done']}/{total_batches} falló, se "
+                    "continúa con el resto"
+                )
+                await on_progress(
+                    f"diagramas ({state['done']}/{total_batches} lotes): {detail}"
+                )
+            return result
+
+    _sem = asyncio.Semaphore(concurrency)
+    results = await asyncio.gather(
+        *[_guarded(b) for b in batches], return_exceptions=True
+    )
+    schemas = [r for r in results if isinstance(r, ProcessResultSchema)]
+    failed = sum(
+        1
+        for r in results
+        if r is None or isinstance(r, Exception)
+    )
+    logger.info(
+        "process_generate: %d/%d lotes ok (%d fallidos) sobre %d diagramas",
+        total_batches - failed, total_batches, failed, len(units),
+    )
+    if not schemas:
         return None
+
+    merged = ProcessResultSchema()
+    seen_sm: set[str] = set()
+    seen_sq: set[str] = set()
+    for schema in schemas:
+        for sm in schema.state_machines:
+            key = sm.entity_name.lower().strip()
+            if key in seen_sm:
+                continue
+            seen_sm.add(key)
+            merged.state_machines.append(sm)
+        for sq in schema.sequence_diagrams:
+            key = sq.name.lower().strip()
+            if key in seen_sq:
+                continue
+            seen_sq.add(key)
+            merged.sequence_diagrams.append(sq)
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -854,6 +1136,7 @@ async def generate_processes(
     goals: list[Any] | None = None,
     enable_critique: bool = True,
     feedback: str = "",
+    on_progress=None,
 ) -> ProcessResult:
     """Generate state machines and sequence diagrams from functional requirements.
 
@@ -880,12 +1163,16 @@ async def generate_processes(
             project_name=project_name,
             project_description=project_description,
             goals=goals, feedback=feedback,
+            concurrency=concurrency,
+            on_progress=on_progress,
         ),
         _identify_interactions(
             items, mer_result,
             project_name=project_name,
             project_description=project_description,
             goals=goals, feedback=feedback,
+            concurrency=concurrency,
+            on_progress=on_progress,
         ),
     )
 
@@ -895,6 +1182,7 @@ async def generate_processes(
         project_name=project_name,
         project_description=project_description,
         goals=goals, feedback=feedback,
+        concurrency=concurrency,
     )
     all_lifecycles = lifecycles + gap_lifecycles
     all_interactions = interactions + gap_interactions
@@ -905,6 +1193,8 @@ async def generate_processes(
         project_name=project_name,
         project_description=project_description,
         goals=goals, feedback=feedback,
+        concurrency=concurrency,
+        on_progress=on_progress,
     )
 
     if result is None:

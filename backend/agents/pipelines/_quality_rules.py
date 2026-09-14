@@ -46,9 +46,20 @@ ABSOLUTE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Pronombres: referencia ambigua.
+# Pronombres: referencia ambigua. Los posesivos (su/sus) NO son ambigüedad
+# material en dominios logísticos («su estado», «su factura»): el referente lo
+# da el objeto de la frase, no un pronombre suelto. Con «su» contado como
+# smell, ~1.100 de los ~3.900 hallazgos abiertos de Planitrack2.0 eran ruido
+# (29% del backlog) y el juez LLM los repetía como ambigüedad semántica.
 PRONOUN_RE = re.compile(
-    r"\b(él|ella|ello|ellos|ellas|lo|la|los|las|sus|su)\b|\b(it|they|them|its|their|he|she)\b",
+    r"\b(él|ella|ello|ellos|ellas|lo|los|it|they|them|its|their|he|she)\b",
+    re.IGNORECASE,
+)
+
+# Posesivos que SÍ son defecto: «su» con referente alternable dentro del propio
+# enunciado (dos sustantivos de tercer persona + «su»). Cuyo/la cual idem.
+AMBIGUOUS_POSSESSIVE_RE = re.compile(
+    r"\b(su|sus)\b[^.!?]{0,80}\b(su|sus)\b|\b(cuyo|cuya|cuyos|cuyas|la\s+cual|el\s+cual)\b",
     re.IGNORECASE,
 )
 
@@ -269,7 +280,7 @@ def programmatic_findings_for_text(
             )
             break  # un hallazgo por ítem basta como señal
 
-    if PRONOUN_RE.search(text):
+    if PRONOUN_RE.search(text) or AMBIGUOUS_POSSESSIVE_RE.search(text):
         findings.append(
             ProgrammaticFinding(
                 rule_id="smell.pronoun",

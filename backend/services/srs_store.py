@@ -15,6 +15,8 @@ Convenciones (espejo de ``requirement_store``):
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import secrets
 from datetime import datetime
 from typing import Any
@@ -23,10 +25,13 @@ from rapidfuzz import fuzz
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.models.project import Project
 from backend.models.requirement import ReqStatus, RequirementItem
 from backend.models.srs import (
+    FindingDimension,
     FindingSeverity,
     FindingStatus,
+    FindingScope,
     Goal,
     GoalLink,
     GoalStatus,
@@ -34,6 +39,8 @@ from backend.models.srs import (
     SrsDocument,
     SrsStatus,
 )
+from backend.services.srs_builder import build_srs
+from backend.services.srs_quality import quality_fingerprint
 
 # Mismo alfabeto opaque que REQ (Crockford base32, sin I/L/O/U).
 _CROCKFORD_B32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
@@ -258,11 +265,14 @@ async def replace_findings(
 ) -> list[RequirementFinding]:
     """Reemplaza TODOS los hallazgos del proyecto por una nueva tanda.
 
-    El análisis de calidad se recalcula entero en cada ``/srs``, así que se
-    borran las filas previas (curación humana incluida) y se reinsertan las
-    nuevas en estado ``OPEN``. ``findings`` viene de los motores; cada dict
-    lleva scope/dimension/rule_id/severity/message/suggestion y opcionalmente
-    req_id/ears_pattern/detected_by.
+    .. deprecated:: a favor de :func:`merge_findings`, que preserva la
+       curación humana (fixed/waived) cuando el enunciado no cambió. Este
+       replace borra TODO (curación incluida) y reinserta en OPEN — es el
+       mecanismo que hacía reaparecer blockers ya resueltos en cada commit.
+       Queda para callers que genuinamente quieran un reset (p. ej. captura
+       desde cero). ``findings`` viene de los motores; cada dict lleva
+       scope/dimension/rule_id/severity/message/suggestion y opcionalmente
+       req_id/ears_pattern/detected_by.
     """
     findings = _dedupe_findings(findings)
     await session.execute(
@@ -290,6 +300,163 @@ async def replace_findings(
     session.add_all(rows)
     await session.commit()
     return rows
+
+
+async def merge_findings(
+    session: AsyncSession,
+    project_id: int,
+    findings: list[dict[str, Any]],
+    *,
+    fresh_judged_req_ids: list[int] | set[int] | None = None,
+) -> dict[str, int]:
+    """Fusiona la tanda de hallazgos con las filas existentes (curación con memoria).
+
+    Diferencia clave con ``replace_findings`` (DELETE all + reinsert OPEN, que
+    borraba la curación humana en cada commit): acá el match es por
+    (req_id, rule_id) — o (dimension, rule_id, message) en hallazgos de
+    conjunto — y el estado de curación (fixed/waived) con su auditoría
+    SOBREVIVE cuando el enunciado no cambió (mismo ``req_fingerprint``). Si el
+    enunciado cambió, el hallazgo se reabre (OPEN): es un veredicto nuevo
+    sobre texto nuevo. Los hallazgos que la tanda ya no detecta se eliminan
+    (el problema desapareció o el req dejó de estar vivo).
+
+    ``fresh_judged_req_ids`` (del summary de ``analyze_quality``) sella los
+    ``quality_fingerprint`` de los ítems re-juzgados EN LA MISMA transacción:
+    si el run aborta antes de este commit no hay sello y la próxima corrida
+    los re-juzga (nunca quedan ítems sellados sin hallazgos persistidos).
+
+    Devuelve {inserted, matched, preserved, reopened, deleted, total}.
+    """
+    findings = _dedupe_findings(findings)
+
+    # Fingerprint vigente por req (lo que el juez vería HOY): decide si la
+    # curación previa de un hallazgo sobrevive al merge.
+    rows = await session.execute(
+        select(RequirementItem.id, RequirementItem.statement, RequirementItem.type)
+        .where(RequirementItem.project_id == project_id)
+    )
+    fp_map: dict[int, str | None] = {
+        rid: quality_fingerprint(stmt, rtype.value if rtype else None)
+        for rid, stmt, rtype in rows.all()
+    }
+
+    def _dim_val(d: Any) -> str:
+        return d.value if hasattr(d, "value") else str(d)
+
+    def _key(fd: dict[str, Any]):
+        if fd.get("req_id") is not None:
+            return ("item", fd["req_id"], fd.get("rule_id"))
+        # Identidad del hallazgo de conjunto: (dimension, rule_id) SIN el
+        # message. El mensaje describe el estado del conteo («N reqs sin
+        # goal»), que varía en cada corrida: incluirlo en la clave re-creaba
+        # la fila en cada merge (insert+delete) y destruía la curación
+        # fixed/waived del hallazgo agregado. El mensaje se refresca in-place.
+        return ("set", _dim_val(fd.get("dimension")), fd.get("rule_id"))
+
+    existing_by_key: dict[tuple, RequirementFinding] = {}
+    for f in await list_findings(session, project_id):
+        if f.req_id is not None:
+            existing_by_key[("item", f.req_id, f.rule_id)] = f
+        else:
+            existing_by_key[("set", f.dimension.value, f.rule_id)] = f
+
+    seen: set[tuple] = set()
+    inserted = matched = preserved = reopened = 0
+    for fd in findings:
+        key = _key(fd)
+        cur_fp: str | None = (
+            fp_map.get(fd["req_id"]) if fd.get("req_id") is not None else None
+        )
+        # Normaliza enums: la tanda fresca trae instancias (Fase A/B) pero un
+        # run sembrado trae los dicts serializados del documento (strings).
+        sev = fd["severity"]
+        sev = sev if isinstance(sev, FindingSeverity) else FindingSeverity(str(sev))
+        dim = fd["dimension"]
+        dim = dim if isinstance(dim, FindingDimension) else FindingDimension(str(dim))
+        row = existing_by_key.get(key)
+        if row is None:
+            session.add(
+                RequirementFinding(
+                    project_id=project_id,
+                    req_id=fd.get("req_id"),
+                    scope=fd["scope"],
+                    dimension=dim,
+                    rule_id=fd["rule_id"],
+                    severity=sev,
+                    message=fd["message"],
+                    suggestion=fd.get("suggestion"),
+                    status=FindingStatus.OPEN,
+                    ears_pattern=fd.get("ears_pattern"),
+                    detected_by=fd.get("detected_by", "agent"),
+                    req_fingerprint=cur_fp,
+                )
+            )
+            inserted += 1
+        else:
+            matched += 1
+            # Descriptores frescos siempre; el estado solo si el enunciado no cambió.
+            row.severity = sev
+            row.dimension = dim
+            row.message = fd["message"]
+            row.suggestion = fd.get("suggestion")
+            row.ears_pattern = fd.get("ears_pattern")
+            row.detected_by = fd.get("detected_by", "agent")
+            # Los hallazgos de CONJUNTO (req_id NULL) no tienen enunciado
+            # propio: su identidad es la regla agregada y la curación (waive
+            # de un «reqs sin goal» decidido a mano) sobrevive SIEMPRE — no
+            # hay fingerprint que cambie bajo ellos. Los item-level mantienen
+            # la regla del fingerprint (enunciado cambió = veredicto nuevo).
+            is_set_finding = fd.get("req_id") is None
+            if (
+                row.status != FindingStatus.OPEN
+                and (
+                    is_set_finding
+                    or (
+                        row.req_fingerprint is not None
+                        and row.req_fingerprint == cur_fp
+                    )
+                )
+            ):
+                preserved += 1
+            else:
+                if row.status != FindingStatus.OPEN:
+                    reopened += 1
+                row.status = FindingStatus.OPEN
+                row.req_fingerprint = cur_fp
+                row.resolved_at = None
+                row.resolved_by = None
+                row.resolution_note = None
+        seen.add(key)
+
+    deleted = 0
+    for key, f in existing_by_key.items():
+        if key not in seen:
+            await session.delete(f)
+            deleted += 1
+
+    # Sello de fingerprints de lo re-juzgado, atómico con la tanda.
+    if fresh_judged_req_ids:
+        judged = set(fresh_judged_req_ids)
+        stamp_rows = await session.scalars(
+            select(RequirementItem).where(
+                RequirementItem.project_id == project_id,
+                RequirementItem.id.in_(judged),
+            )
+        )
+        now = datetime.utcnow()
+        for it in stamp_rows:
+            it.quality_fingerprint = fp_map.get(it.id)
+            it.quality_judged_at = now
+
+    await session.commit()
+    return {
+        "inserted": inserted,
+        "matched": matched,
+        "preserved": preserved,
+        "reopened": reopened,
+        "deleted": deleted,
+        "total": inserted + matched,
+    }
 
 
 async def delete_all_findings(
@@ -388,6 +555,49 @@ async def set_finding_status(
     f.status = status
     await session.commit()
     return f
+
+
+async def resolve_findings(
+    session: AsyncSession,
+    project_id: int,
+    *,
+    targets: list[tuple[int, str]],
+    status: FindingStatus,
+    note: str | None = None,
+    resolved_by: str = "agent",
+) -> dict[str, Any]:
+    """Cierre formal y auditable de hallazgos por lote: (req_id, rule_id) → estado.
+
+    ``status`` debe ser FIXED (corregido) o WAIVED (descartado con criterio):
+    ambos sobreviven a los re-análisis mientras el enunciado no cambie (los
+    respeta ``merge_findings``), que es lo que corta el goteo de «lo descartado
+    reaparece en el siguiente run». ``note`` documenta el por qué (auditoría:
+    resolved_at/by/note). Devuelve {resolved, missing} con los targets que no
+    encontraron hallazgo persistido.
+    """
+    if status not in (FindingStatus.FIXED, FindingStatus.WAIVED):
+        raise ValueError("status debe ser FindingStatus.FIXED o WAIVED")
+    now = datetime.utcnow()
+    resolved = 0
+    missing: list[list] = []
+    for req_id, rule_id in targets:
+        f = await session.scalar(
+            select(RequirementFinding).where(
+                RequirementFinding.project_id == project_id,
+                RequirementFinding.req_id == req_id,
+                RequirementFinding.rule_id == rule_id,
+            )
+        )
+        if f is None:
+            missing.append([req_id, rule_id])
+            continue
+        f.status = status
+        f.resolved_at = now
+        f.resolved_by = resolved_by
+        f.resolution_note = note
+        resolved += 1
+    await session.commit()
+    return {"resolved": resolved, "missing": missing}
 
 
 # --------------------------------------------------------------------------- #
@@ -630,6 +840,9 @@ async def upsert_goals(
                 target.rationale = gd["rationale"]
             if gd.get("confidence") is not None:
                 target.confidence = gd["confidence"]
+            if target.status == GoalStatus.STALE:
+                # La inferencia volvió a detectarlo: revive como PROPOSED.
+                target.status = GoalStatus.PROPOSED
             code_to_id[target.code] = target.id
         rows_by_id[target.id] = target
         if gd.get("code"):
@@ -643,14 +856,31 @@ async def upsert_goals(
         rows_by_id[gid].parent_id = None if parent_id == gid else parent_id
 
     # Links: los de los goals del payload se reemplazan por la nueva
-    # inferencia; los de los preservados fuera del payload quedan intactos.
+    # inferencia, SALVO los curados a mano (detected_by="human"), que
+    # sobreviven siempre; los de los preservados fuera del payload quedan
+    # intactos.
     payload_goal_ids = set(rows_by_id)
+    human_edges: set[tuple[int, int, str]] = set()
     if payload_goal_ids:
+        existing_links = await session.scalars(
+            select(GoalLink).where(GoalLink.goal_id.in_(payload_goal_ids))
+        )
+        for l in existing_links:
+            if l.detected_by == "human":
+                rel = (
+                    l.relation.value
+                    if hasattr(l.relation, "value")
+                    else str(l.relation)
+                )
+                human_edges.add((l.goal_id, l.req_id, rel))
         await session.execute(
-            delete(GoalLink).where(GoalLink.goal_id.in_(payload_goal_ids))
+            delete(GoalLink).where(
+                GoalLink.goal_id.in_(payload_goal_ids),
+                GoalLink.detected_by != "human",
+            )
         )
     link_rows: list[GoalLink] = []
-    seen_edges: set[tuple[int, int, str]] = set()
+    seen_edges: set[tuple[int, int, str]] = set(human_edges)
     for ld in links:
         goal_id = alias_to_id.get(ld["goal_code"]) or code_to_id.get(
             ld["goal_code"]
@@ -664,7 +894,7 @@ async def upsert_goals(
         )
         edge = (goal_id, req_id, relation_val)
         if edge in seen_edges:
-            continue  # arista duplicada del LLM
+            continue  # arista duplicada del LLM o ya cubierta por curación humana
         seen_edges.add(edge)
         link_rows.append(
             GoalLink(
@@ -672,32 +902,35 @@ async def upsert_goals(
                 req_id=req_id,
                 relation=relation,
                 rationale=ld.get("rationale"),
+                detected_by=ld.get("detected_by", "agent"),
             )
         )
     session.add_all(link_rows)
 
-    # Stale: el PROPOSED que la inferencia ya no menciona se va con sus links;
-    # el confirmado/rechazado por un humano es decisión persistente y queda.
-    removed = 0
+    # Stale: el PROPOSED que la inferencia ya no menciona se MARCA stale —
+    # fila y links quedan para decisión (antes se borraba con sus links y cada
+    # re-run pisaba la curación). El confirmado/rechazado por un humano es
+    # decisión persistente y queda igual. Un stale re-mencionado por una
+    # inferencia posterior revive a PROPOSED (arriba, al matchear).
+    marked_stale = 0
     for gid, g in existing.items():
         if gid in matched_ids:
             continue
         if g.status == GoalStatus.PROPOSED:
-            await session.execute(
-                delete(GoalLink).where(GoalLink.goal_id == gid)
-            )
-            await session.delete(g)
-            removed += 1
+            g.status = GoalStatus.STALE
+            marked_stale += 1
 
     await session.commit()
     return {
-        # Total de goals vivos tras el upsert (re-inferidos + nuevos + stale
-        # humanos conservados).
-        "goals": len(rows_by_id) + (len(existing) - len(matched_ids) - removed),
+        # Total de goals tras el upsert: re-inferidos + nuevos + decisiones
+        # humanas conservadas + marcados stale (que siguen en la tabla).
+        "goals": len(rows_by_id) + (len(existing) - len(matched_ids)),
         "links": len(link_rows),
         "goals_kept": len(matched_ids),
         "goals_added": len(rows_by_id) - len(matched_ids),
-        "goals_removed": removed,
+        "goals_stale": marked_stale,
+        # Alias legado (era hard-delete); hoy cuenta los marcados stale.
+        "goals_removed": marked_stale,
     }
 
 
@@ -849,6 +1082,101 @@ async def update_goal(
     return g
 
 
+async def merge_goals(
+    session: AsyncSession,
+    project_id: int,
+    *,
+    keeper_code: str,
+    absorbed_codes: list[str],
+    statement: str | None = None,
+    rationale: str | None = None,
+) -> dict[str, Any]:
+    """Fusiona goals absorbidos en un keeper (consolidación del catálogo).
+
+    Camino de curación quirúrgica del modelo GORE: re-apunta los links de los
+    absorbidos AL keeper IN-PLACE (conserva detected_by/resolution — la
+    curación humana de las aristas sobrevive), retira los absorbidos como
+    REJECTED (soft, misma línea que el descarte soft de versiones: la fila y
+    su historial quedan), re-parenta los sub-goals que colgaban de un
+    absorbido y opcionalmente reescribe el enunciado del keeper con la
+    consolidación. NO es destructivo: los absorbidos quedan consultables y
+    una re-inferencia NO los revive automática (status REJECTED es decisión
+    humana: el upsert la preserva).
+
+    Dedupe de aristas por (keeper, req, relation): si el keeper ya tenía la
+    arista, la del absorbido se elimina (queda la del keeper con su
+    detected_by original). Devuelve {keeper, merged_links, dropped_links,
+    absorbed, subgoals_reparented}.
+    """
+    by_code: dict[str, Goal] = {
+        g.code: g for g in await list_goals(session, project_id)
+    }
+    keeper = by_code.get(keeper_code)
+    if keeper is None:
+        raise KeyError(f"goal {keeper_code} not found")
+    keep_status = {
+        GoalStatus.CONFIRMED.value,
+        GoalStatus.REJECTED.value,
+    }
+    absorbed_goals: list[Goal] = []
+    for code in absorbed_codes:
+        if code == keeper_code:
+            raise ValueError(f"{code} es el keeper: no puede absorberse a sí mismo")
+        g = by_code.get(code)
+        if g is None:
+            raise KeyError(f"goal {code} not found")
+        if g.status.value in keep_status and g.kind != keeper.kind:
+            raise ValueError(
+                f"{code} tiene decisión humana ({g.status.value}) y kind "
+                f"distinto del keeper: fusionar requiere reversión explícita"
+            )
+        absorbed_goals.append(g)
+    if not absorbed_goals:
+        raise ValueError("absorbed_codes vacío")
+
+    links = await list_goal_links(session, project_id)
+    absorbed_ids = {g.id for g in absorbed_goals}
+    keeper_links = {
+        (l.req_id, l.relation.value) for l in links if l.goal_id == keeper.id
+    }
+    merged_links = dropped_links = 0
+    for l in links:
+        if l.goal_id not in absorbed_ids:
+            continue
+        key = (l.req_id, l.relation.value)
+        if key in keeper_links:
+            # La arista ya existe en el keeper: la del absorbido se elimina
+            # (el keeper conserva la SUYA con su detected_by original).
+            await session.delete(l)
+            dropped_links += 1
+        else:
+            # Re-apuntar IN-PLACE: detected_by y resolution del link viajan
+            # con él (curación humana preservada).
+            l.goal_id = keeper.id
+            keeper_links.add(key)
+            merged_links += 1
+    subgoals_reparented = 0
+    for g in by_code.values():
+        if g.parent_id in absorbed_ids:
+            g.parent_id = keeper.id
+            subgoals_reparented += 1
+    for g in absorbed_goals:
+        g.parent_id = None
+        g.status = GoalStatus.REJECTED
+    if statement is not None and statement.strip():
+        keeper.statement = statement.strip()
+    if rationale is not None and rationale.strip():
+        keeper.rationale = rationale.strip()
+    await session.commit()
+    return {
+        "keeper": keeper.code,
+        "merged_links": merged_links,
+        "dropped_links": dropped_links,
+        "absorbed": [g.code for g in absorbed_goals],
+        "subgoals_reparented": subgoals_reparented,
+    }
+
+
 async def set_link_status(
     session: AsyncSession,
     link_id: int,
@@ -944,16 +1272,20 @@ def srs_to_dict(
 async def get_latest_srs(
     session: AsyncSession, project_id: int
 ) -> SrsDocument | None:
-    """La versión más reciente del SRS del proyecto, ignorando descartadas.
+    """La versión más reciente del SRS del proyecto, ignorando descartadas/draft.
 
     Las DISCARDED no cuentan: descartar v11 hace que la «última» vuelva a ser
-    la v10 previa, que es la base del seed y de la cobertura del router.
+    la v10 previa, que es la base del seed y de la cobertura del router. Las
+    DRAFT tampoco: son materialización temprana del run EN CURSO (aún sin
+    commit) y no deben ser base de seed ni «última» — el commit las promueve.
     """
     return await session.scalar(
         select(SrsDocument)
         .where(
             SrsDocument.project_id == project_id,
-            SrsDocument.status != SrsStatus.DISCARDED,
+            SrsDocument.status.notin_(
+                [SrsStatus.DISCARDED, SrsStatus.DRAFT]
+            ),
         )
         .order_by(SrsDocument.version.desc())
         .limit(1)
@@ -1016,6 +1348,80 @@ async def create_srs(
     await session.commit()
     await session.refresh(row)
     return row
+
+
+async def create_srs_draft(
+    session: AsyncSession, project_id: int, payload: dict[str, Any]
+) -> SrsDocument:
+    """Crea una versión DRAFT del SRS: materialización temprana del run.
+
+    La llama ``draft_narrative`` apenas la prosa está lista, ANTES del commit:
+    el usuario ve el documento en el visor (badge DRAFT) sin esperar a que
+    termine el pipeline. ``commit_srs`` la promueve in-place a CANDIDATE
+    (misma fila, mismo número); un run abortado deja el DRAFT visible como
+    foto del intento. No es base de seed ni «última» (``get_latest_srs``
+    salta los DRAFT). La numeración usa max(version)+1 sobre TODAS las filas,
+    así que un DRAFT huérfano nunca colisiona.
+    """
+    cur = await session.scalar(
+        select(func.max(SrsDocument.version)).where(
+            SrsDocument.project_id == project_id
+        )
+    )
+    version = (cur or 0) + 1
+    row = SrsDocument(
+        project_id=project_id,
+        version=version,
+        status=SrsStatus.DRAFT,
+        structure=payload.get("structure", []),
+        narrative=payload.get("narrative", {}),
+        markdown=payload.get("markdown", ""),
+        quality_summary=payload.get("quality_summary", {}),
+        coverage=payload.get("coverage", {}),
+        traceability=payload.get("traceability", {}),
+        review_flags=payload.get("review_flags", {}),
+        requirement_codes=payload.get("requirement_codes", []),
+        requirement_count=payload.get("requirement_count", 0),
+        generated_by=payload.get("generated_by", "agent"),
+    )
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+async def promote_srs_draft(
+    session: AsyncSession,
+    project_id: int,
+    version: int,
+    payload: dict[str, Any],
+) -> SrsDocument:
+    """Promueve in-place un DRAFT a CANDIDATE con el payload final del commit.
+
+    Misma fila y mismo número de versión: el DRAFT que el usuario vio durante
+    el run se convierte en la versión formal. Solo aplica desde DRAFT (un
+    CANDIDATE/LOCKED/DISCARDED con ese número es un error de programación).
+    """
+    s = await get_srs_version(session, project_id, version)
+    if s is None:
+        raise KeyError(f"srs version {version} not found")
+    if s.status != SrsStatus.DRAFT:
+        raise ValueError(
+            f"srs version {version} no es DRAFT (status={s.status.value})"
+        )
+    s.status = SrsStatus.CANDIDATE
+    s.structure = payload.get("structure", s.structure)
+    s.narrative = payload.get("narrative", s.narrative)
+    s.markdown = payload.get("markdown", s.markdown)
+    s.quality_summary = payload.get("quality_summary", s.quality_summary)
+    s.coverage = payload.get("coverage", s.coverage)
+    s.traceability = payload.get("traceability", s.traceability)
+    s.review_flags = payload.get("review_flags", s.review_flags)
+    s.requirement_codes = payload.get("requirement_codes", s.requirement_codes)
+    s.requirement_count = payload.get("requirement_count", s.requirement_count)
+    await session.commit()
+    await session.refresh(s)
+    return s
 
 
 async def discard_srs_version(
@@ -1083,6 +1489,109 @@ async def update_srs(
     await session.commit()
     await session.refresh(s)
     return s
+
+
+async def patch_narrative_section(
+    session: AsyncSession,
+    project_id: int,
+    version: int,
+    *,
+    section_id: str,
+    text: str,
+    note: str | None = None,
+) -> SrsDocument:
+    """Edita UNA subsección authored de una versión del SRS en el lugar.
+
+    Anti-cascada (sesión 17 de Planitrack2.0): hasta ahora la única vía para
+    materializar un ajuste de redacción era seed + draft_narrative + commit
+    (una versión NUEVA con re-proyección completa por más mínimo el cambio).
+    Este parche escribe la clave en el JSON de narrative, regenera el
+    markdown proyectado (mismas secciones projected, prosa actualizada) y
+    queda auditado en review_flags.narrative_patches (últimos 20). Sin LLM,
+    sin versión nueva. LOCKED es inmutable y las DISCARDED no se editan.
+    """
+    s = await get_srs_version(session, project_id, version)
+    if s is None:
+        raise KeyError(f"srs version {version} not found")
+    if s.status == SrsStatus.LOCKED:
+        raise ValueError("LOCKED SRS is immutable")
+    if s.status == SrsStatus.DISCARDED:
+        raise ValueError("SRS version is discarded")
+    old = s.narrative.get(section_id)
+    if old is None:
+        raise KeyError(f"narrative section {section_id} not found")
+    if isinstance(old, str) and old.strip() == text.strip():
+        raise ValueError("patch is a no-op: the section already has that text")
+
+    narrative = dict(s.narrative)
+    narrative[section_id] = text
+    built = await build_srs(
+        session,
+        project_id,
+        project_name=(
+            await session.scalar(
+                select(Project.name).where(Project.id == project_id)
+            )
+        )
+        or "",
+        narrative=narrative,
+        structure=s.structure or None,
+    )
+    s.narrative = narrative
+    s.markdown = built["markdown"]
+
+    # Auditoría: cola acotada (20) dentro de review_flags; la fila NO cambia
+    # de estado, así el visor no ve saltos de versión ni de badge.
+    flags = dict(s.review_flags or {})
+    patches = list(flags.get("narrative_patches") or [])
+    patches.append(
+        {
+            "section_id": section_id,
+            "note": note,
+            "at": datetime.utcnow().isoformat(timespec="seconds"),
+        }
+    )
+    flags["narrative_patches"] = patches[-20:]
+    s.review_flags = flags
+
+    await session.commit()
+    await session.refresh(s)
+    return s
+
+
+def srs_commit_signature(
+    narrative: dict,
+    *,
+    statements: list[tuple[str, str]],
+    requirement_count: int,
+    goals_summary: dict | None = None,
+    coverage_totals: dict | None = None,
+) -> str:
+    """Huella del contenido de un SRS candidato (anti-commit-no-op).
+
+    Cubre lo authored de la prosa, el catálogo de requerimientos con sus
+    enunciados (una edición de texto sin cambio de código TAMBIÉN cambia la
+    versión: §2.2 se re-proyecta desde el store), el conteo, el resumen de
+    goals y los totales de cobertura. El markdown NO entra: es derivado.
+
+    El commit persiste la firma en ``review_flags.commit_signature``; el
+    guard compara la firma nueva contra la PERSISTIDA (versiones previas sin
+    firma → commit normal, retrocompatible).
+    """
+    basis = {
+        "narrative": {
+            k: v
+            for k, v in sorted(narrative.items())
+            if isinstance(v, str) and v.strip()
+        },
+        "statements": sorted(f"{code}\n{stmt or ''}" for code, stmt in statements),
+        "requirement_count": requirement_count,
+        "goals": goals_summary or {},
+        "coverage_totals": coverage_totals or {},
+    }
+    return hashlib.sha256(
+        json.dumps(basis, ensure_ascii=False, sort_keys=True).encode()
+    ).hexdigest()
 
 
 async def reproject_srs(

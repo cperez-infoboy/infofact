@@ -31,7 +31,11 @@ from langchain_core.tools import tool
 
 from backend.agents.no_fs_tools import NoFilesystemToolsMiddleware
 from backend.agents.llm_retry_guard import EmptyResponseRetryMiddleware
-from backend.agents.size_guard import SizeGuardMiddleware
+from backend.agents.sandboxes.docker_sandbox import DockerSandbox
+from backend.agents.size_guard import (
+    SizeGuardMiddleware,
+    make_summarization_middleware,
+)
 from backend.agents.subagents.analysis_run_holder import (
     STAGE_ADR,
     STAGE_ARCHITECTURE,
@@ -250,6 +254,233 @@ def _loop_err(exc: StageLoopExceeded) -> dict[str, Any]:
     }
 
 
+def _stage_busy(stage: str) -> dict[str, Any]:
+    """Rechazo de doble despacho: ya hay un pipeline en vuelo en el holder."""
+    return {
+        "error": "stage_in_progress",
+        "stage": stage,
+        "message": (
+            f"Ya hay una ejecución en curso en este run de análisis (etapa "
+            f"{stage}): probable reenvío del comando o doble delegación. NO "
+            "re-ejecutes la etapa ni reinicies la cascada: esperá el "
+            "resultado de la corrida en curso e informa al usuario."
+        ),
+    }
+
+
+def _commit_without_run() -> dict[str, Any]:
+    """Commit sin holder: el proceso se reinició u otra ejecución ya
+    commiteó y limpió el holder.
+
+    El mensaje dirige a VERIFICAR la versión persistida antes de aceptar una
+    re-ejecución de la cascada completa (horas de LLM): en la corrida
+    2026-09-11 el modelo lanzó una tercera cascada por este error con la
+    versión v3 ya en la DB.
+    """
+    return {
+        "error": "no_active_analysis_run",
+        "message": (
+            "No hay un run de análisis activo: el proceso se reinició o otra "
+            "ejecución ya hizo commit y limpió el holder. ANTES de re-crear "
+            "el run, verifica si ya existe una versión CANDIDATE recién "
+            "generada (visor de análisis): si existe, NO re-ejecutes la "
+            "cascada completa — repórtala al usuario o usá el modo "
+            "refinamiento (refine_analysis) para re-ejecutar etapas "
+            "puntuales sobre ella."
+        ),
+    }
+
+
+async def _latest_analysis_document(project_id: int) -> dict | None:
+    """Payload dict del último AnalysisDocument del proyecto (o None).
+
+    Reúne las filas hijas (entidades, relaciones, ADRs, proyectos,
+    sub-proyectos, contratos) para sembrar el holder en modo refinamiento
+    sin re-generar nada. Espejo de ``seed_from_last_srs`` del srs-agent.
+    """
+    from backend.services import analysis_store
+
+    async with AsyncSessionLocal() as session:
+        latest = await analysis_store.get_latest_analysis(session, project_id)
+        if latest is None:
+            return None
+        entities = await analysis_store.list_domain_entities(session, latest.id)
+        rels = await analysis_store.list_domain_relationships(
+            session, latest.id
+        )
+        adrs = await analysis_store.list_adrs(session, latest.id)
+        projects = await analysis_store.list_projects(session, latest.id)
+        sub_projects = await analysis_store.list_sub_projects(
+            session, latest.id
+        )
+        contracts = await analysis_store.list_contracts(session, latest.id)
+        return {
+            "id": latest.id,
+            "version": latest.version,
+            "srs_version": latest.srs_version,
+            "mer_diagram": latest.mer_diagram or "",
+            "mer_diagram_description": (
+                latest.mer_diagram_description or ""
+            ),
+            "nfr_analysis": latest.nfr_analysis or {},
+            "component_diagram": latest.component_diagram or "",
+            "entities": [
+                analysis_store.entity_to_dict(e) for e in entities
+            ],
+            "relationships": [
+                analysis_store.relationship_to_dict(r) for r in rels
+            ],
+            "adrs": [analysis_store.adr_to_dict(a) for a in adrs],
+            "projects": [
+                analysis_store.project_to_dict(p) for p in projects
+            ],
+            "sub_projects": [
+                analysis_store.subproject_to_dict(s) for s in sub_projects
+            ],
+            "contracts": [
+                analysis_store.contract_to_dict(c) for c in contracts
+            ],
+        }
+
+
+def _seed_holder_from_document(run, doc: dict | None) -> dict[str, int]:
+    """Siembra resultados tipados del documento previo en el holder.
+
+    Sin esto, re-ejecutar SOLO una etapa (p. ej. propose_subprojects) tras
+    ``refine_analysis`` recibía un holder vacío (mer_result=None) y la etapa
+    no podía correr. Best-effort por fila: una fila corrupta se salta, no
+    rompe el siembra. ``process_result`` NO se siembra (los diagramas
+    persisten como Mermaid crudo; patch_commit copia el bloque desde el
+    documento previo si la etapa no se re-ejecuta).
+    """
+    if not doc:
+        return {}
+    from backend.agents.pipelines.adr_pipeline import AdrResult, AdrSchema
+    from backend.agents.pipelines.mer_pipeline import (
+        MerAttribute,
+        MerEntitySchema,
+        MerRelationshipSchema,
+        MerResult,
+    )
+    from backend.agents.pipelines.nfr_pipeline import (
+        NfrDecision,
+        NfrResult,
+        StackDecision,
+    )
+    from backend.agents.pipelines.project_pipeline import (
+        ProjectResult,
+        ProjectSkeleton,
+    )
+
+    counts: dict[str, int] = {}
+
+    entities_raw = doc.get("entities") or []
+    code_to_name = {
+        (e.get("code") or ""): (e.get("name") or "") for e in entities_raw
+    }
+    entities: list[MerEntitySchema] = []
+    for e in entities_raw:
+        try:
+            entities.append(
+                MerEntitySchema(
+                    name=e.get("name") or "",
+                    description=e.get("description") or "",
+                    attributes=[
+                        MerAttribute(**a)
+                        for a in (e.get("attributes") or [])
+                    ],
+                    aggregate_root=bool(e.get("aggregate_root")),
+                    bounded_context=e.get("bounded_context") or "",
+                    traced_req_codes=list(e.get("traced_req_codes") or []),
+                )
+            )
+        except Exception:  # noqa: BLE001 — fila corrupta se salta
+            continue
+    relationships: list[MerRelationshipSchema] = []
+    for r in doc.get("relationships") or []:
+        try:
+            from_code = r.get("from_entity_code") or ""
+            to_code = r.get("to_entity_code") or ""
+            relationships.append(
+                MerRelationshipSchema(
+                    from_entity=code_to_name.get(from_code, from_code),
+                    to_entity=code_to_name.get(to_code, to_code),
+                    cardinality=r.get("cardinality") or "1:N",
+                    label=r.get("label") or "",
+                    description=r.get("description") or "",
+                    traced_req_codes=list(r.get("traced_req_codes") or []),
+                )
+            )
+        except Exception:  # noqa: BLE001
+            continue
+    if entities:
+        run.mer_result = MerResult(
+            entities=entities,
+            relationships=relationships,
+            mermaid=doc.get("mer_diagram") or "",
+            description=doc.get("mer_diagram_description") or "",
+        )
+        counts["entities"] = len(entities)
+        counts["relationships"] = len(relationships)
+
+    nfr = doc.get("nfr_analysis") or {}
+    decisions: list[NfrDecision] = []
+    for d in nfr.get("decisions") or []:
+        try:
+            decisions.append(NfrDecision(**d))
+        except Exception:  # noqa: BLE001
+            continue
+    stack: list[StackDecision] = []
+    for s in nfr.get("stack") or []:
+        try:
+            stack.append(StackDecision(**s))
+        except Exception:  # noqa: BLE001
+            continue
+    if decisions or stack:
+        run.nfr_result = NfrResult(
+            decisions=decisions,
+            stack=stack,
+            data_consistency=nfr.get("data_consistency") or "",
+            patterns=nfr.get("patterns") or "",
+        )
+        counts["nfr_decisions"] = len(decisions)
+
+    adrs: list[AdrSchema] = []
+    for a in doc.get("adrs") or []:
+        try:
+            adrs.append(AdrSchema(**a))
+        except Exception:  # noqa: BLE001
+            continue
+    if adrs:
+        run.adr_result = AdrResult(adrs=adrs)
+        counts["adrs"] = len(adrs)
+
+    projects: list[ProjectSkeleton] = []
+    for p in doc.get("projects") or []:
+        try:
+            projects.append(
+                ProjectSkeleton(
+                    name=p.get("name") or "",
+                    description=p.get("description") or "",
+                    domain_type=p.get("domain_type") or "supporting",
+                    bounded_contexts=list(p.get("bounded_contexts") or []),
+                    entity_names=list(
+                        p.get("entity_names")
+                        or p.get("entity_codes")
+                        or []
+                    ),
+                    traced_req_codes=list(p.get("traced_req_codes") or []),
+                )
+            )
+        except Exception:  # noqa: BLE001
+            continue
+    if projects:
+        run.project_result = ProjectResult(projects=projects)
+        counts["projects"] = len(projects)
+
+    return counts
+
+
 # ---------------------------------------------------------------------------
 # Stage tools.
 # ---------------------------------------------------------------------------
@@ -312,16 +543,35 @@ Mermaid erDiagram. Emite ``analysis.mer_ready``.
         run.requirement_codes = [it.code for it in live]
         run.requirement_count = len(live)
 
-        result = await _generate_mer(
-            functional,
-            project_name=run.project_name,
-            project_description=run.project_description,
-            goals=functional_goals,
-            feedback=run.feedback or "",
-        )
+        # Guarda anti doble despacho: un solo pipeline en vuelo por holder.
+        if not run.begin_stage(STAGE_MER):
+            return _stage_busy(STAGE_MER)
+        try:
+            result = await _generate_mer(
+                functional,
+                project_name=run.project_name,
+                project_description=run.project_description,
+                goals=functional_goals,
+                feedback=run.feedback or "",
+                on_progress=lambda msg: on_progress(
+                    STAGE_MER, msg, {"phase": "batch"}
+                ),
+            )
+        finally:
+            run.end_stage(STAGE_MER)
         run.mer_result = result
         run.stages_done.add(STAGE_MER)
 
+        # Guard anti-cascada-vacía: 0 entidades con corpus de entrada significa
+        # que las pasadas fallaron (o el corpus no genera modelo); el agente
+        # debe reportarlo y decidir (reintento dentro del cap de 3), no
+        # continuar una cascada de etapas vacía sin saberlo.
+        mer_empty = len(result.entities) == 0 and bool(live)
+        if mer_empty:
+            logger.warning(
+                "generate_mer terminó con 0 entidades (%d requerimientos vivos)",
+                len(live),
+            )
         elapsed = (time.perf_counter() - t0) * 1000
         run.timings[STAGE_MER] = elapsed
         await on_progress(
@@ -334,7 +584,7 @@ Mermaid erDiagram. Emite ``analysis.mer_ready``.
             "relationships": len(result.relationships),
         })
 
-        return {
+        out = {
             "stage": STAGE_MER,
             "entities": len(result.entities),
             "relationships": len(result.relationships),
@@ -344,6 +594,29 @@ Mermaid erDiagram. Emite ``analysis.mer_ready``.
             }),
             "stages_done": sorted(run.stages_done),
         }
+        consolidation = result.stats.get("consolidation") or {}
+        if consolidation.get("merges"):
+            out["consolidation"] = {
+                "before": consolidation.get("before"),
+                "after": consolidation.get("after"),
+                "merges": len(consolidation.get("merges") or []),
+                "detail": consolidation.get("merges"),
+            }
+            out["message"] = (
+                f"El MER se afinó: {consolidation.get('before')} entidades "
+                f"detectadas -> {consolidation.get('after')} tras "
+                f"{len(consolidation.get('merges') or [])} fusiones de "
+                "duplicados/sinónimos. Repórtalo al usuario en tu resumen."
+            )
+        if mer_empty:
+            out["mer_empty"] = True
+            out["message"] = (
+                "La etapa terminó con 0 entidades pese a haber "
+                f"{len(live)} requerimientos vivos. NO continúes con las "
+                "etapas dependientes: repórtalo al usuario y reintenta la "
+                "etapa o indaga la causa antes de seguir."
+            )
+        return out
 
     @tool
     async def analyze_nfrs() -> dict:
@@ -383,13 +656,18 @@ capa, estrategia de consistencia y patrones. Emite ``analysis.nfr_ready``.
         active = [g for g in all_goals if g.status != GoalStatus.REJECTED]
         softgoals = [g for g in active if g.kind == GoalKind.SOFTGOAL]
 
-        result = await _analyze_nfrs(
-            nfrs,
-            project_name=run.project_name,
-            project_description=run.project_description,
-            softgoals=softgoals,
-            feedback=run.feedback or "",
-        )
+        if not run.begin_stage(STAGE_NFR):
+            return _stage_busy(STAGE_NFR)
+        try:
+            result = await _analyze_nfrs(
+                nfrs,
+                project_name=run.project_name,
+                project_description=run.project_description,
+                softgoals=softgoals,
+                feedback=run.feedback or "",
+            )
+        finally:
+            run.end_stage(STAGE_NFR)
         run.nfr_result = result
         run.stages_done.add(STAGE_NFR)
 
@@ -465,14 +743,22 @@ Emite ``analysis.process_ready``.
             g for g in active if g.kind == GoalKind.FUNCTIONAL_GOAL
         ]
 
-        result = await _generate_processes(
-            functional,
-            mer_result=run.mer_result,
-            project_name=run.project_name,
-            project_description=run.project_description,
-            goals=functional_goals,
-            feedback=run.feedback or "",
-        )
+        if not run.begin_stage(STAGE_PROCESS):
+            return _stage_busy(STAGE_PROCESS)
+        try:
+            result = await _generate_processes(
+                functional,
+                mer_result=run.mer_result,
+                project_name=run.project_name,
+                project_description=run.project_description,
+                goals=functional_goals,
+                feedback=run.feedback or "",
+                on_progress=lambda msg: on_progress(
+                    STAGE_PROCESS, msg, {"phase": "batch"}
+                ),
+            )
+        finally:
+            run.end_stage(STAGE_PROCESS)
         run.process_result = result
         run.stages_done.add(STAGE_PROCESS)
 
@@ -538,14 +824,19 @@ Requiere que ``analyze_nfrs`` haya corrido antes. Emite ``analysis.adr_ready``.
         active = [g for g in all_goals if g.status != GoalStatus.REJECTED]
         softgoals = [g for g in active if g.kind == GoalKind.SOFTGOAL]
 
-        result = await _generate_adrs(
-            run.nfr_result,
-            run.mer_result,
-            project_name=run.project_name,
-            project_description=run.project_description,
-            softgoals=softgoals,
-            feedback=run.feedback or "",
-        )
+        if not run.begin_stage(STAGE_ADR):
+            return _stage_busy(STAGE_ADR)
+        try:
+            result = await _generate_adrs(
+                run.nfr_result,
+                run.mer_result,
+                project_name=run.project_name,
+                project_description=run.project_description,
+                softgoals=softgoals,
+                feedback=run.feedback or "",
+            )
+        finally:
+            run.end_stage(STAGE_ADR)
         run.adr_result = result
         run.stages_done.add(STAGE_ADR)
 
@@ -638,16 +929,21 @@ las fronteras usando métricas objetivas del grafo del MER. Requiere que \
             )
             project_rules_block = ""
 
-        result = await _discover_projects(
-            mer_result=run.mer_result,
-            process_result=run.process_result,
-            adr_result=run.adr_result,
-            project_name=run.project_name,
-            project_description=run.project_description,
-            goals=active,
-            feedback=run.feedback or "",
-            rules_block=project_rules_block,
-        )
+        if not run.begin_stage(STAGE_PROJECTS):
+            return _stage_busy(STAGE_PROJECTS)
+        try:
+            result = await _discover_projects(
+                mer_result=run.mer_result,
+                process_result=run.process_result,
+                adr_result=run.adr_result,
+                project_name=run.project_name,
+                project_description=run.project_description,
+                goals=active,
+                feedback=run.feedback or "",
+                rules_block=project_rules_block,
+            )
+        finally:
+            run.end_stage(STAGE_PROJECTS)
         run.project_result = result
         run.stages_done.add(STAGE_PROJECTS)
 
@@ -720,16 +1016,24 @@ anterior. Requiere que ``generate_mer``, ``generate_adrs`` y \
             all_goals = await list_goals(session, project_id)
         active = [g for g in all_goals if g.status != GoalStatus.REJECTED]
 
-        result = await _propose_subprojects(
-            mer_result=run.mer_result,
-            adr_result=run.adr_result,
-            nfr_result=run.nfr_result,
-            project_result=run.project_result,
-            project_name=run.project_name,
-            project_description=run.project_description,
-            goals=active,
-            feedback=run.feedback or "",
-        )
+        if not run.begin_stage(STAGE_SUBPROJECT):
+            return _stage_busy(STAGE_SUBPROJECT)
+        try:
+            result = await _propose_subprojects(
+                mer_result=run.mer_result,
+                adr_result=run.adr_result,
+                nfr_result=run.nfr_result,
+                project_result=run.project_result,
+                project_name=run.project_name,
+                project_description=run.project_description,
+                goals=active,
+                feedback=run.feedback or "",
+                on_progress=lambda msg: on_progress(
+                    STAGE_SUBPROJECT, msg, {"phase": "batch"}
+                ),
+            )
+        finally:
+            run.end_stage(STAGE_SUBPROJECT)
         run.subproject_result = result
         run.stages_done.add(STAGE_SUBPROJECT)
 
@@ -745,13 +1049,31 @@ anterior. Requiere que ``generate_mer``, ``generate_adrs`` y \
             "contracts": len(result.contracts),
         })
 
-        return {
+        failed_batches = int(result.stats.get("failed_batches", 0) or 0)
+        fallback = bool(result.stats.get("detailing_fallback"))
+        out = {
             "stage": STAGE_SUBPROJECT,
             "sub_projects": len(result.sub_projects),
             "contracts": len(result.contracts),
             "has_component_diagram": bool(result.component_diagram_mermaid),
+            "failed_batches": failed_batches,
+            "degraded": bool(failed_batches or fallback),
+            "self_contracts_dropped": int(
+                result.stats.get("self_contracts_dropped", 0) or 0
+            ),
+            "orphans_reassigned": int(
+                result.stats.get("orphans_reassigned", 0) or 0
+            ),
             "stages_done": sorted(run.stages_done),
         }
+        if failed_batches or fallback:
+            out["message"] = (
+                f"El detailing perdió {failed_batches} lote(s) por "
+                "truncado de salida. Los sub-proyectos de esos lotes NO "
+                "están en el resultado: repórtalo al usuario y decide si "
+                "reintentar la etapa (cap 3) o continuar con lo generado."
+            )
+        return out
 
     @tool
     async def generate_architecture() -> dict:
@@ -800,6 +1122,9 @@ hayan corrido antes. Emite ``analysis.architecture_ready``.
             generate_architecture as _generate_architecture,
         )
 
+        # Guarda anti doble despacho: un solo pipeline en vuelo por holder.
+        if not run.begin_stage(STAGE_ARCHITECTURE):
+            return _stage_busy(STAGE_ARCHITECTURE)
         try:
             result = await _generate_architecture(
                 mer_result=run.mer_result,
@@ -839,6 +1164,8 @@ hayan corrido antes. Emite ``analysis.architecture_ready``.
         except Exception as exc:  # noqa: BLE001 — surface to the model
             logger.exception("generate_architecture failed")
             return {"error": f"generate_architecture failed: {exc}"}
+        finally:
+            run.end_stage(STAGE_ARCHITECTURE)
 
     @tool
     async def commit_analysis() -> dict:
@@ -851,7 +1178,7 @@ AnalysisDocument versionado. Es la UNICA etapa que escribe la DB. Emite \
         """
         run = get_run(project_id)
         if run is None:
-            return _no_run("generate_mer")
+            return _commit_without_run()
         try:
             run.bump(STAGE_COMMIT)
         except StageLoopExceeded as exc:
@@ -880,6 +1207,9 @@ AnalysisDocument versionado. Es la UNICA etapa que escribe la DB. Emite \
             list_goals,
         )
 
+        # Guarda anti doble despacho: evita un doble commit concurrente.
+        if not run.begin_stage(STAGE_COMMIT):
+            return _stage_busy(STAGE_COMMIT)
         try:
             async with AsyncSessionLocal() as session:
                 # Codigos de todos los requerimientos vivos para trazabilidad.
@@ -1072,6 +1402,8 @@ AnalysisDocument versionado. Es la UNICA etapa que escribe la DB. Emite \
         except Exception as exc:  # noqa: BLE001 — surface to the model
             logger.exception("commit_analysis failed")
             return {"error": f"commit_analysis failed: {exc}"}
+        finally:
+            run.end_stage(STAGE_COMMIT)
 
         elapsed = (time.perf_counter() - t0) * 1000
         run.timings[STAGE_COMMIT] = elapsed
@@ -1088,9 +1420,16 @@ AnalysisDocument versionado. Es la UNICA etapa que escribe la DB. Emite \
             "adrs": len(adrs),
             "sub_projects": len(sub_projects),
             "requirement_count": analysis.requirement_count,
+            # Tiempos por etapa para el banner de progreso del chat.
+            "timings": {k: round(v) for k, v in run.timings.items()},
         })
 
-        clear_run(project_id)
+        # Limpieza con identidad: con doble despacho, el commit de ESTE run
+        # no debe borrarle el holder al otro (corrida 2026-09-11: el commit
+        # del run A dejó sin holder al run B en plena arquitectura, y su
+        # commit falló con no_active_analysis_run).
+        if get_run(project_id) is run:
+            clear_run(project_id)
         return {
             "stage": STAGE_COMMIT,
             "version": analysis.version,
@@ -1156,14 +1495,27 @@ AnalysisDocument versionado. Es la UNICA etapa que escribe la DB. Emite \
             }
             run.calls = {}
 
+            # Siembra del holder con los resultados tipados del documento
+            # previo: sin esto, re-ejecutar UNA etapa recibiría mer_result=
+            # None y la etapa no podía correr (falla detectada en la
+            # corrida Planitrack2.0 del 2026-09-10: sub-proyectos bloqueada
+            # y refinamiento imposible).
+            doc = await _latest_analysis_document(project_id)
+            seeded = _seed_holder_from_document(run, doc)
+
             return {
                 "status": "loaded",
                 "version": latest.version,
                 "feedback": feedback,
+                "seeded_counts": seeded,
                 "message": (
-                    f"Analisis version {latest.version} cargado. Feedback "
-                    f"registrado. Decide que etapas re-generar basandote en "
-                    f"el feedback y las dependencias entre etapas."
+                    f"Analisis version {latest.version} cargado y holder "
+                    f"sembrado ({len(seeded)} colecciones: "
+                    + ", ".join(f"{k}={v}" for k, v in seeded.items())
+                    + "). Feedback registrado. Decide que etapas "
+                    "re-generar basandote en el feedback y las "
+                    "dependencias entre etapas; las NO re-ejecutadas "
+                    "salen del holder sembrado."
                 ),
             }
         except Exception as exc:  # noqa: BLE001 — surface to the model
@@ -1250,6 +1602,12 @@ AnalysisDocument versionado. Es la UNICA etapa que escribe la DB. Emite \
                 prev_contracts = await analysis_store.list_contracts(
                     session, prev_doc.id
                 )
+                # Cargado junto al resto de las filas previas: la copia de
+                # sub-proyectos necesita el mapa proyecto -> nombre y la
+                # sesion solo es valida dentro de este async with.
+                prev_projects = await analysis_store.list_projects(
+                    session, prev_doc.id
+                )
                 items = await list_requirements(
                     session, project_id, include_deleted=True
                 )
@@ -1319,10 +1677,29 @@ AnalysisDocument versionado. Es la UNICA etapa que escribe la DB. Emite \
                 entities = [
                     analysis_store.entity_to_dict(e) for e in prev_entities
                 ]
-                relationships = [
-                    analysis_store.relationship_to_dict(r)
-                    for r in prev_relationships
-                ]
+                # Traducir codigos de relacion previos a NOMBRES para que
+                # create_analysis re-asigne los codigos nuevos y descarte
+                # extremos colgantes (mismo patron que sp_code_to_name para
+                # contratos).
+                ent_code_to_name = {e.code: e.name for e in prev_entities}
+                relationships = []
+                for r in prev_relationships:
+                    relationships.append({
+                        "from_entity": ent_code_to_name.get(
+                            r.from_entity_code, r.from_entity_code
+                        ),
+                        "to_entity": ent_code_to_name.get(
+                            r.to_entity_code, r.to_entity_code
+                        ),
+                        "cardinality": (
+                            r.cardinality.value
+                            if hasattr(r.cardinality, "value")
+                            else r.cardinality
+                        ),
+                        "label": r.label,
+                        "description": r.description,
+                        "traced_req_codes": r.traced_req_codes,
+                    })
                 mer_diagram = prev_doc.mer_diagram
 
             # --- NFR analysis ---
@@ -1376,9 +1753,6 @@ AnalysisDocument versionado. Es la UNICA etapa que escribe la DB. Emite \
                     for p in run.project_result.projects
                 ]
             else:
-                prev_projects = await analysis_store.list_projects(
-                    session, prev_doc.id
-                )
                 projects = [
                     analysis_store.project_to_dict(p)
                     for p in prev_projects
@@ -1398,10 +1772,23 @@ AnalysisDocument versionado. Es la UNICA etapa que escribe la DB. Emite \
                     run.subproject_result.component_diagram_mermaid
                 )
             else:
-                sub_projects = [
-                    analysis_store.subproject_to_dict(s)
-                    for s in prev_sub_projects
-                ]
+                # Traducir codigos previos a NOMBRES para que create_analysis
+                # re-asigne los codigos nuevos: los contratos via
+                # sp_code_to_name y la asociacion proyecto -> sub-proyecto via
+                # project_name (create_analysis ignora el project_code viejo;
+                # sin esta traduccion la copia queda con project_code=None y
+                # los sub-proyectos desaparecen del arbol del visor).
+                proj_code_to_name = {
+                    p.code: p.name for p in prev_projects
+                }
+                sub_projects = []
+                for s in prev_sub_projects:
+                    sp_dict = analysis_store.subproject_to_dict(s)
+                    if s.project_code:
+                        sp_dict["project_name"] = proj_code_to_name.get(
+                            s.project_code
+                        )
+                    sub_projects.append(sp_dict)
                 # Resolve old SUB-NNN codes to names so create_analysis can
                 # re-resolve them to new codes.
                 sp_code_to_name = {
@@ -1490,7 +1877,9 @@ AnalysisDocument versionado. Es la UNICA etapa que escribe la DB. Emite \
         })
 
         prev_version = prev_doc.version
-        clear_run(project_id)
+        # Limpieza con identidad (misma razón que en commit_analysis).
+        if get_run(project_id) is run:
+            clear_run(project_id)
         return {
             "stage": STAGE_COMMIT,
             "version": analysis.version,
@@ -1576,6 +1965,16 @@ def make_analysis_agent_subagent(
         "tools": stage_tools + _make_read_tools(project_id) + rules_tools,
         # deepagents NO propaga el middleware del orquestador a los
         # subagentes (pero SI les inyecta FilesystemMiddleware): cada spec
-        # necesita su guarda de tamaño y su filtro de tools de filesystem.
-        "middleware": [SizeGuardMiddleware(), EmptyResponseRetryMiddleware(), NoFilesystemToolsMiddleware()],
+        # necesita su guarda de tamaño, su filtro de tools de filesystem y
+        # su summarizer con techo (reemplaza al default de deepagents por
+        # nombre; sesion 17). El backend es el mismo sandbox del proyecto.
+        # Best-effort: sin LLM_API_KEY (smoke tests) queda el default.
+        "middleware": [
+            SizeGuardMiddleware(),
+            EmptyResponseRetryMiddleware(),
+            NoFilesystemToolsMiddleware(),
+            make_summarization_middleware(
+                DockerSandbox(profile=profile, project_slug=project_slug)
+            ),
+        ],
     }

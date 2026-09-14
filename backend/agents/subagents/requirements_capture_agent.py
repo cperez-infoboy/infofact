@@ -34,6 +34,7 @@ which embeds free-form user steering (text after the command) as
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import time
 from pathlib import Path
@@ -57,7 +58,11 @@ from backend.agents.pipelines.extraction import (
 )
 from backend.agents.pipelines.ingestion import discover_documents, verification_text
 from backend.agents.pipelines.parse_cache import parse_document_cached
-from backend.services.document_service import parser_hint_map
+from backend.services.document_service import (
+    ensure_document_registered,
+    mark_document_parsed,
+    parser_hint_map,
+)
 from backend.agents.subagents.capture_run_holder import (
     STAGE_ACTORS,
     STAGE_CLASSIFY,
@@ -76,15 +81,22 @@ from backend.agents.subagents.capture_run_holder import (
     scope_mismatch,
 )
 from backend.agents.llm_retry_guard import EmptyResponseRetryMiddleware
-from backend.agents.size_guard import SizeGuardMiddleware
+from backend.agents.sandboxes.docker_sandbox import DockerSandbox
+from backend.agents.size_guard import (
+    SizeGuardMiddleware,
+    make_summarization_middleware,
+)
 from backend.agents.tools.grouping_tools import make_grouping_tools
 from backend.agents.tools.actor_tools import make_actor_tools
 from backend.agents.tools.project_rules_tools import make_project_rules_tools
 from backend.agents.tools.requirements_tools import make_requirements_tools
+from backend.agents.tools.srs_tools import make_srs_read_tools
 from backend.agents.tools.vision_tools import make_vision_tools
 from backend.models.project_actor import ActorSource
 from backend.models.project_rule import RuleScope, RuleSource
 from backend.services import actor_store, project_rules_store
+
+logger = logging.getLogger(__name__)
 
 
 REQUIREMENTS_CAPTURE_AGENT_PROMPT = """\
@@ -226,6 +238,23 @@ saltear):
 - Los requerimientos viven en la base de datos del backend, fuera del sandbox:
   nunca los busques en archivos del workspace (no hay .db ni .sqlite
   accesibles) — el workspace solo contiene los documentos fuente del proyecto.
+
+CALIDAD DE REQUERIMIENTOS (backlog de hallazgos): tu toolset incluye la
+lectura de calidad del proyecto: `get_quality` (resumen + hallazgos
+paginados a 40, filtro `severity`, `offset` para avanzar) y
+`get_requirement_findings(req_code)` (los hallazgos de UN requerimiento).
+Antes de una curacion de enunciados por hallazgos, mira el backlog con
+get_quality(severity="major") o get_requirement_findings del req puntual en
+vez de inferir veredictos del historial de revisiones.
+- Al editar con update_requirements, los hallazgos deterministas que dejaron
+  de disparar se cierran solos (findings_closed); los de juez LLM (rule_id
+  sem.*) NO: el retorno los lista en `llm_findings_pending` con la nota de
+  que su veredicto llega con el re-analisis. REPORTA esa deuda en tu informe:
+  no afirmes que la cura "resolvio" un hallazgo LLM sin veredicto.
+- El veredicto formal (que hallazgos siguen, cuales se resolvieron, cuales
+  son nuevos) lo produce el srs-agent con /srs: analyze_quality es delta
+  (solo re-juzga lo editado, minutos). Tras una tanda de curas, sugiere al
+  usuario correr /srs para el re-escaneo — NO re-analices por tu cuenta.
 
 REGLAS PERSISTENTES DEL PROYECTO: el proyecto tiene un harness de
 consideraciones duraderas. Los stages inyectan automaticamente las activas
@@ -493,39 +522,39 @@ def _make_orient_tool(project_id: int, host_workspace: Path):
     return orient_documents
 
 
-async def _mark_used_in_capture(
-    project_id: int, docs: list[Path], host_workspace: Path
-) -> None:
-    """Mark the discovered documents as used_in_capture in ProjectDocument.
+async def _mark_used_in_capture(project_id: int, document_ids: list[int]) -> None:
+    """Mark the batch documents as used_in_capture in ProjectDocument, by id.
 
-    Maps filesystem paths to rel_path (relative to workspace root) and updates
-    the matching rows. Documents not in this batch keep their existing flag
-    (append mode); reset mode already cleared all flags via reset_project_capture.
+    By id (not rel_path): the rows are guaranteed by ensure_document_registered
+    during ingest, so the marking no longer depends on the registered rel_path
+    matching the discovered one exactly -- an UPDATE over 0 rows used to leave
+    ingested documents invisible to the SRS RAG in complete silence. Documents
+    not in this batch keep their existing flag (append mode); reset mode
+    already cleared all flags via reset_project_capture.
     """
     from sqlalchemy import update as sa_update
     from backend.database import AsyncSessionLocal
     from backend.models.project_document import ProjectDocument
 
-    root = host_workspace.resolve()
-    rel_paths: list[str] = []
-    for d in docs:
-        try:
-            rel_paths.append(str(d.relative_to(root)))
-        except ValueError:
-            continue
-    if not rel_paths:
+    if not document_ids:
         return
     async with AsyncSessionLocal() as session:
-        for rp in rel_paths:
-            await session.execute(
-                sa_update(ProjectDocument)
-                .where(
-                    ProjectDocument.project_id == project_id,
-                    ProjectDocument.rel_path == rp,
-                )
-                .values(used_in_capture=True)
+        result = await session.execute(
+            sa_update(ProjectDocument)
+            .where(
+                ProjectDocument.project_id == project_id,
+                ProjectDocument.id.in_(document_ids),
             )
+            .values(used_in_capture=True)
+        )
         await session.commit()
+        if result.rowcount < len(set(document_ids)):
+            logger.warning(
+                "used_in_capture marco %d de %d documentos del batch "
+                "(algunas filas desaparecieron a mitad de captura)",
+                result.rowcount,
+                len(set(document_ids)),
+            )
 
 
 async def _project_rules_block(project_id: int) -> str:
@@ -806,6 +835,28 @@ def _make_stage_tools(
         # demás caen a "auto" (el router decide).
         hint_map = await parser_hint_map(project_id, host_workspace.resolve())
 
+        # Auto-registro en el catálogo (Fase A): los docs descubiertos por
+        # filesystem deben tener fila en ProjectDocument o quedan invisibles
+        # para el conteo de fuentes y el RAG del SRS (el join de retrieval pasa
+        # por el catálogo). Best-effort: un fallo de registro no aborta la
+        # captura, pero se loguea -- nunca más en silencio.
+        doc_rows: dict[str, object | None] = {}
+        registered_count = 0
+        for d in docs:
+            try:
+                reg = await ensure_document_registered(
+                    project_id=project_id,
+                    host_root=host_workspace.resolve(),
+                    path=d,
+                )
+                doc_rows[str(d)] = reg.document
+                registered_count += 1 if reg.created else 0
+            except Exception as exc:  # noqa: BLE001 -- registrar no debe tumbar la ingesta
+                doc_rows[str(d)] = None
+                logger.warning(
+                    "registro de catalogo fallo para %s: %s", d.name, exc
+                )
+
         per_doc: list = []
         doc_texts: dict[str, str] = {}
         all_chunks: list = []
@@ -821,6 +872,16 @@ def _make_stage_tools(
             per_doc.append((chunks, smap))
             doc_texts[smap.document_id] = verification_text(chunks, smap)
             all_chunks.extend(chunks)
+            row = doc_rows.get(str(d))
+            if row is not None:
+                try:
+                    await mark_document_parsed(
+                        document_id=row.id, sha256=row.sha256
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "estado de parseo no actualizado para %s: %s", d.name, exc
+                    )
             await on_progress(
                 STAGE_INGEST, "parseado " + d.name,
                 {"current": idx + 1, "total": len(docs)},
@@ -839,11 +900,15 @@ def _make_stage_tools(
 
         # Mark discovered documents as used_in_capture so the SRS RAG
         # only searches within capture-processed documents.
-        await _mark_used_in_capture(project_id, docs, host_workspace)
+        await _mark_used_in_capture(
+            project_id,
+            [row.id for row in doc_rows.values() if row is not None],
+        )
 
         return {
             "documents": [d.name for d in docs],
             "total_chunks": len(all_chunks),
+            "catalog_registered": registered_count,
             "stages_done": sorted(run.stages_done),
         }
 
@@ -912,10 +977,15 @@ def _make_stage_tools(
     async def identify_actors() -> dict:
         """Determina los ACTORES del sistema desde los documentos ingeridos.
 
-        Una pasada LLM por documento (best-effort, espejo de
-        discover_conventions) que extrae los roles que interactúan con el
-        sistema (humanos y sistemas externos, NUNCA el «usuario» genérico) y
-        los persiste en el catálogo ProjectActor del proyecto (códigos R1..Rn,
+        Una pasada LLM por documento que identifica los actores que evidencia
+        y una pasada de CONSOLIDACIÓN SEMÁNTICA que agrupa los granulares en
+        roles generales (p. ej. Google Maps + OSRM -> «Proveedor de
+        cartografía»): el rol general absorbe los nombres de los miembros como
+        sinónimos y los miembros quedan retirados (soft, con auditoría).
+
+        Ambas pasadas son best-effort: si la consolidación falla, el catálogo
+        granular persistido sigue siendo válido. Los roles generales se
+        persisten en el catálogo ProjectActor del proyecto (códigos R1..Rn,
         idempotente: re-correr consolida sinónimos, no duplica). El catálogo
         se inyecta como bloque PROJECT_ACTORS en extract/critique/classify y
         alimenta los pre-checks de actor (smell.actor_missing reconoce los
@@ -969,6 +1039,50 @@ def _make_stage_tools(
                 res = {"created": 0, "updated": 0, "actors": []}
 
         run.actor_catalog = res.get("actors", [])
+
+        # Consolidación semántica (best-effort): agrupa los granulares que
+        # convergen en un rol general. Si falla, queda el catálogo granular,
+        # que sigue siendo válido para downstream.
+        consolidated_groups = 0
+        consolidated_retired = 0
+        active = [
+            a for a in run.actor_catalog if a.get("status") == "active"
+        ]
+        if len(active) >= 2:
+            await on_progress(
+                STAGE_ACTORS, "consolidación de actores",
+                {"phase": "consolidating"},
+            )
+            try:
+                from backend.agents.pipelines.extraction import (
+                    consolidate_actors,
+                )
+
+                cons = await consolidate_actors(
+                    active,
+                    project_name=run.project_name,
+                    project_description=run.project_description,
+                )
+                groups = [g.model_dump() for g in cons.groups]
+                if groups:
+                    from backend.database import AsyncSessionLocal
+
+                    async with AsyncSessionLocal() as session:
+                        applied = await actor_store.apply_actor_consolidation(
+                            session,
+                            project_id,
+                            groups,
+                            source=ActorSource.ACTORS_STAGE,
+                        )
+                        await session.commit()
+                    run.actor_catalog = applied["actors"]
+                    consolidated_groups = len(groups)
+                    consolidated_retired = len(applied["retired"])
+            except Exception:  # noqa: BLE001 — best-effort, nunca aborta
+                logging.getLogger(__name__).exception(
+                    "identify_actors: consolidación semántica falló"
+                )
+
         run.timings[STAGE_ACTORS] = (time.perf_counter() - t0) * 1000
         run.stages_done.add(STAGE_ACTORS)
         await on_progress(
@@ -977,12 +1091,16 @@ def _make_stage_tools(
                 "phase": "end",
                 "elapsed_ms": round(run.timings[STAGE_ACTORS]),
                 "actors": len(run.actor_catalog),
+                "consolidated_groups": consolidated_groups,
+                "retired_actors": consolidated_retired,
             },
         )
         return {
             "actors": len(run.actor_catalog),
             "created": res.get("created", 0),
             "updated": res.get("updated", 0),
+            "consolidated_groups": consolidated_groups,
+            "retired_actors": consolidated_retired,
             "names": [a["name"] for a in run.actor_catalog],
             "stages_done": sorted(run.stages_done),
         }
@@ -1378,9 +1496,19 @@ def make_requirements_capture_agent_subagent(
     )
     editing_tools = make_requirements_tools(project_id)
     grouping_tools = make_grouping_tools(project_id)
+    # Lectura de calidad (get_quality paginado + get_requirement_findings por
+    # req): la curación de enunciados necesita VER el backlog OPEN de la DB —
+    # sin esto, la cura de majors/minors se hace a ciegas y el veredicto de
+    # cada hallazgo LLM queda sin resolver (sesión 18: el capture-agent tuvo
+    # que inferir los veredictos del historial de revisiones).
+    quality_read_tools = make_srs_read_tools(project_id)
     vision_tools = make_vision_tools(profile, project_slug)
     rules_tools = make_project_rules_tools(project_id)
-    actor_tools = make_actor_tools(project_id)
+    actor_tools = make_actor_tools(
+        project_id,
+        project_name=project_name,
+        project_description=project_description,
+    )
 
     return {
         "name": "requirements-capture-agent",
@@ -1404,12 +1532,23 @@ def make_requirements_capture_agent_subagent(
             *stage_tools,
             *editing_tools,
             *grouping_tools,
+            *quality_read_tools,
             *vision_tools,
             *rules_tools,
             *actor_tools,
         ],
         # deepagents NO propaga el middleware del orquestador a los
         # subagentes (pero SI les inyecta FilesystemMiddleware): cada spec
-        # necesita su guarda de tamaño y su filtro de tools de filesystem.
-        "middleware": [SizeGuardMiddleware(), EmptyResponseRetryMiddleware(), NoFilesystemToolsMiddleware()],
+        # necesita su guarda de tamaño, su filtro de tools de filesystem y
+        # su summarizer con techo (reemplaza al default de deepagents por
+        # nombre; sesion 17). El backend es el mismo sandbox del proyecto.
+        # Best-effort: sin LLM_API_KEY (smoke tests) queda el default.
+        "middleware": [
+            SizeGuardMiddleware(),
+            EmptyResponseRetryMiddleware(),
+            NoFilesystemToolsMiddleware(),
+            make_summarization_middleware(
+                DockerSandbox(profile=profile, project_slug=project_slug)
+            ),
+        ],
     }

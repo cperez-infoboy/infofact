@@ -60,6 +60,12 @@ from backend.models.analysis import (
     SubProject,
     SubProjectContract,
 )
+from backend.models.packages import (
+    PackageStatus,
+    WorkPackage,
+    WorkPackageDocument,
+    WorkTask,
+)
 from backend.models.user import User
 
 __all__ = [
@@ -115,4 +121,8 @@ __all__ = [
     "MerCardinality",
     "AdrStatus",
     "ContractType",
+    "WorkPackageDocument",
+    "WorkPackage",
+    "WorkTask",
+    "PackageStatus",
 ]

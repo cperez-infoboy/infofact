@@ -14,6 +14,8 @@ para el cuerpo de requerimientos.
 from __future__ import annotations
 
 import logging
+import os
+from pathlib import PurePosixPath
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -24,6 +26,7 @@ from backend.agents.retrieval import store as retrieval
 from backend.services.goals_engine import infer_goals
 from sqlalchemy import select
 
+from backend.models.project_document import ProjectDocument
 from backend.models.srs import Goal, GoalLink
 from backend.services.requirement_store import list_requirements
 from backend.services.srs_builder import (
@@ -59,7 +62,12 @@ _PRIORITY_RANK = {
 
 
 class SrsNarrativeDraft(BaseModel):
-    """LLM-generated prose for the 8 authored SRS subsections."""
+    """LLM-generated prose for the 7 authored SRS subsections.
+
+    §1.4 Referencias NO está acá: es una proyección determinista del catálogo
+    de fuentes de captura (``_projected_references``) — una prosa LLM congelada
+    por el carry-forward desfasaba el conteo de documentos tras capturas append.
+    """
 
     purpose: str = Field(
         description=(
@@ -73,12 +81,6 @@ class SrsNarrativeDraft(BaseModel):
     definitions: str = Field(
         description=(
             "Sección 1.3 Definiciones: términos y acrónimos del dominio en "
-            "formato Markdown con viñetas."
-        )
-    )
-    references: str = Field(
-        description=(
-            "Sección 1.4 Referencias: normas y documentos referenciados en "
             "formato Markdown con viñetas."
         )
     )
@@ -125,10 +127,8 @@ _NARRATIVE_SYSTEM = (
     "fragmentos los respaldan.\n"
     "- Para definitions: extrae términos técnicos y acrónimos del dominio "
     "que aparezcan en los requerimientos o fragmentos.\n"
-    "- Para references: cita ISO/IEC/IEEE 29148:2018, ISO/IEC 25010:2011 y "
-    "cualquier norma detectada en los requerimientos.\n"
-    "- Cada sección debe ser prosa coherente, excepto definitions y "
-    "references que pueden usar viñetas Markdown.\n"
+    "- Cada sección debe ser prosa coherente, excepto definitions que puede "
+    "usar viñetas Markdown.\n"
 )
 
 # Marcador del bloque de conteos de §2.1: lo arma el determinista y se
@@ -137,11 +137,13 @@ _COUNTS_MARKER = "\n**Resumen del alcance especificado:**"
 
 # Subsecciones authored cuyo TEXTO carry-forward preserva de la versión
 # previa (la perspectiva va aparte: hay que separarle el bloque de conteos).
+# ``intro.references`` NO está acá: §1.4 es proyección determinista del
+# catálogo de fuentes — una prosa congelada desfasaba el conteo de documentos
+# tras capturas append (sesión 16 de Planitrack2.0: «4 fuentes» eternas).
 _AUTHORED_PROSE_KEYS = (
     "intro.purpose",
     "intro.scope",
     "intro.definitions",
-    "intro.references",
     "overall.users",
     "overall.environment",
     "overall.assumptions",
@@ -178,9 +180,10 @@ def _carryover_narrative(
 ) -> dict[str, str]:
     """Combina la prosa authored de la versión previa con el determinista fresco.
 
-    El texto authored (7 subsecciones + perspectiva sin su bloque de conteos)
+    El texto authored (6 subsecciones + perspectiva sin su bloque de conteos)
     se conserva VERBATIM de ``previous``; los deterministas (``intro.overview``,
-    ``overall.features``, bloque de conteos) salen de ``det`` y reflejan el
+    ``intro.references``, ``overall.features``, bloque de conteos) salen de
+    ``det`` y reflejan el
     store vivo. Así «refrescá el SRS tras una curación» preserva el texto
     curado sin redactar de nuevo: sin este canal el redactor re-draftaba de
     cero y marcaba el documento con notas provisionales (sesión 53 v11).
@@ -219,6 +222,140 @@ def _feature_line(it: Any) -> str:
     return f"- `{it.code}` ({prio} · {type_label}) — {stmt}"
 
 
+# Media embebida extraída del parseo (imágenes OCR): se agrupa como anexo en
+# la proyección de fuentes en vez de listar archivo por archivo.
+_MEDIA_DIR_MARKER = "/.infofact-media/"
+
+_STANDARDS_BLOCK = (
+    "**Normas aplicadas:** ISO/IEC/IEEE 29148:2018 (Ingeniería de "
+    "requerimientos), ISO/IEC 25010:2011 (Calidad del producto software)."
+)
+
+
+async def _capture_sources(
+    session: AsyncSession, project_id: int
+) -> dict[str, Any]:
+    """Resumen vivo de las fuentes usadas en captura, para §1.4 y §2.1.
+
+    Cruza el catálogo (``ProjectDocument`` con ``used_in_capture``) con los
+    ``source[].document_id`` citados por requerimientos vivos: cada fuente
+    con su conteo de requerimientos respaldados. Los archivos de media
+    embebida (``.infofact-media/``) se cuentan aparte como anexo OCR — la
+    proyección los agrupa en una sola línea. Citas sin fila en el catálogo
+    (registro histórico perdido) entran marcadas ``unregistered`` para que
+    la tabla refleje siempre el respaldo real.
+    """
+    from sqlalchemy import text as sa_text
+
+    slug = await session.scalar(
+        sa_text("SELECT slug FROM projects WHERE id = :pid"), {"pid": project_id}
+    )
+    docs = list(
+        await session.scalars(
+            select(ProjectDocument).where(
+                ProjectDocument.project_id == project_id,
+                ProjectDocument.used_in_capture.is_(True),
+            )
+        )
+    )
+    items = await list_requirements(session, project_id, include_deleted=True)
+    live = [it for it in items if it.status in _LIVE_STATUSES]
+
+    prefix = f"/workspaces/{slug}/" if slug else None
+    cited: dict[str, int] = {}
+    for it in live:
+        src = it.source
+        if not src:
+            continue
+        entries = src if isinstance(src, list) else [src]
+        seen: set[str] = set()
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            doc_id = entry.get("document_id")
+            if not (isinstance(doc_id, str) and doc_id) or doc_id in seen:
+                continue
+            seen.add(doc_id)
+            if prefix and prefix in doc_id:
+                rel = doc_id.split(prefix, 1)[1]
+            else:
+                rel = doc_id.lstrip("/")
+            if rel:
+                cited[rel] = cited.get(rel, 0) + 1
+
+    def _entry(rel: str, reqs: int, unregistered: bool) -> dict[str, Any]:
+        name = PurePosixPath(rel).name
+        return {
+            "rel_path": rel,
+            "filename": name,
+            "extension": os.path.splitext(name)[1].lower().lstrip("."),
+            "reqs": reqs,
+            "unregistered": unregistered,
+        }
+
+    documents: list[dict[str, Any]] = []
+    media_files = 0
+    media_reqs = 0
+    covered_rels: set[str] = set()
+    for d in sorted(docs, key=lambda x: x.rel_path):
+        reqs = cited.get(d.rel_path, 0)
+        if _MEDIA_DIR_MARKER in f"/{d.rel_path}":
+            media_files += 1
+            media_reqs += reqs
+        else:
+            documents.append(_entry(d.rel_path, reqs, False))
+        covered_rels.add(d.rel_path)
+
+    for rel in sorted(cited):
+        if rel in covered_rels:
+            continue
+        if _MEDIA_DIR_MARKER in f"/{rel}":
+            media_files += 1
+            media_reqs += cited[rel]
+        else:
+            documents.append(_entry(rel, cited[rel], True))
+
+    documents.sort(key=lambda e: (-e["reqs"], e["filename"]))
+    return {
+        "documents": documents,
+        "media_files": media_files,
+        "media_reqs": media_reqs,
+        "total_files": len(documents) + media_files,
+    }
+
+
+def _projected_references(sources: dict[str, Any] | None) -> str:
+    """Tabla Markdown de §1.4: fuentes de captura vivas + anexo OCR + normas.
+
+    Proyección pura (sin LLM): siempre coincide con el catálogo y con los
+    requerimientos vivos. Filenames duplicados se muestran con su ruta
+    relativa para desambiguar.
+    """
+    if not sources or not sources.get("total_files"):
+        return (
+            "_Sin documentos fuente registrados en captura todavía._\n\n"
+            + _STANDARDS_BLOCK
+        )
+    lines = [
+        "| # | Fuente | Tipo | Reqs respaldados |",
+        "|---|--------|------|------------------|",
+    ]
+    name_counts: dict[str, int] = {}
+    for e in sources["documents"]:
+        name_counts[e["filename"]] = name_counts.get(e["filename"], 0) + 1
+    for i, e in enumerate(sources["documents"], start=1):
+        label = e["rel_path"] if name_counts[e["filename"]] > 1 else e["filename"]
+        flag = " (sin registro)" if e.get("unregistered") else ""
+        ext = (e["extension"] or "?").upper()
+        lines.append(f"| {i} | {label}{flag} | {ext} | {e['reqs']} |")
+    if sources.get("media_files"):
+        lines.append(
+            f"| — | Anexo de imágenes (OCR, {sources['media_files']} archivo(s)) "
+            f"| IMG | {sources.get('media_reqs', 0)} |"
+        )
+    return "\n".join(lines) + "\n\n" + _STANDARDS_BLOCK
+
+
 def _draft_narrative(
     project_name: str,
     project_description: str,
@@ -229,13 +366,16 @@ def _draft_narrative(
     live_items: list | None = None,
     goal_groups: list[tuple[str, str, list]] | None = None,
     actors_block_text: str | None = None,
+    sources_summary: dict[str, Any] | None = None,
 ) -> dict[str, str]:
     """Borrador de la prosa editable por subsection.
 
     Determinista (sin LLM): el usuario lo pule vía PATCH. Devuelve un dict con
     claves por subsection ID (e.g. ``"intro.purpose"``) más claves legacy
     (``"intro"``, ``"overall"``) que concatenan las subsections para
-    retrocompatibilidad con versiones anteriores.
+    retrocompatibilidad con versiones anteriores. ``intro.references`` es una
+    proyección de ``sources_summary`` (ver ``_capture_sources``): refleja el
+    catálogo de fuentes vivo, no prosa redactada.
     """
     title = project_name or "Especificación de Requerimientos de Software"
     desc_line = project_description.strip() if project_description else ""
@@ -255,9 +395,7 @@ def _draft_narrative(
     intro_definitions = (
         "_Editor: listar definiciones, acrónimos y términos del dominio._"
     )
-    intro_references = (
-        "_Editor: listar normas y documentos referenciados._"
-    )
+    intro_references = _projected_references(sources_summary)
     intro_overview = (
         "Este documento se organiza en las siguientes secciones: "
         "Sección 1 (Introducción), Sección 2 (Descripción general), "
@@ -276,14 +414,27 @@ def _draft_narrative(
     ]
     if desc_line:
         overall_perspective_parts.append(desc_line)
-    overall_perspective_parts.append(
-        f"\n**Resumen del alcance especificado:**\n"
+    counts_parts = [
         f"- Requerimientos en el SRS: **{total}** (funcionales: {func_count}, "
-        f"no funcionales: {nfr_count}).\n"
+        f"no funcionales: {nfr_count}).",
         f"- Goals modelados: **{goals_summary.get('goals', 0)}** "
         f"(softgoals: {goals_summary.get('softgoals', 0)}, obstáculos: "
-        f"{goals_summary.get('obstacles', 0)}).\n"
-        f"- Hallazgos de calidad: **{findings}** (bloqueantes: {blockers})."
+        f"{goals_summary.get('obstacles', 0)}).",
+        f"- Hallazgos de calidad: **{findings}** (bloqueantes: {blockers}).",
+    ]
+    if sources_summary and sources_summary.get("total_files"):
+        extra = ""
+        if sources_summary.get("media_files"):
+            extra = (
+                f" (+ anexo OCR de {sources_summary['media_files']} imágenes "
+                f"que respaldan {sources_summary['media_reqs']} requerimientos)"
+            )
+        counts_parts.append(
+            f"- Fuentes de captura: **{len(sources_summary['documents'])}** "
+            f"documento(s){extra}."
+        )
+    overall_perspective_parts.append(
+        "\n**Resumen del alcance especificado:**\n" + "\n".join(counts_parts)
     )
     overall_perspective = "\n\n".join(overall_perspective_parts)
 
@@ -398,7 +549,6 @@ async def _rag_context_for_section(project_id: int, section_type: str) -> str:
         "purpose": "propósito objetivo producto sistema",
         "scope": "alcance del producto límites",
         "definitions": "términos técnicos definiciones glosario acrónimos",
-        "references": "normas estándares ISO IEEE regulaciones",
         "perspective": "contexto del producto dependencias integraciones",
         "users": "roles de usuario tipos de usuario",
         "environment": "entorno operativo plataforma tecnologías",
@@ -510,13 +660,13 @@ async def _build_narrative_context(
     parts.append(f"- Goals modelados: {goals_summary.get('goals', 0)}")
     parts.append(f"- Hallazgos de calidad: {quality_summary.get('total_findings', 0)}")
 
-    # Contexto RAG por sección.
+    # Contexto RAG por sección (§1.4 Referencias no se redacta: es
+    # proyección determinista del catálogo de fuentes).
     parts.append("\n## Fragmentos de documentos fuente por sección")
     for section in (
         "purpose",
         "scope",
         "definitions",
-        "references",
         "perspective",
         "users",
         "environment",
@@ -544,11 +694,12 @@ async def draft_narrative_llm(
 ) -> dict[str, str]:
     """Enriquece la narrativa determinista con prosa generada por LLM.
 
-    Sobrescribe las 8 subsecciones authored (purpose, scope, definitions,
-    references, perspective, users, environment, assumptions) con texto del
-    LLM, preservando las claves deterministas (``intro.overview`` y
-    ``overall.features``). El bloque de conteos de ``overall.perspective``
-    se reapende después del texto del LLM para mantener el resumen de alcance.
+    Sobrescribe las 7 subsecciones authored (purpose, scope, definitions,
+    perspective, users, environment, assumptions) con texto del LLM,
+    preservando las claves deterministas (``intro.overview``,
+    ``intro.references`` y ``overall.features``). El bloque de conteos de
+    ``overall.perspective`` se reapende después del texto del LLM para
+    mantener el resumen de alcance.
 
     ``instructions`` (opcional) son indicaciones narrativas del usuario
     (p. ej. "incorporar el carácter multi-industria en propósito y alcance").
@@ -584,7 +735,6 @@ async def draft_narrative_llm(
                 "intro.purpose",
                 "intro.scope",
                 "intro.definitions",
-                "intro.references",
                 "overall.perspective",
                 "overall.users",
                 "overall.environment",
@@ -629,11 +779,11 @@ async def draft_narrative_llm(
     )
 
     updated = dict(narrative)
-    # 8 subsecciones authored -> prosa LLM.
+    # 7 subsecciones authored -> prosa LLM. §1.4 Referencias queda con la
+    # proyección determinista que trae ``narrative`` (catálogo vivo).
     updated["intro.purpose"] = draft.purpose
     updated["intro.scope"] = draft.scope
     updated["intro.definitions"] = draft.definitions
-    updated["intro.references"] = draft.references
     updated["overall.perspective"] = draft.perspective + (
         "\n\n" + counts_block if counts_block else ""
     )
@@ -641,7 +791,8 @@ async def draft_narrative_llm(
     updated["overall.environment"] = draft.environment
     updated["overall.assumptions"] = draft.assumptions
 
-    # Preservar deterministicos: intro.overview, overall.features (ya en updated).
+    # Preservar deterministicos: intro.overview, intro.references,
+    # overall.features (ya vienen en ``updated`` desde ``narrative``).
 
     # Reconstruir claves legacy.
     updated["intro"] = "\n\n".join(
@@ -755,6 +906,8 @@ async def assemble_srs(
     from backend.services import actor_store
 
     actors_block_text = await actor_store.actors_block(session, project_id)
+    # §1.4 Referencias proyectada desde el catálogo de fuentes vivo.
+    sources_summary = await _capture_sources(session, project_id)
 
     narrative = _draft_narrative(
         project_name,
@@ -766,6 +919,7 @@ async def assemble_srs(
         live_items=live,
         goal_groups=goal_groups,
         actors_block_text=actors_block_text,
+        sources_summary=sources_summary,
     )
 
     # 8. Cuerpo Markdown (proyección con narrative + structure).

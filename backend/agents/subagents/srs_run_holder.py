@@ -58,6 +58,18 @@ class SrsRun:
     # Bookkeeping (igual que CaptureRun).
     calls: dict[str, int] = field(default_factory=dict)
     stages_done: set[str] = field(default_factory=set)
+    # Materialización temprana (P2): versión DRAFT persistida por
+    # draft_narrative; commit_srs la promueve in-place a CANDIDATE.
+    draft_version: int | None = None
+    # Olas de curación: requerimientos editados desde el último análisis de
+    # calidad (los marcan update_requirements/apply_cures; lo limpia
+    # analyze_quality/close_curation_wave). La ola abre con un snapshot del
+    # inventario de hallazgos para que el reporte de cierre sea DELTA
+    # (nuevos/resueltos contra el estado previo a curar), no el inventario
+    # completo — sin eso cada cura parecía descubrir problemas nuevos aunque
+    # fueran los mismos (sesión 18: 913 tool calls sin noción de progreso).
+    dirty_req_ids: set[int] = field(default_factory=set)
+    wave_snapshot: dict[int, set[tuple[str, str]]] | None = None
 
     def bump(self, stage: str, cap: int = DEFAULT_STAGE_CAP) -> int:
         n = self.calls.get(stage, 0) + 1
@@ -77,6 +89,77 @@ class SrsRun:
         """
         self.calls.clear()
 
+    # ------------------------------------------------------------------
+    # Olas de curación (delta de hallazgos: 1 ola = 1 re-análisis).
+    # ------------------------------------------------------------------
+
+    def _finding_key(self, f: dict[str, Any]) -> tuple[str, str] | None:
+        rid = f.get("req_id")
+        rule = f.get("rule_id")
+        if rid is None or rule is None:
+            return None
+        return (str(rid), str(rule))
+
+    def mark_dirty(self, req_ids) -> None:
+        """Registra ediciones de enunciados y abre la ola si aún no existe."""
+        ids = {int(r) for r in req_ids if r is not None}
+        if not ids:
+            return
+        if self.wave_snapshot is None:
+            # Snapshot del inventario vigente (ANTES de curar): el reporte de
+            # cierre compara contra esto. Solo llaves (req_id, rule_id) — el
+            # mensaje cambia entre corridas y no es identidad.
+            self.wave_snapshot = {
+                self._finding_key(f)
+                for f in self.findings
+                if self._finding_key(f) is not None
+            }
+        self.dirty_req_ids |= ids
+
+    def clear_dirty(self, req_ids) -> None:
+        ids = {int(r) for r in req_ids if r is not None}
+        self.dirty_req_ids -= ids
+        if not self.dirty_req_ids:
+            self.close_wave()
+
+    def close_wave(self) -> None:
+        self.wave_snapshot = None
+
+    def wave_report(
+        self, new_findings: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Delta del inventario tras el re-análisis de cierre de ola.
+
+        Compara las llaves (req_id, rule_id) del inventario fresco contra el
+        snapshot de apertura: resueltos = estaban y ya no están; nuevos = no
+        estaban y aparecieron. Devuelve el payload para la tool (listas cap
+        40 + conteos completos).
+        """
+        before = self.wave_snapshot
+        if before is None:
+            before = set()
+        fresh_keys = {
+            self._finding_key(f)
+            for f in new_findings
+            if self._finding_key(f) is not None
+        }
+        resolved_keys = before - fresh_keys
+        new_keys = fresh_keys - before
+
+        def _shape(key: tuple[str, str]) -> dict[str, str]:
+            return {"req_id": key[0], "rule_id": key[1]}
+
+        report: dict[str, Any] = {
+            "resolved_count": len(resolved_keys),
+            "new_count": len(new_keys),
+            "resolved": [_shape(k) for k in sorted(resolved_keys)[:40]],
+            "new": [_shape(k) for k in sorted(new_keys)[:40]],
+            "resolved_truncated": len(resolved_keys) > 40,
+            "new_truncated": len(new_keys) > 40,
+        }
+        self.close_wave()
+        return report
+
     def reset_pipeline_outputs(self) -> None:
         """Limpia las salidas de etapas pero conserva los contadores de loop."""
         self.quality_summary = None
@@ -88,7 +171,10 @@ class SrsRun:
         self.markdown = ""
         self.requirement_codes = []
         self.requirement_count = 0
+        self.draft_version = None
         self.stages_done.clear()
+        self.dirty_req_ids = set()
+        self.wave_snapshot = None
 
     def missing_stages_before_commit(self) -> list[str]:
         return [s for s in _REQUIRED_BEFORE_COMMIT if s not in self.stages_done]

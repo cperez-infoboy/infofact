@@ -113,6 +113,43 @@ def truncate_messages(
     return out
 
 
+def make_summarization_middleware(backend, *, model=None):
+    """Summarizer de deepagents con techo propio (incidente de la sesión 17).
+
+    La fábrica de deepagents construye el SummarizationMiddleware con
+    ``trim_tokens_to_summarize=None`` y None significa «sin recorte»: el
+    resumidor mandó ~4.9 MB de tool_results intactos al LLM y Anthropic
+    rechazó el propio prompt del resumen (400 prompt is too long). Esta
+    fábrica re-crea el MISMO middleware con techo (settings.llm_summarize_
+    trim_chars, convertido a tokens al ritmo ~4 chars/token que usa
+    count_tokens_approximately). El instance devuelto reporta
+    ``name == "SummarizationMiddleware"``, así que el ensamblador de
+    deepagents (_apply_custom_middleware, match por nombre) lo REEMPLAZA
+    in-place en vez de apilar uno segundo.
+
+    Args:
+        backend: el BackendProtocol del agente (el DockerSandbox); lo usa
+            para el offload del historial a /conversation_history.
+        model: el BaseChatModel del resumen; por defecto el cliente estándar
+            de settings (build_llm). Solo se resuelve si hay backend: en
+            tests sin LLM configurado el spec usa su middleware base.
+    """
+    if backend is None:
+        return None
+    from deepagents.middleware.summarization import (
+        create_summarization_middleware,
+    )
+
+    if model is None:
+        from backend.agents.llm import build_llm
+
+        model = build_llm()
+    trim_tokens = max(settings.llm_summarize_trim_chars // 4, 4_000)
+    return create_summarization_middleware(
+        model, backend, trim_tokens_to_summarize=trim_tokens
+    )
+
+
 class SizeGuardMiddleware(AgentMiddleware):
     """wrap_model_call que aplica truncate_messages al input del modelo.
 

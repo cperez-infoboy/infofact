@@ -156,15 +156,27 @@ async def test_upsert_mixed_keeps_confirmed_removes_stale_proposed():
             )
             assert res["goals_kept"] == 1
             assert res["goals_added"] == 1
-            assert res["goals_removed"] == 1  # "Descartar basura" (proposed)
+            # "Descartar basura" (proposed ausente): ya no se borra — se
+            # marca STALE conservando fila, código y links (curación con
+            # memoria; una re-inferencia posterior puede revivirlo).
+            assert res["goals_stale"] == 1
+            assert res["goals_removed"] == 1  # alias legado = marcados stale
 
             by_stmt = {g.statement: g for g in await srs_store.list_goals(session, pid)}
             assert set(by_stmt) == {
-                "Servir pedidos", "Auditar operaciones", "Reportar metricas",
+                "Servir pedidos", "Auditar operaciones",
+                "Reportar metricas", "Descartar basura",
             }
             assert by_stmt["Servir pedidos"].code == codes["Servir pedidos"]
             assert by_stmt["Auditar operaciones"].code.startswith("GOAL-")
             assert by_stmt["Auditar operaciones"].code != codes["Descartar basura"]
+            assert (
+                by_stmt["Descartar basura"].status == GoalStatus.STALE
+            )
+            assert (
+                by_stmt["Descartar basura"].code
+                == codes["Descartar basura"]
+            )
 
             # Links: el hecho a mano del confirmado sobrevive; el del
             # re-inferido se creó por la nueva pasada.

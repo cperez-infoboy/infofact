@@ -158,6 +158,171 @@ async def upsert_actors(
     }
 
 
+async def apply_actor_consolidation(
+    session,
+    project_id: int,
+    groups: list[dict[str, Any]],
+    *,
+    source: ActorSource = ActorSource.ACTORS_STAGE,
+) -> dict[str, Any]:
+    """Aplica grupos de consolidación: rol general absorbe a los miembros.
+
+    ``groups``: [{general_name, channel?, rationale?, member_codes}] (salida
+    ``model_dump`` de ``ActorGroup``). Por grupo: resuelve los códigos contra
+    actores ACTIVE (desconocidos o retirados se saltan; menos de 2 válidos →
+    grupo ignorado), crea o consolida el actor general con los nombres y
+    sinónimos de los miembros como SINÓNIMOS, y retira (soft) los miembros —
+    salvo el caso borde en que el nombre general matchea a un MIEMBRO: ese
+    miembro se vuelve el general (no se retira) y absorbe a los demás.
+
+    Flush sin commit (contrato del caller): así la consolidación del catálogo
+    y la reescritura de enunciados comparten una transacción. Idempotente:
+    re-aplicar no encuentra miembros activos y no hace nada. Devuelve
+    ``{created, retired, mapping, actors}``: ``mapping`` lleva cada término
+    retirado (nombre/sinónimo) al nombre del rol general, excluyendo los
+    términos que otro actor activo reclama — es la entrada de la reescritura
+    de enunciados.
+    """
+    existing = list(
+        (await session.scalars(
+            select(ProjectActor).where(ProjectActor.project_id == project_id)
+        )).all()
+    )
+    by_code = {a.code.strip().upper(): a for a in existing if a.code}
+    by_term: dict[str, ProjectActor] = {}
+    for a in existing:
+        by_term[_norm(a.name)] = a
+        for syn in a.synonyms or []:
+            by_term[_norm(syn)] = a
+
+    created = 0
+    retired: list[str] = []
+    mapping: dict[str, str] = {}
+    general_ids: set[int] = set()
+
+    for g in groups:
+        general_name = (g.get("general_name") or "").strip()
+        if not general_name:
+            continue
+        members: list[ProjectActor] = []
+        seen: set[int] = set()
+        for raw in g.get("member_codes") or []:
+            a = by_code.get((raw or "").strip().upper())
+            # La comprobación de status va sobre la instancia viva: un actor
+            # absorbido por un grupo anterior del mismo lote ya figura RETIRED.
+            if a is None or a.id in seen or a.status is not ActorStatus.ACTIVE:
+                continue
+            members.append(a)
+            seen.add(a.id)
+        if len(members) < 2:
+            continue
+
+        # Sinónimos absorbidos: nombres + sinónimos de los miembros, sin
+        # duplicados y sin el nombre canónico del general.
+        synonyms: list[str] = []
+        for m in members:
+            for term in [m.name, *(m.synonyms or [])]:
+                t = term.strip()
+                if t and _norm(t) != _norm(general_name) and t not in synonyms:
+                    synonyms.append(t)
+        channel = (g.get("channel") or None) or None
+        if not channel:
+            channels = {m.channel for m in members if m.channel}
+            channel = channels.pop() if len(channels) == 1 else None
+        rationale = (g.get("rationale") or None) or (
+            "Rol general que agrupa: " + ", ".join(m.name for m in members)
+        )
+
+        entry = {
+            "name": general_name,
+            "synonyms": synonyms,
+            "channel": channel,
+            "rationale": rationale,
+        }
+        target = by_term.get(_norm(general_name))
+        if target is not None and target in members:
+            # Caso borde: el general es uno de los miembros (identidad por
+            # match de nombre/sinónimo). Se queda como general y absorbe.
+            merged = {s for s in (target.synonyms or [])}
+            merged.add(target.name)
+            merged.update(synonyms)
+            target.synonyms = sorted(merged - {target.name})
+            if channel and not target.channel:
+                target.channel = channel
+            if not target.rationale:
+                target.rationale = rationale
+            await session.flush()
+            general = target
+            general_ids.add(general.id)
+        elif target is not None:
+            # El general ya existe y no es miembro: absorbe los sinónimos.
+            # Sin upsert_actors: su matching POR SINÓNIMOS interpretaría los
+            # nombres de los miembros como "este entry ya existe" y
+            # consolidaría el general DENTRO de un miembro.
+            merged = {s for s in (target.synonyms or [])}
+            merged.add(target.name)
+            merged.update(synonyms)
+            target.synonyms = sorted(merged - {target.name})
+            if channel and not target.channel:
+                target.channel = channel
+            if not target.rationale:
+                target.rationale = rationale
+            await session.flush()
+            general = target
+            general_ids.add(general.id)
+        else:
+            code = await next_actor_code(session, project_id)
+            general = ProjectActor(
+                project_id=project_id,
+                code=code,
+                name=general_name,
+                synonyms=synonyms,
+                channel=channel,
+                rationale=rationale,
+                source=source,
+                status=ActorStatus.ACTIVE,
+            )
+            session.add(general)
+            await session.flush()
+            created += 1
+            general_ids.add(general.id)
+            by_code[code.strip().upper()] = general
+            by_term[_norm(general_name)] = general
+            for syn in synonyms:
+                by_term.setdefault(_norm(syn), general)
+
+        for m in members:
+            if m is general or m.status is not ActorStatus.ACTIVE:
+                continue
+            await set_actor_status(
+                session, project_id, m.id, ActorStatus.RETIRED
+            )
+            retired.append(m.code)
+            mapping[m.name] = general.name
+            for syn in m.synonyms or []:
+                mapping[syn] = general.name
+
+    # Los términos que OTRO actor ACTIVO sigue reclamando no van al mapping:
+    # reescribirlos cambiaría enunciados ajenos a la consolidación. Los
+    # términos que el propio general absorbió como sinónimos SÍ van: son
+    # exactamente los que la reescritura debe reemplazar por el rol general.
+    actors = await list_actors(session, project_id, include_retired=True)
+    live_terms: set[str] = set()
+    for a in actors:
+        if a.status is ActorStatus.ACTIVE and a.id not in general_ids:
+            live_terms.add(_norm(a.name))
+            live_terms.update(_norm(s) for s in a.synonyms or [])
+    mapping = {
+        t: g for t, g in mapping.items() if _norm(t) not in live_terms
+    }
+    return {
+        "created": created,
+        "retired": retired,
+        "mapping": mapping,
+        "actors": [actor_to_dict(a) for a in actors],
+    }
+
+
 async def set_actor_status(
     session,
     project_id: int,

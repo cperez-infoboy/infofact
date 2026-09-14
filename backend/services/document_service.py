@@ -24,13 +24,14 @@ import hashlib
 import mimetypes
 import os
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from sqlalchemy import select
 
 from backend.config import settings
 from backend.database import AsyncSessionLocal
-from backend.models import ProjectDocument
+from backend.models import DocumentParse, ProjectDocument
 from backend.services import file_service
 
 # Extensiones admitidas como documentos fuente. Otras se rechazan en upload
@@ -254,6 +255,76 @@ async def scan_workspace(
             await db.refresh(doc)
         results.append(RegisterResult(document=doc, created=True))
     return results
+
+
+async def ensure_document_registered(
+    *,
+    project_id: int,
+    host_root: Path,
+    path: Path,
+    parser_hint: str = "auto",
+) -> RegisterResult:
+    """Registra un archivo del workspace host si aún no está en el catálogo.
+
+    Upsert idempotente por ``(project_id, sha256)``: si el contenido ya está
+    registrado devuelve la fila existente y corrige ``rel_path`` cuando el
+    archivo cambió de carpeta. Es la vía por la que la ingesta del agente
+    mantiene el catálogo sincronizado con lo que realmente procesa: sin ella,
+    documentos que llegaron al workspace fuera de /upload y /scan sostienen
+    requerimientos pero quedan invisibles para el conteo de fuentes y el RAG
+    del SRS (el join de retrieval pasa por project_documents). No valida
+    extensión: la llamada proviene de discover_documents, que ya filtró.
+    """
+    root = host_root.resolve()
+    rel = path.resolve().relative_to(root).as_posix()
+    sha = _sha256_host_file(str(path))
+    async with AsyncSessionLocal() as db:
+        existing = await _find_by_sha(db, project_id, sha)
+        if existing is not None:
+            if existing.rel_path != rel:
+                existing.rel_path = rel
+                await db.commit()
+            return RegisterResult(document=existing, created=False)
+        doc = ProjectDocument(
+            project_id=project_id,
+            rel_path=rel,
+            filename=path.name,
+            extension=_ext(path.name),
+            mime=_guess_mime(path.name),
+            size_bytes=path.stat().st_size,
+            sha256=sha,
+            parse_status="pending",
+            parser_hint=_normalize_hint(parser_hint),
+        )
+        db.add(doc)
+        await db.commit()
+        await db.refresh(doc)
+    return RegisterResult(document=doc, created=True)
+
+
+async def mark_document_parsed(*, document_id: int, sha256: str) -> bool:
+    """Completa la fila del catálogo tras un parseo exitoso de la captura.
+
+    Copia ``parser_used``/``page_count`` desde el cache global
+    (``DocumentParse``, keyed por sha256) y marca ``parse_status='ready'``.
+    Devuelve False si la fila ya no existe (p. ej. borrada a mitad de captura).
+    """
+    async with AsyncSessionLocal() as db:
+        doc = await db.get(ProjectDocument, document_id)
+        if doc is None:
+            return False
+        parse = await db.scalar(
+            select(DocumentParse).where(DocumentParse.sha256 == sha256)
+        )
+        doc.parse_status = "ready"
+        doc.parsed_at = datetime.utcnow()
+        doc.error = None
+        if parse is not None:
+            doc.parser_used = parse.parser_used
+            if parse.page_count:
+                doc.page_count = parse.page_count
+        await db.commit()
+    return True
 
 
 async def list_documents(project_id: int) -> list[ProjectDocument]:

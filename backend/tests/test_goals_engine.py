@@ -282,13 +282,16 @@ async def test_failed_link_batch_persists_partial(monkeypatch):
     boom = ValueError("parse broke")
     plans = _plans(
         ge.GoalGoals(goals=[_goal("G1")]),
-        # Lote 2 (REQ-0002..0003) agota sus reintentos de parse y cae; los
-        # lotes 1 y 3 aportan sus links igualmente.
+        # Lote 2 (REQ-0002..0003) agota sus reintentos de parse, cae, y el
+        # RETRY externo también falla (plan final = boom persistente); los
+        # lotes 1 y 3 aportan sus links igualmente. Consumo determinista con
+        # concurrencia 1: lote1=ok, lote2=boom+boom, lote3=ok, retry=boom.
         [
             _links([("G1", "REQ-0000")]),
             boom,
             boom,
             _links([("G1", "REQ-0003")]),
+            boom,
         ],
     )
     _patch_llm(monkeypatch, plans)
@@ -301,9 +304,55 @@ async def test_failed_link_batch_persists_partial(monkeypatch):
         assert summary["links"] == 2
         assert summary["links_partial"] is True
         assert summary["link_batches_failed"] == 1
+        assert summary["link_batches_retried"] == 0  # el retry no logró revivirlo
         async with sm() as session:
             rows = (await session.execute(sa_select(GoalLink))).scalars().all()
             assert len(rows) == 2
+            # Los reqs del lote caído NO quedan sellados: la próxima corrida
+            # los re-vincula (delta de goals_fingerprint).
+            unsel = (
+                await session.execute(
+                    sa_select(RequirementItem).where(
+                        RequirementItem.goals_fingerprint.is_(None)
+                    )
+                )
+            ).scalars().all()
+            assert {r.code for r in unsel} == {"REQ-0002", "REQ-0003"}
+    finally:
+        await engine.dispose()
+        tmp.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_failed_link_batch_recovers_on_retry(monkeypatch):
+    """El retry externo revive un lote caído por congestión transitoria."""
+    monkeypatch.setattr(ge, "_LINK_BATCH_SIZE", 2)
+    monkeypatch.setattr(ge, "DEFAULT_CONCURRENCY", 1)
+    boom = ValueError("transient gateway error")
+    plans = _plans(
+        ge.GoalGoals(goals=[_goal("G1")]),
+        # lote1=ok, lote2=boom+boom (cae), lote3=ok, retry del lote2=ok.
+        [
+            _links([("G1", "REQ-0000")]),
+            boom,
+            boom,
+            _links([("G1", "REQ-0002")]),
+            _links([("G1", "REQ-0004")]),
+        ],
+    )
+    _patch_llm(monkeypatch, plans)
+    sm, tmp, engine = await _fresh_db()
+    try:
+        async with sm() as session:
+            pid = await _seed(session, n=6)
+            summary = await ge.infer_goals(session, pid)
+
+        assert summary["link_batches_retried"] == 1
+        assert summary["link_batches_failed"] == 0
+        assert summary["links_partial"] is False
+        async with sm() as session:
+            rows = (await session.execute(sa_select(GoalLink))).scalars().all()
+            assert len(rows) == 3
     finally:
         await engine.dispose()
         tmp.cleanup()
@@ -732,6 +781,83 @@ async def test_incremental_links_require_existing_goals():
                 await ge.infer_goal_links_incremental(
                     session, pid, ["REQ-0000"]
                 )
+    finally:
+        await engine.dispose()
+        tmp.cleanup()
+
+
+# ---------------------------------------------------------------------------
+# Consolidación del catálogo (acotado por instrucción, no por corte)
+# ---------------------------------------------------------------------------
+
+
+# 20 enunciados genuinamente distintos (el dedupe fuzzy fusiona a >=90:
+# frases que solo cambian un dígito colapsan a una).
+_DISTINCT_STATEMENTS = [
+    "Gestionar logistica", "Gestionar facturacion", "Controlar inventario",
+    "Optimizar ruteo", "Emitir alertas", "Reportar metricas",
+    "Blindar seguridad", "Auditar operaciones", "Integrar sistemas externos",
+    "Notificar eventos", "Operar sin conexion", "Soportar multiempresa",
+    "Facturar electronicamente", "Coordinar carriers", "Rastrear envios",
+    "Gestionar devoluciones", "Garantizar slas", "Parametrizar plantillas",
+    "Administrar permisos", "Respaldar informacion",
+]
+
+
+def test_merge_does_not_cut_at_fifteen():
+    """El merge ya no recorta a 15: el acotado lo hace la consolidación LLM."""
+    chunks = [
+        [
+            _goal_stmt(f"G{i}", stmt)
+            for i, stmt in enumerate(_DISTINCT_STATEMENTS)
+        ]
+    ]
+    merged = ge._merge_chunked_goals(chunks)
+    assert len(merged) == 20
+
+
+@pytest.mark.asyncio
+async def test_consolidation_fuses_catalog_above_target(monkeypatch):
+    """Sobre el rango objetivo, UNA pasada LLM fusiona; re-run sin ediciones es no-op."""
+    calls: list[str] = []
+
+    async def _fake_unit(schema, msgs, *, label, extra=None):
+        calls.append(label)
+        human = msgs[1][1]
+        if schema is ge.GoalGoals and "PROJECT REQUIREMENTS:" in human:
+            # Fase 1 (chunk): emite 20 candidatos distintos.
+            return ge.GoalGoals(
+                goals=[
+                    _goal_stmt(f"G{i}", stmt)
+                    for i, stmt in enumerate(_DISTINCT_STATEMENTS)
+                ]
+            )
+        if schema is ge.GoalGoals:
+            # Consolidación: fusiona a 12 renumerados.
+            assert "DRAFT GOAL CATALOG" in human
+            return ge.GoalGoals(
+                goals=[
+                    _goal_stmt(f"G{i}", f"Objetivo fusionado {i}")
+                    for i in range(12)
+                ]
+            )
+        return ge.GoalLinks(links=[])
+
+    monkeypatch.setattr(ge, "_invoke_unit", _fake_unit)
+    sm, tmp, engine = await _fresh_db()
+    try:
+        async with sm() as session:
+            pid = await _seed(session, n=4)
+            summary = await ge.infer_goals(session, pid)
+            assert "goals consolidation" in calls
+            assert summary["goals"] == 12
+
+            # Re-run sin ediciones: cero llamadas LLM (delta de fingerprints).
+            n_calls = len(calls)
+            summary2 = await ge.infer_goals(session, pid)
+            assert len(calls) == n_calls
+            assert summary2["link_scope"] == "none"
+            assert summary2["goals"] == 12
     finally:
         await engine.dispose()
         tmp.cleanup()

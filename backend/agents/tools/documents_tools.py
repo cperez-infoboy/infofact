@@ -100,6 +100,7 @@ def make_document_read_tools(project_id: int) -> list:
                             ProjectDocument.filename,
                             ProjectDocument.parse_status,
                             ProjectDocument.page_count,
+                            ProjectDocument.used_in_capture,
                             DocumentParse.id,
                         )
                         .join(
@@ -119,10 +120,21 @@ def make_document_read_tools(project_id: int) -> list:
                         "parse_status": r.parse_status,
                         "page_count": r.page_count,
                         "parsed": r.id is not None,
+                        "used_in_capture": r.used_in_capture,
+                        "media": "/.infofact-media/" in f"/{r.rel_path}",
                     }
                     for r in rows
                 ]
-                return {"count": len(items), "items": items}
+                # Desglose para el reporte del agente: las imágenes embebidas
+                # de .infofact-media se presentan como anexo OCR, no como
+                # documentos de cliente individuales.
+                media_files = sum(1 for it in items if it["media"])
+                return {
+                    "count": len(items),
+                    "documents": len(items) - media_files,
+                    "media_files": media_files,
+                    "items": items,
+                }
         except Exception as exc:  # noqa: BLE001 -- superficie al modelo
             return {"error": f"list_documents failed: {exc}"}
 

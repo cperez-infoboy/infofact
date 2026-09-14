@@ -93,11 +93,18 @@ class GoalKind(str, Enum):
 
 
 class GoalStatus(str, Enum):
-    """Estado de curación del goal."""
+    """Estado de curación del goal.
+
+    STALE marca un PROPOSED que la última inferencia ya no menciona pero que
+    NO se borra (con sus links) hasta decisión: preserva la auditoría y la
+    curación hecha sobre él, en la misma línea que el merge de hallazgos.
+    Si una inferencia posterior vuelve a detectarlo, revive a PROPOSED.
+    """
 
     PROPOSED = "proposed"
     CONFIRMED = "confirmed"
     REJECTED = "rejected"
+    STALE = "stale"
 
 
 class LinkRelation(str, Enum):
@@ -123,6 +130,12 @@ class LinkStatus(str, Enum):
 class SrsStatus(str, Enum):
     """Ciclo de vida del documento SRS.
 
+    DRAFT      materialización temprana: el pipeline persiste el documento
+               apenas la narrativa está lista, ANTES del commit final, para
+               que el usuario vea el SRS sin esperar el pipeline completo.
+               ``commit_srs`` la promueve in-place a CANDIDATE; un run
+               abortado deja el DRAFT visible (se lista con badge). No es
+               base de seed ni «última» versión (``get_latest_srs`` la salta).
     CANDIDATE  generado por el agente, pendiente de revisión humana.
     IN_REVIEW  el usuario edita la prosa y marca pendientes.
     LOCKED     snapshot inmutable consumido por la fase de diseño (fase 2).
@@ -132,6 +145,7 @@ class SrsStatus(str, Enum):
                admite el descarte.
     """
 
+    DRAFT = "draft"
     CANDIDATE = "candidate"
     IN_REVIEW = "in_review"
     LOCKED = "locked"
@@ -185,6 +199,14 @@ class RequirementFinding(Base):
     # Plantilla EARS detectada o esperada (ej. "event_driven").
     ears_pattern: Mapped[str | None] = mapped_column(String(32), nullable=True)
     detected_by: Mapped[str] = mapped_column(String(16), default="agent")
+    # Curacion con memoria (merge en vez de replace): req_fingerprint es la
+    # huella del enunciado al momento de detectar; si el enunciado no cambia,
+    # el estado de curacion (fixed/waived) y su auditoria sobreviven al
+    # re-analisis. resolved_* registra quien, cuando y por que se cerro.
+    req_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    resolved_by: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    resolution_note: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()

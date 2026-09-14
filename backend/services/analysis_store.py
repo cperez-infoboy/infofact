@@ -396,8 +396,8 @@ async def create_analysis(
       traceability, requirement_codes, requirement_count, srs_version.
     - entities: list[dict] con name, description, attributes, aggregate_root,
       bounded_context, traced_req_codes.
-    - relationships: list[dict] con from_entity_code, to_entity_code,
-      cardinality, label, description, traced_req_codes.
+    - relationships: list[dict] con from_entity, to_entity (nombres de
+      entidad), cardinality, label, description, traced_req_codes.
 
     La version se autoincrementa por proyecto. Los codigos ENT-XXXX se asignan
     aqui (Crockford base32, unico por proyecto). Los codigos ADR-NNN y SUB-NNN
@@ -467,13 +467,25 @@ async def create_analysis(
     # 4. Create DomainRelationship rows.
     # Dedupe by (from_entity_code, to_entity_code, label) to respect the
     # UniqueConstraint; the LLM may emit duplicate edges.
+    from backend.agents.pipelines.mer_pipeline import resolve_entity_reference
+
     seen_edges: set[tuple[str, str, str]] = set()
+    entity_names = list(entity_name_to_code)
     for rd in payload.get("relationships", []):
-        # Resolve entity names to codes; skip if entity not found.
-        from_name = rd.get("from_entity", "")
-        to_name = rd.get("to_entity", "")
-        from_code = rd.get("from_entity_code") or entity_name_to_code.get(from_name, from_name)
-        to_code = rd.get("to_entity_code") or entity_name_to_code.get(to_name, to_name)
+        # Resolver nombre -> entidad con tolerancia a variantes ortograficas
+        # (mismo resolver del pipeline MER); si un extremo no resuelve, skip
+        # real: nunca persistir el nombre crudo como codigo (generaria una
+        # relacion colgante invisible para el diccionario de datos).
+        resolved_from = resolve_entity_reference(
+            rd.get("from_entity", ""), entity_names
+        )
+        resolved_to = resolve_entity_reference(
+            rd.get("to_entity", ""), entity_names
+        )
+        if resolved_from is None or resolved_to is None:
+            continue
+        from_code = entity_name_to_code[resolved_from]
+        to_code = entity_name_to_code[resolved_to]
         label = rd.get("label") or ""
         edge = (from_code, to_code, label)
         if edge in seen_edges:
