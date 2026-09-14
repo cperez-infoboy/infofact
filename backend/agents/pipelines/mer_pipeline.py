@@ -2,9 +2,11 @@
 
 Multi-pass pipeline (5 passes):
 
-  Pass 1 — entity discovery (narrow schema: no attributes, no relationships).
-  Pass 2 — gap pass: re-scan requirements whose REQ codes were not traced.
-  Pass 3 — attributes + relationships (entity-constrained to the Pass 1+2 list).
+  Pass 1 — entity discovery (narrow schema, batched over items).
+  Pass 2 — gap pass: re-scan (batched) requirements whose REQ codes were not
+  traced.
+  Pass 3 — attributes + relationships (entity-constrained, batched over
+  entities).
   Pass 4 — deterministic validation (PK, dangling refs, duplicates, cardinality).
   Pass 5 — LLM critique covering documented failure modes (optional).
 
@@ -29,6 +31,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -43,14 +48,30 @@ from backend.agents.pipelines._diagram_colors import (
 )
 from backend.agents.pipelines._resilience import (
     DEFAULT_CONCURRENCY,
+    _chunk,
     _format_feedback,
     _format_goals,
     _invoke_with_retry,
     _repair_mermaid,
     _validate_mermaid,
+    invoke_structured_resilient,
 )
 
 logger = logging.getLogger(__name__)
+
+# Batch size for the discovery / gap passes (narrow schema, small output per
+# item). Env-tunable for calibration.
+_MER_BATCH_SIZE = int(os.environ.get("INFOFACT_MER_BATCH", "25"))
+
+# Batch size for the detail pass (attributes + relationships). The OUTPUT per
+# entity is fat (attributes with types/descriptions + PK/required flags), so a
+# large batch overflows the completion budget and the JSON gets truncated
+# (finish_reason=length) — session 19 of Planitrack2.0 burned hours in retry
+# loops on 25-entity batches. Each batch emits the FULL entity list (so
+# cross-batch relationships still validate) but only details its own entities.
+_MER_DETAIL_BATCH_SIZE = int(
+    os.environ.get("INFOFACT_MER_DETAIL_BATCH", "8")
+)
 
 
 # ---------------------------------------------------------------------------
@@ -74,13 +95,21 @@ class MerAttribute(BaseModel):
         default=True,
         description="True si el atributo es obligatorio (NOT NULL).",
     )
+    length: str = Field(
+        default="",
+        description=(
+            "Largo o precision del atributo cuando el tipo lo soporta "
+            "(ej. '16' para un string de 16 caracteres, '10,2' para un "
+            "float con 2 decimales). Vacio en tipos que no lo usan."
+        ),
+    )
     is_key: bool = Field(
         default=False,
         description="True si el atributo es parte de la clave primaria (PK).",
     )
     description: str = Field(
         default="",
-        description="Descripcion breve del atributo (opcional).",
+        description="Descripcion de negocio breve del atributo (opcional).",
     )
 
 
@@ -233,6 +262,82 @@ class MerCritiqueSchema(BaseModel):
     findings: list[MerCritiqueFinding]
 
 
+class MerConsolidationGroup(BaseModel):
+    """One proposed merge: ``keep`` absorbs the entities in ``absorb``."""
+
+    keep: str = Field(
+        description=(
+            "Nombre EXACTO de la entidad que se conserva (debe ser una de "
+            "las recibidas)."
+        ),
+    )
+    absorb: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Nombres EXACTOS de las entidades que se fusionan dentro de "
+            "keep (cada una debe estar en la lista recibida)."
+        ),
+    )
+    reason: str = Field(
+        default="",
+        description="Razon breve de la fusion (1 oracion).",
+    )
+
+
+class MerConsolidationSchema(BaseModel):
+    """Output schema of the consolidation pass (Pass 3b)."""
+
+    merges: list[MerConsolidationGroup] = Field(
+        default_factory=list,
+    )
+
+
+# Env kill-switch: INFOFACT_MER_CONSOLIDATE=0 desactiva el afinamiento.
+_MER_CONSOLIDATE_ENABLED = (
+    os.environ.get("INFOFACT_MER_CONSOLIDATE", "1") != "0"
+)
+_MER_CONSOLIDATION_BATCH_SIZE = int(
+    os.environ.get("INFOFACT_MER_CONSOLIDATION_BATCH", "25")
+)
+
+# Pass 3c: higiene de contextos acotados. INFOFACT_MER_CONTEXT_CONSOLIDATE=0
+# desactiva el mapeo LLM (la normalizacion ortografica siempre corre);
+# INFOFACT_MER_CONTEXT_MAX fija el techo de etiquetas a partir del cual conviene
+# consolidar semanticamente.
+_MER_CONTEXT_CONSOLIDATE_ENABLED = (
+    os.environ.get("INFOFACT_MER_CONTEXT_CONSOLIDATE", "1") != "0"
+)
+_MER_CONTEXT_TARGET_MAX = int(
+    os.environ.get("INFOFACT_MER_CONTEXT_MAX", "25")
+)
+
+
+class MerContextMapping(BaseModel):
+    """Una entrada del mapeo de contextos: etiqueta cruda -> canonica."""
+
+    raw: str = Field(
+        description="Etiqueta de contexto original, copiada de la lista de entrada."
+    )
+    canonical: str = Field(
+        description="Etiqueta canonica que la reemplaza (debe existir en la lista)."
+    )
+
+
+class MerContextConsolidationSchema(BaseModel):
+    """Output schema del mapeo de contextos acotados (Pass 3c)."""
+
+    mappings: list[MerContextMapping] = Field(default_factory=list)
+
+
+_MER_CONTEXT_CONSOLIDATION_PROMPT = """Eres un arquitecto de software que consolida los contextos acotados (bounded contexts) de un modelo de dominio.
+Recibes la lista de etiquetas de contexto asignadas a las entidades de UN mismo modelo, con la cantidad de entidades de cada una. Estan fragmentadas: sinonimos, plurales, variantes con o sin espacios, traducciones parciales.
+Devuelve un mapeo que fusione etiquetas que pertenecen al MISMO contexto de negocio. Reglas:
+- La etiqueta canonica debe ser una de las etiquetas de la lista, copiada tal cual.
+- Solo fusiona sinonimos reales o subconjuntos evidentes (ej. «Comunicación» -> «Comunicaciones»); NO fusiones dominios de negocio distintos (ej. «Navegación» y «Ruteo» pueden ser contextos separados).
+- Las etiquetas que ya son correctas no necesitan entrada en el mapeo.
+- Objetivo: quedar con un catalogo chico de contextos canonicos (idealmente entre 8 y 25) sin perder distinciones de negocio relevantes."""
+
+
 class MerDescriptionSchema(BaseModel):
     """Pass 6: narrative description for the analysis view."""
 
@@ -309,12 +414,23 @@ _GAP_PASS_PROMPT = (
 _DETAIL_PROMPT = (
     "Eres un arquitecto de software. Se te da la lista definitiva de entidades del "
     "dominio. Tu tarea es:\n"
-    "1. Asignar atributos detallados a cada entidad (con tipo, PK, required).\n"
+    "1. Asignar atributos detallados a cada entidad (con tipo, largo, PK, required).\n"
     "2. Identificar relaciones entre entidades (solo entre las entidades listadas).\n\n"
     "Reglas:\n"
     "- IDIOMA: manten el idioma original.\n"
-    "- NO inventes entidades nuevas. Solo atributos y relaciones para las entidades dadas.\n"
-    "- Toda entidad debe tener al menos un atributo marcado como is_key=True (PK).\n"
+    "- ECONOMIA DE SALIDA: la lista de entidades puede ser larga y solo debes "
+    "detallar las entidades que se indiquen; para el resto NO emitas entradas.\n"
+    "- length: SOLO cuando el tipo lo soporta (string -> caracteres maximos, "
+    "ej. '16'; float -> 'precision,escala', ej. '10,2'). Dejalo vacio en int, "
+    "bool, datetime, date, uuid, text y json. Nunca inventes largos que los "
+    "requerimientos no sugieran.\n"
+    "- description de cada atributo: UNA frase breve de negocio (maximo 120 "
+    "caracteres) que diga que representa; si el atributo tiene valores "
+    "permitidos (enum), enumerarlos dentro de la description (ej. 'Estado del "
+    "pedido: activa, cancelada, cumplida'). La salida debe seguir siendo "
+    "compacta.\n"
+    "- NO inventes entidades nuevas. Solo atributos y relaciones para las entidades indicadas.\n"
+    "- Toda entidad detallada debe tener al menos un atributo marcado como is_key=True (PK).\n"
     "- Las relaciones deben referenciar SOLO entidades de la lista.\n"
     "- cardinalidad: usa exactamente '1:1', '1:N' o 'N:M'.\n"
     "Devuelve SOLO el objeto estructurado."
@@ -423,10 +539,15 @@ def _render_mermaid(
             lines.append(_mermaid_attr_line(attr.model_dump()))
         lines.append("    }")
 
-    # Relationship edges
+    # Relationship edges. Los extremos deben ser entidades declaradas:
+    # Mermaid auto-crearia un nodo fantasma (caja sin atributos) para cualquier
+    # extremo no declarado, invisible para el diccionario de datos.
+    valid_ids = {e.name.replace(" ", "_").upper() for e in entities}
     for rel in relationships:
         from_id = rel.from_entity.replace(" ", "_").upper()
         to_id = rel.to_entity.replace(" ", "_").upper()
+        if from_id not in valid_ids or to_id not in valid_ids:
+            continue
         card = _MERMAID_CARDINALITY.get(rel.cardinality.strip(), "||--o{")
         label = rel.label or "relates_to"
         lines.append(f'    {from_id} {card} {to_id} : "{label}"')
@@ -463,6 +584,112 @@ def _render_mermaid(
         lines.append(f"    class {ent_id} {cls}")
         if ent.aggregate_root:
             lines.append(f"    class {ent_id} agg_root")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Data dictionary rendering (deterministic, 0 LLM)
+# ---------------------------------------------------------------------------
+
+
+def _md_cell(text: str) -> str:
+    """Sanitiza una celda de tabla markdown (sin saltos, pipes escapados)."""
+    return text.strip().replace("\n", " ").replace("|", "\\|")
+
+
+def render_data_dictionary(
+    entities: list[MerEntitySchema],
+    relationships: list[MerRelationshipSchema],
+) -> str:
+    """Renderiza el diccionario de datos como Markdown (determinista, 0 LLM).
+
+    Formato de referencia para entregables de modelado (Silverston,
+    dbdocs/dbt): catálogo de entidades como índice, luego UNA sección por
+    entidad con su explicación de negocio y la tabla de campos
+    (Campo/Tipo/Largo/Obligatorio/Clave/Descripción) ordenada PK primero,
+    luego FKs (atributo cuyo tipo nombra otra entidad) y después atributos
+    propios. Cierra con la tabla resumen de relaciones. Tolerante a dicts
+    de atributos persistidos sin ``length`` (columna vacía).
+    """
+    names_lower = {e.name.lower(): e.name for e in entities}
+
+    def _is_fk(attr: MerAttribute) -> bool:
+        return (attr.type or "").strip().lower() in names_lower
+
+    lines: list[str] = ["## Diccionario de datos", ""]
+    lines.append(
+        f"{len(entities)} entidades · "
+        f"{sum(len(e.attributes) for e in entities)} atributos · "
+        f"{len(relationships)} relaciones"
+    )
+    lines.append("")
+
+    # Catálogo de entidades (índice del documento).
+    lines.append("| Entidad | Descripción | Campos |")
+    lines.append("| --- | --- | --- |")
+    for ent in entities:
+        desc = (ent.description or "").strip()
+        cut = desc.find(".")
+        if cut > 0:
+            desc = desc[: cut + 1]
+        lines.append(
+            f"| {ent.name} | {_md_cell(desc)} | {len(ent.attributes)} |"
+        )
+    lines.append("")
+
+    # Una sección por entidad.
+    for ent in entities:
+        badges: list[str] = []
+        if ent.aggregate_root:
+            badges.append("aggregate root")
+        if ent.bounded_context:
+            badges.append(f"contexto: {ent.bounded_context}")
+        badge_str = f" ({'; '.join(badges)})" if badges else ""
+        lines.append(f"### {ent.name}{badge_str}")
+        lines.append("")
+        if ent.description:
+            lines.append(ent.description.strip())
+            lines.append("")
+        if not ent.attributes:
+            lines.append("_Sin atributos modelados._")
+            lines.append("")
+            continue
+        lines.append("| Campo | Tipo | Largo | Obligatorio | Clave | Descripción |")
+        lines.append("| --- | --- | --- | --- | --- | --- |")
+        # Orden de referencia: PK primero, luego FKs, luego atributos propios.
+        ranked = sorted(
+            ent.attributes,
+            key=lambda a: 0 if a.is_key else 1 if _is_fk(a) else 2,
+        )
+        for attr in ranked:
+            if attr.is_key:
+                key = "PK"
+            elif _is_fk(attr):
+                target = names_lower[(attr.type or "").strip().lower()]
+                key = f"FK → {target}"
+            else:
+                key = ""
+            lines.append(
+                f"| {attr.name} | {attr.type} | {attr.length or ''} "
+                f"| {'sí' if attr.required else 'no'} | {key} "
+                f"| {_md_cell(attr.description or '')} |"
+            )
+        lines.append("")
+
+    # Resumen de relaciones.
+    if relationships:
+        lines.append("### Relaciones")
+        lines.append("")
+        lines.append("| Origen | Cardinalidad | Destino | Verbo | Descripción |")
+        lines.append("| --- | --- | --- | --- | --- |")
+        for rel in relationships:
+            lines.append(
+                f"| {rel.from_entity} | {rel.cardinality} | {rel.to_entity} "
+                f"| {_md_cell(rel.label or '')} "
+                f"| {_md_cell(rel.description or '')} |"
+            )
+        lines.append("")
 
     return "\n".join(lines)
 
@@ -537,28 +764,126 @@ def _build_items_text(
 # ---------------------------------------------------------------------------
 
 
+def _dedupe_candidates(
+    candidates: list[EntityCandidate],
+) -> list[EntityCandidate]:
+    """Merge entity candidates found across batches (case-insensitive name).
+
+    The first occurrence wins for description/aggregate_root/bounded_context;
+    traced_req_codes are unioned so the same entity reported by two batches
+    does not become two entities (it would duplicate the erDiagram block).
+    """
+    merged: dict[str, EntityCandidate] = {}
+    order: list[str] = []
+    for c in candidates:
+        key = c.name.lower().strip()
+        if key in merged:
+            existing = merged[key]
+            for code in c.traced_req_codes:
+                if code not in existing.traced_req_codes:
+                    existing.traced_req_codes.append(code)
+        else:
+            merged[key] = c
+            order.append(key)
+    return [merged[k] for k in order]
+
+
+async def _discover_entities_batch(
+    items_batch,
+    project_name: str,
+    project_description: str,
+    goals: list[Any] | None = None,
+    feedback: str = "",
+) -> list[EntityCandidate]:
+    """Discover entities for a single batch of items (one LLM call)."""
+    user_text = _build_items_text(
+        items_batch, project_name, project_description,
+        goals=goals, feedback=feedback,
+    )
+    msgs = [("system", _ENTITY_DISCOVERY_PROMPT), ("human", user_text)]
+    try:
+        result = await invoke_structured_resilient(
+            lambda **kw: structured_llm(EntityDiscoverySchema, **kw),
+            msgs,
+            context_label=f"mer_discover ({len(items_batch)} items)",
+        )
+        return list(result.entities)
+    except Exception:
+        logger.exception(
+            "_discover_entities_batch: all retries exhausted for %d items",
+            len(items_batch),
+        )
+        return []
+
+
 async def _discover_entities(
     items,
     project_name: str,
     project_description: str,
     goals: list[Any] | None = None,
     feedback: str = "",
+    concurrency: int = DEFAULT_CONCURRENCY,
+    on_progress=None,
 ) -> list[EntityCandidate]:
-    """Pass 1: entity discovery with narrow schema (no attributes, no relationships)."""
-    user_text = _build_items_text(
-        items, project_name, project_description,
-        goals=goals, feedback=feedback,
-    )
-    msgs = [("system", _ENTITY_DISCOVERY_PROMPT), ("human", user_text)]
-    llm = structured_llm(EntityDiscoverySchema)
-    try:
-        result = await _invoke_with_retry(
-            llm, msgs, context_label="mer_discover"
+    """Pass 1: batched entity discovery with narrow schema.
+
+    Items are split into batches of ``_MER_BATCH_SIZE`` so a large corpus
+    never overflows a single structured call. Batches run concurrently up to
+    ``concurrency`` parallel calls; a failed batch degrades to no candidates
+    instead of aborting the pass. Duplicate entity names across batches are
+    merged by ``_dedupe_candidates``. ``on_progress`` (optional) fires per
+    batch for live UI feedback — at corporate scale this pass alone issues
+    dozens of calls and is the longest silent stretch of the stage.
+    """
+    batches = list(_chunk(items, _MER_BATCH_SIZE))
+    total = len(batches)
+    if total <= 1:
+        if on_progress is not None:
+            await on_progress("entidades identificadas (1/1 lote)")
+        return _dedupe_candidates(
+            await _discover_entities_batch(
+                items, project_name, project_description,
+                goals=goals, feedback=feedback,
+            )
         )
-        return list(result.entities)
-    except Exception:
-        logger.exception("_discover_entities: all retries exhausted")
-        return []
+    sem = asyncio.Semaphore(concurrency)
+    done = 0
+    failed = 0
+
+    async def _guarded(batch):
+        nonlocal done, failed
+        async with sem:
+            result = await _discover_entities_batch(
+                batch, project_name, project_description,
+                goals=goals, feedback=feedback,
+            )
+            done += 1
+            if not result:
+                failed += 1
+            if on_progress is not None:
+                await on_progress(
+                    f"entidades identificadas ({done}/{total} lotes)"
+                )
+            return result
+
+    results = await asyncio.gather(
+        *[_guarded(b) for b in batches], return_exceptions=True
+    )
+    all_candidates: list[EntityCandidate] = []
+    for i, r in enumerate(results):
+        if isinstance(r, Exception):
+            logger.warning(
+                "_discover_entities: batch %d/%d failed: %s",
+                i + 1, total, r,
+            )
+            failed += 1
+            continue
+        all_candidates.extend(r)
+    logger.info(
+        "mer_discover: %d/%d lotes ok (%d sin candidatos) sobre %d items",
+        total - failed, total, failed, len(items),
+    )
+    return _dedupe_candidates(all_candidates)
 
 
 # ---------------------------------------------------------------------------
@@ -573,8 +898,15 @@ async def _gap_pass(
     project_description: str,
     goals: list[Any] | None = None,
     feedback: str = "",
+    concurrency: int = DEFAULT_CONCURRENCY,
+    on_progress=None,
 ) -> list[EntityCandidate]:
-    """Pass 2: detect uncovered REQ codes and re-scan them."""
+    """Pass 2: detect uncovered REQ codes and re-scan them (batched).
+
+    With a large corpus the uncovered set can hold hundreds of items, so the
+    rescan itself runs in batches of ``_MER_BATCH_SIZE``. ``on_progress``
+    (optional) fires per batch for live UI feedback.
+    """
     input_codes = {it.code for it in items}
     covered_codes = {c for e in candidates for c in e.traced_req_codes}
     uncovered = input_codes - covered_codes
@@ -582,26 +914,65 @@ async def _gap_pass(
         return []
 
     uncovered_items = [it for it in items if it.code in uncovered]
-    user_text = _build_items_text(
-        uncovered_items, project_name, project_description,
-        goals=goals, feedback=feedback,
-    )
     already_listed = ", ".join(e.name for e in candidates) or "(ninguna)"
-    user_text += (
-        f"\nENTIDADES YA IDENTIFICADAS: {already_listed}\n"
-        "Revisa SOLO los requerimientos anteriores y determina si generan "
-        "entidades NUEVAS (no listadas arriba).\n"
-    )
-    msgs = [("system", _GAP_PASS_PROMPT), ("human", user_text)]
-    llm = structured_llm(EntityDiscoverySchema)
-    try:
-        result = await _invoke_with_retry(
-            llm, msgs, context_label="mer_gap_pass"
+
+    async def _scan(batch_items) -> list[EntityCandidate]:
+        user_text = _build_items_text(
+            batch_items, project_name, project_description,
+            goals=goals, feedback=feedback,
         )
-        return list(result.entities)
-    except Exception:
-        logger.exception("_gap_pass: all retries exhausted")
-        return []
+        user_text += (
+            f"\nENTIDADES YA IDENTIFICADAS: {already_listed}\n"
+            "Revisa SOLO los requerimientos anteriores y determina si generan "
+            "entidades NUEVAS (no listadas arriba).\n"
+        )
+        msgs = [("system", _GAP_PASS_PROMPT), ("human", user_text)]
+        try:
+            result = await invoke_structured_resilient(
+                lambda **kw: structured_llm(EntityDiscoverySchema, **kw),
+                msgs,
+                context_label=f"mer_gap_pass ({len(batch_items)} items)",
+            )
+            return list(result.entities)
+        except Exception:
+            logger.exception(
+                "_gap_pass: all retries exhausted for %d items",
+                len(batch_items),
+            )
+            return []
+
+    batches = list(_chunk(uncovered_items, _MER_BATCH_SIZE))
+    total = len(batches)
+    if total <= 1:
+        if on_progress is not None:
+            await on_progress("re-escaneo de requerimientos no cubiertos (1/1 lote)")
+        return _dedupe_candidates(await _scan(uncovered_items))
+    sem = asyncio.Semaphore(concurrency)
+    done = 0
+
+    async def _guarded(batch):
+        nonlocal done
+        async with sem:
+            result = await _scan(batch)
+            done += 1
+            if on_progress is not None:
+                await on_progress(
+                    f"re-escaneo de no cubiertos ({done}/{total} lotes)"
+                )
+            return result
+
+    results = await asyncio.gather(
+        *[_guarded(b) for b in batches], return_exceptions=True
+    )
+    extra: list[EntityCandidate] = []
+    for i, r in enumerate(results):
+        if isinstance(r, Exception):
+            logger.warning(
+                "_gap_pass: batch %d/%d failed: %s", i + 1, total, r
+            )
+            continue
+        extra.extend(r)
+    return _dedupe_candidates(extra)
 
 
 # ---------------------------------------------------------------------------
@@ -616,74 +987,207 @@ async def _detail_entities_relationships(
     project_description: str,
     goals: list[Any] | None = None,
     feedback: str = "",
+    concurrency: int = DEFAULT_CONCURRENCY,
+    on_progress=None,
 ) -> tuple[list[MerEntitySchema], list[MerRelationshipSchema]]:
-    """Pass 3: given the finalized entity list, extract attributes + relationships.
+    """Pass 3: attributes + relationships, batched over the candidate list.
 
-    Merges candidate metadata (description, aggregate_root, bounded_context,
-    traced_req_codes) with the detail entities (attributes) matched by name
-    (case-insensitive). Builds full MerEntitySchema objects from the merged data.
+    The batch size is ``_MER_DETAIL_BATCH_SIZE`` (small on purpose: the
+    structured OUTPUT is what overflows the completion budget, not the
+    input). Each batch receives only the requirements traced to its own
+    entities (lookup by ``traced_req_codes``) plus the FULL entity name list,
+    so the model can emit cross-batch relationships that still validate in
+    Pass 4. With no candidates the pass short-circuits without an LLM call.
+    The base entity list is the candidate list — an entity whose batch failed
+    comes back without attributes (graceful degradation) instead of
+    disappearing from the model.
+
+    ``on_progress`` (optional) is awaited with a short human message after
+    each batch so callers (the agentic tool) can stream live progress.
     """
+    if not candidates:
+        return ([], [])
+
     entity_list_str = "\n".join(f"- {c.name}" for c in candidates)
-    user_text = _build_items_text(
-        items, project_name, project_description,
-        goals=goals, feedback=feedback,
-    )
-    user_text += (
-        f"\nENTIDADES DEL DOMINIO (usa SOLO estos nombres):\n"
-        f"{entity_list_str}\n"
-    )
-    msgs = [("system", _DETAIL_PROMPT), ("human", user_text)]
-    llm = structured_llm(MerDetailSchema)
-    try:
-        detail = await _invoke_with_retry(
-            llm, msgs, context_label="mer_detail"
+    items_by_code = {it.code: it for it in items}
+
+    def _entity_key(name: str) -> str:
+        return name.lower().strip()
+
+    async def _detail_batch(batch: list[EntityCandidate]):
+        batch_reqs = [
+            items_by_code[code]
+            for c in batch
+            for code in c.traced_req_codes
+            if code in items_by_code
+        ]
+        # Only THIS batch's entities go into the detail instruction — the
+        # full list stays in the context block above as the naming universe.
+        batch_names = ", ".join(c.name for c in batch)
+        user_text = _build_items_text(
+            batch_reqs, project_name, project_description,
+            goals=goals, feedback=feedback,
         )
-    except Exception:
-        logger.exception(
-            "_detail_entities_relationships: all retries exhausted"
+        user_text += (
+            f"\nENTIDADES DEL DOMINIO (usa SOLO estos nombres):\n"
+            f"{entity_list_str}\n\n"
+            f"DETALLA SOLO ESTAS ENTIDADES: {batch_names}\n"
         )
-        # Fallback: return candidates as entities without attributes.
-        fallback_entities = [
+        msgs = [("system", _DETAIL_PROMPT), ("human", user_text)]
+        try:
+            return await invoke_structured_resilient(
+                lambda **kw: structured_llm(MerDetailSchema, **kw),
+                msgs,
+                context_label=f"mer_detail ({len(batch)} entities)",
+            )
+        except Exception:
+            logger.exception(
+                "_detail_entities_relationships: batch of %d entities failed",
+                len(batch),
+            )
+            return None
+
+    batches = list(_chunk(candidates, _MER_DETAIL_BATCH_SIZE))
+    total_batches = len(batches)
+    sem = asyncio.Semaphore(concurrency)
+    done = 0
+    failed = 0
+
+    async def _guarded(batch):
+        nonlocal done, failed
+        async with sem:
+            result = await _detail_batch(batch)
+            done += 1
+            if result is None:
+                failed += 1
+            if on_progress is not None:
+                detail = (
+                    f"lote {done}/{total_batches} completado"
+                    if result is not None
+                    else f"lote {done}/{total_batches} falló, se continúa "
+                    "con el resto"
+                )
+                await on_progress(
+                    f"atributos y relaciones ({done}/{total_batches} lotes): "
+                    f"{detail}"
+                )
+            return result
+
+    results = await asyncio.gather(
+        *[_guarded(b) for b in batches], return_exceptions=True
+    )
+
+    attributes_by_key: dict[str, list[MerAttribute]] = {}
+    relationships: list[MerRelationshipSchema] = []
+    for i, r in enumerate(results):
+        if isinstance(r, Exception):
+            logger.warning(
+                "_detail_entities_relationships: batch %d/%d failed: %s",
+                i + 1, total_batches, r,
+            )
+            failed += 1
+            continue
+        if r is None:
+            continue
+        for det in r.entities:
+            attributes_by_key[_entity_key(det.name)] = det.attributes
+        relationships.extend(r.relationships)
+
+    logger.info(
+        "mer_detail: %d/%d lotes ok (%d fallidos) sobre %d entidades",
+        total_batches - failed, total_batches, failed, len(candidates),
+    )
+
+    entities_full: list[MerEntitySchema] = []
+    for c in candidates:
+        entities_full.append(
             MerEntitySchema(
                 name=c.name,
                 description=c.description,
+                attributes=attributes_by_key.get(_entity_key(c.name), []),
                 aggregate_root=c.aggregate_root,
                 bounded_context=c.bounded_context,
                 traced_req_codes=c.traced_req_codes,
             )
-            for c in candidates
-        ]
-        return (fallback_entities, [])
-
-    # Merge candidates + detail by lowercase name.
-    candidate_lookup = {c.name.lower(): c for c in candidates}
-    entities_full: list[MerEntitySchema] = []
-    for det_ent in detail.entities:
-        c = candidate_lookup.get(det_ent.name.lower())
-        if c:
-            entities_full.append(
-                MerEntitySchema(
-                    name=c.name,
-                    description=c.description,
-                    attributes=det_ent.attributes,
-                    aggregate_root=c.aggregate_root,
-                    bounded_context=c.bounded_context,
-                    traced_req_codes=c.traced_req_codes,
-                )
-            )
-        else:
-            # Entity from detail not in candidates — include with empty metadata.
-            entities_full.append(
-                MerEntitySchema(name=det_ent.name, attributes=det_ent.attributes)
-            )
-
-    relationships = list(detail.relationships)
+        )
     return (entities_full, relationships)
 
 
 # ---------------------------------------------------------------------------
 # Pass 4: deterministic validation
 # ---------------------------------------------------------------------------
+
+
+def _reconcile_relationship_endpoints(
+    entities: list[MerEntitySchema],
+    relationships: list[MerRelationshipSchema],
+    *,
+    max_report: int = 50,
+) -> tuple[list[MerRelationshipSchema], dict[str, Any], list[str]]:
+    """Pass 3d: re-apunta extremos de relaciones a nombres canonicos.
+
+    La pasada de detalle acumula relaciones de lotes independientes y el LLM
+    puede emitir variantes del nombre canonico ("ConfiguracionConexion" vs
+    "Configuracion de Conexion"); la consolidacion 3b solo re-apunta nombres
+    exactos. Una arista con extremo inexistente renderizaria un nodo fantasma
+    en el erDiagram sin contraparte en el diccionario de datos, asi que cada
+    extremo se resuelve con ``resolve_entity_reference`` y las aristas sin
+    resolucion (o ambiguas) se descartan con warning explicito.
+    """
+    names = [e.name for e in entities]
+    kept: list[MerRelationshipSchema] = []
+    reconciled: list[dict[str, str]] = []
+    warnings: list[str] = []
+    seen_edges: set[tuple[str, str, str]] = set()
+    reconciled_count = 0
+    dropped_count = 0
+    deduped_count = 0
+    for rel in relationships:
+        new_from = resolve_entity_reference(rel.from_entity, names)
+        new_to = resolve_entity_reference(rel.to_entity, names)
+        if new_from is None or new_to is None:
+            dropped_count += 1
+            for side, resolved in (
+                ("from_entity", new_from),
+                ("to_entity", new_to),
+            ):
+                if resolved is not None:
+                    continue
+                bad = rel.from_entity if side == "from_entity" else rel.to_entity
+                warnings.append(
+                    f"Relacion descartada por extremo sin entidad "
+                    f"({side}): {bad}"
+                )
+            continue
+        for side, old, new in (
+            ("from", rel.from_entity, new_from),
+            ("to", rel.to_entity, new_to),
+        ):
+            if old != new:
+                reconciled_count += 1
+                if len(reconciled) < max_report:
+                    reconciled.append({"side": side, "was": old, "now": new})
+        rel.from_entity = new_from
+        rel.to_entity = new_to
+        edge = (
+            new_from.lower(),
+            new_to.lower(),
+            (rel.label or "").strip().lower(),
+        )
+        if edge in seen_edges:
+            # Dos variantes pueden converger a la misma arista tras el
+            # re-apuntado; sin dedupe el render duplicaria la linea.
+            deduped_count += 1
+            continue
+        seen_edges.add(edge)
+        kept.append(rel)
+    stats = {
+        "reconciled": reconciled,
+        "reconciled_count": reconciled_count,
+        "dropped_count": dropped_count,
+        "deduped_count": deduped_count,
+    }
+    return kept, stats, warnings
 
 
 def _validate_mer(
@@ -872,6 +1376,486 @@ async def _describe_mer(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Pass 3b: consolidation (anti over-fragmentation)
+# ---------------------------------------------------------------------------
+
+_MER_CONSOLIDATION_PROMPT = (
+    "Eres un modelador de datos. Recibes grupos de entidades candidatas a "
+    "fusion que un heuristico detecto como posibles DUPLICADOS, SINONIMOS o "
+    "FRAGMENTOS de una misma entidad (ej. 'Cliente' + 'Customer' + "
+    "'ClientePrincipal', o 'PedidoItem' + 'PedidoLinea'). Decide que "
+    "fusiones son correctas.\n\n"
+    "Reglas:\n"
+    "- SOLO fusiona entidades que claramente modelan el mismo concepto del "
+    "dominio. Ante duda, NO fusiones (es preferible dejar una entidad de mas).\n"
+    "- keep debe ser el nombre mas claro y canonicamente correcto del grupo.\n"
+    "- absorb y keep usan nombres EXACTOS de la lista recibida.\n"
+    "- No inventes entidades ni nombres nuevos.\n"
+    "- Si un grupo NO debe fusionarse, simplemente omite ese grupo.\n"
+    "Devuelve SOLO el objeto estructurado."
+)
+
+_SINGULAR_SUFFIXES = ("s", "es", "as")
+
+
+def _normalize_entity_name(name: str) -> str:
+    """Lowercase + strip accents/spaces + naive singular for grouping."""
+    import unicodedata
+
+    lowered = unicodedata.normalize(
+        "NFKD", name.strip().lower()
+    )
+    lowered = "".join(
+        c for c in lowered if not unicodedata.combining(c)
+    )
+    lowered = re.sub(r"[^a-z0-9]", "", lowered)
+    for suf in _SINGULAR_SUFFIXES:
+        if lowered.endswith(suf) and len(lowered) > len(suf) + 2:
+            return lowered[: -len(suf)]
+    return lowered
+
+
+_SPANISH_STOPWORDS = frozenset(
+    {"a", "de", "del", "el", "en", "la", "las", "los", "y"}
+)
+
+
+def _compact_entity_name(name: str) -> str:
+    """Nombre normalizado sin stopwords españoles (match de último recurso)."""
+    import unicodedata
+
+    lowered = unicodedata.normalize("NFKD", name.strip().lower())
+    lowered = "".join(c for c in lowered if not unicodedata.combining(c))
+    tokens = re.split(r"[^a-z0-9]+", lowered)
+    return "".join(t for t in tokens if t and t not in _SPANISH_STOPWORDS)
+
+
+def resolve_entity_reference(
+    reference: str, names: list[str]
+) -> str | None:
+    """Resuelve un extremo de relacion (posible variante) a un nombre de entidad.
+
+    Niveles de match, del mas estricto al mas laxo; un nivel con 2+
+    candidatos se rechaza como ambiguo (nunca adivinar):
+    1. Exacto ignorando mayusculas.
+    2. ``_normalize_entity_name`` (acentos/separadores/plural).
+    3. Compaccion sin stopwords (``ConfiguracionConexion`` ->
+       ``Configuracion de Conexion``).
+    """
+    ref = (reference or "").strip()
+    if not ref:
+        return None
+    by_lower = {n.lower(): n for n in names}
+    exact = by_lower.get(ref.lower())
+    if exact is not None:
+        return exact
+    ref_norm = _normalize_entity_name(ref)
+    normalized = [n for n in names if _normalize_entity_name(n) == ref_norm]
+    if len(normalized) == 1:
+        return normalized[0]
+    ref_compact = _compact_entity_name(ref)
+    compact = [n for n in names if _compact_entity_name(n) == ref_compact]
+    if len(compact) == 1:
+        return compact[0]
+    return None
+
+
+def _candidate_consolidation_groups(
+    entities: list[MerEntitySchema],
+) -> list[list[str]]:
+    """Detect candidate duplicate/synonym groups deterministically (0 LLM).
+
+    Tres senales, ninguna decisiva por si sola pero suficientes para
+    acotar el trabajo del LLM a los pares plausibles:
+    - nombres equivalentes tras normalizar (singular, acentos, separadores);
+    - un nombre es prefijo del otro (Fragmento de una misma entidad:
+      OrderItem/OrderLine vs Order se maneja por prefix group);
+    - solapamiento fuerte de traced_req_codes (>= 60% del menor).
+    Devuelve grupos de >= 2 nombres.
+    """
+    # Union-find ligero sobre pares candidatos.
+    parent: dict[str, str] = {e.name: e.name for e in entities}
+
+    def find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: str, b: str) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    by_norm: dict[str, str] = {}
+    for e in entities:
+        norm = _normalize_entity_name(e.name)
+        first = by_norm.setdefault(norm, e.name)
+        if first != e.name:
+            union(first, e.name)
+
+    codes_by_name: dict[str, set[str]] = {
+        e.name: set(e.traced_req_codes or []) for e in entities
+    }
+    names = [e.name for e in entities]
+    for i, a in enumerate(names):
+        for b in names[i + 1 :]:
+            codes_a = codes_by_name[a]
+            codes_b = codes_by_name[b]
+            if not codes_a or not codes_b:
+                continue
+            overlap = len(codes_a & codes_b)
+            smaller = min(len(codes_a), len(codes_b))
+            if overlap and overlap / smaller >= 0.6:
+                union(a, b)
+
+    groups: dict[str, set[str]] = {}
+    for e in entities:
+        groups.setdefault(find(e.name), set()).add(e.name)
+    return [
+        sorted(g) for g in groups.values() if len(g) >= 2
+    ]
+
+
+async def _consolidate_entities(
+    entities: list[MerEntitySchema],
+    relationships: list[MerRelationshipSchema],
+    *,
+    project_name: str = "",
+    concurrency: int = DEFAULT_CONCURRENCY,
+    on_progress=None,
+) -> tuple[
+    list[MerEntitySchema],
+    list[MerRelationshipSchema],
+    list[dict],
+]:
+    """Pass 3b: fusion de entidades duplicadas/sinonimas (afinamiento).
+
+    Deteccion determinista de grupos candidatos (0 LLM) + consolidacion LLM
+    batcheada que SOLO decide que grupos fusionar (output angosto). El merge
+    en si es determinista: keep absorbe atributos (dedup por nombre) y
+    trazas; las relaciones que apuntaban a absorbidas se re-apuntan a keep
+    (dedup de pares equivalentes). Un lote que falla degrada a "sin merges
+    de ese lote"; si TODOS fallan devuelve la entrada intacta.
+    """
+    before = len(entities)
+    groups = _candidate_consolidation_groups(entities)
+    if not groups:
+        return entities, relationships, []
+
+    # Resolver unions transitivas: cada grupo es un set de nombres; el LLM
+    # decide que fusiones (keep/absorb) hacer dentro de cada grupo.
+    name_set = {e.name for e in entities}
+    batches = list(_chunk(groups, _MER_CONSOLIDATION_BATCH_SIZE))
+    total_batches = len(batches)
+    state: dict[str, int] = {"done": 0, "failed": 0}
+    merges: list[dict] = []
+
+    async def _ask(batch: list[list[str]]):
+        lines = []
+        for group in batch:
+            members = ", ".join(group)
+            lines.append(f"- [{members}]")
+        msgs = [
+            ("system", _MER_CONSOLIDATION_PROMPT),
+            (
+                "human",
+                "GRUPOS CANDIDATOS (nombre [contexto]):\n"
+                + "\n".join(lines)
+                + "\n",
+            ),
+        ]
+        try:
+            return await invoke_structured_resilient(
+                lambda **kw: structured_llm(MerConsolidationSchema, **kw),
+                msgs,
+                context_label=f"mer_consolidate ({len(batch)} grupos)",
+            )
+        except Exception:
+            logger.exception("_consolidate_entities: lote fallo")
+            return None
+
+    sem = asyncio.Semaphore(concurrency)
+
+    async def _guarded(batch):
+        async with sem:
+            result = await _ask(batch)
+            state["done"] += 1
+            if result is None:
+                state["failed"] += 1
+            if on_progress is not None:
+                detail = (
+                    f"lote {state['done']}/{total_batches} completado"
+                    if result is not None
+                    else f"lote {state['done']}/{total_batches} fallo, se "
+                    "continua con el resto"
+                )
+                await on_progress(
+                    f"afinando MER ({state['done']}/{total_batches} lotes): {detail}"
+                )
+            return result
+
+    results = await asyncio.gather(
+        *[_guarded(b) for b in batches], return_exceptions=True
+    )
+    ok_results = [
+        r for r in results if isinstance(r, MerConsolidationSchema)
+    ]
+    failed = total_batches - len(ok_results)
+    logger.info(
+        "mer_consolidate: %d/%d lotes ok (%d fallidos) sobre %d grupos",
+        len(ok_results), total_batches, failed, len(groups),
+    )
+    if not ok_results:
+        return entities, relationships, []
+
+    for schema in ok_results:
+        for m in schema.merges:
+            if m.keep not in name_set:
+                continue
+            absorb = [a for a in m.absorb if a in name_set and a != m.keep]
+            if not absorb:
+                continue
+            merges.append({
+                "keep": m.keep,
+                "absorb": absorb,
+                "reason": m.reason,
+            })
+
+    # Merge determinista.
+    absorbed_names: set[str] = set()
+    for m in merges:
+        absorbed_names.update(m["absorb"])
+    if not absorbed_names:
+        return entities, relationships, []
+
+    by_name = {e.name: e for e in entities}
+    keepers = [e for e in entities if e.name not in absorbed_names]
+    for m in merges:
+        keep = by_name.get(m["keep"])
+        if keep is None:
+            continue
+        keep_attrs: set[str] = {a.name.lower() for a in keep.attributes}
+        for absorbed_name in m["absorb"]:
+            absorbed = by_name.get(absorbed_name)
+            if absorbed is None or absorbed.name in (
+                absorbed_names - {absorbed_name}
+            ) and absorbed_name != m["keep"] and absorbed is keep:
+                continue
+            if absorbed is None or absorbed is keep:
+                continue
+            for attr in absorbed.attributes:
+                if attr.name.lower() not in keep_attrs:
+                    keep.attributes.append(attr)
+                    keep_attrs.add(attr.name.lower())
+            for code in absorbed.traced_req_codes:
+                if code not in keep.traced_req_codes:
+                    keep.traced_req_codes.append(code)
+            if not keep.description and absorbed.description:
+                keep.description = absorbed.description
+            if not keep.bounded_context and absorbed.bounded_context:
+                keep.bounded_context = absorbed.bounded_context
+            if absorbed.aggregate_root:
+                keep.aggregate_root = True
+
+    # Re-apuntar relaciones de absorbidas hacia keep y deduplicar.
+    redirect = {
+        absorbed: m["keep"]
+        for m in merges
+        for absorbed in m["absorb"]
+    }
+    seen_rels: set[tuple] = set()
+    new_rels: list[MerRelationshipSchema] = []
+    for rel in relationships:
+        rel.from_entity = redirect.get(rel.from_entity, rel.from_entity)
+        rel.to_entity = redirect.get(rel.to_entity, rel.to_entity)
+        if rel.from_entity == rel.to_entity:
+            continue  # self-loop creado por el merge
+        if rel.from_entity in absorbed_names or rel.to_entity in absorbed_names:
+            continue
+        key = (rel.from_entity.lower(), rel.to_entity.lower(), rel.cardinality)
+        if key in seen_rels:
+            continue
+        seen_rels.add(key)
+        new_rels.append(rel)
+
+    return keepers, new_rels, merges
+
+
+# ---------------------------------------------------------------------------
+# Pass 3c: higiene de contextos acotados
+# ---------------------------------------------------------------------------
+
+
+_CONTEXT_STOPWORDS = re.compile(
+    r"\b(de|del|la|el|los|las|y|e|en|para)\b", re.IGNORECASE
+)
+
+
+def normalize_context_key(bc: str | None) -> str:
+    """Clave canonica de una etiqueta de contexto para agrupar variantes.
+
+    Quita acentos, separa camelCase («GestionTerreno» -> «Gestion Terreno»),
+    descarta partículas («de», «del», «y», …) y reduce a minusculas
+    alfanumericas. «Gestión de Terreno», «Gestion de Terreno» y
+    «GestionTerreno» producen la misma clave; «N:M» y otros dominios
+    distintos conservan claves separadas.
+    """
+    if not bc:
+        return ""
+    decomposed = unicodedata.normalize("NFKD", bc)
+    without_accents = "".join(
+        c for c in decomposed if not unicodedata.combining(c)
+    )
+    camel_spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", without_accents)
+    without_stopwords = _CONTEXT_STOPWORDS.sub(" ", camel_spaced)
+    return re.sub(r"[^a-z0-9]", "", without_stopwords.lower())
+
+
+def _context_label_counts(entities: list[MerEntitySchema]) -> dict[str, int]:
+    """Conteo de entidades por etiqueta de contexto (sin vacias)."""
+    counts: dict[str, int] = {}
+    for e in entities:
+        bc = (e.bounded_context or "").strip()
+        if bc:
+            counts[bc] = counts.get(bc, 0) + 1
+    return counts
+
+
+def consolidate_context_labels(
+    entities: list[MerEntitySchema],
+) -> dict[str, str]:
+    """Fusiona variantes ortograficas de ``bounded_context`` (0 LLM).
+
+    Agrupa las etiquetas por clave normalizada y reescribe cada entidad a la
+    variante representativa del grupo: la mas frecuente; en empate, la mas
+    legible (la que tiene espacios). Devuelve el mapeo clave->canonica. Las
+    entidades sin contexto quedan intactas.
+    """
+    counts = _context_label_counts(entities)
+    groups: dict[str, list[str]] = {}
+    for e in entities:
+        bc = (e.bounded_context or "").strip()
+        if not bc:
+            continue
+        groups.setdefault(normalize_context_key(bc), []).append(bc)
+
+    canonical: dict[str, str] = {}
+    for key, variants in groups.items():
+        canonical[key] = sorted(
+            variants, key=lambda v: (-counts[v], " " not in v, v)
+        )[0]
+
+    for e in entities:
+        bc = (e.bounded_context or "").strip()
+        if not bc:
+            # Higiene: un contexto de solo espacios equivale a no tener.
+            e.bounded_context = ""
+            continue
+        e.bounded_context = canonical[normalize_context_key(bc)]
+    return canonical
+
+
+async def consolidate_bounded_contexts(
+    entities: list[MerEntitySchema],
+    *,
+    on_progress=None,
+) -> tuple[list[MerEntitySchema], dict]:
+    """Pass 3c: consolidacion de contextos acotados fragmentados.
+
+    Paso 1 determinista (0 LLM): fusiona variantes ortograficas. Paso 2
+    (LLM, solo si quedan mas etiquetas que ``_MER_CONTEXT_TARGET_MAX``): un
+    unico llamado de output angosto decide el mapeo etiqueta->canonica; su
+    aplicacion es determinista, resuelve cadenas (A->B, B->C) y solo acepta
+    canonicos que ya existen en el modelo. Cualquier fallo degrada al paso
+    anterior sin abortar el pipeline.
+    """
+    raw_labels = {
+        (e.bounded_context or "").strip()
+        for e in entities
+        if (e.bounded_context or "").strip()
+    }
+    consolidate_context_labels(entities)
+    norm_labels = {
+        (e.bounded_context or "").strip()
+        for e in entities
+        if (e.bounded_context or "").strip()
+    }
+    stats: dict = {
+        "raw": len(raw_labels),
+        "normalized": len(norm_labels),
+        "llm_mapped": False,
+        "final": len(norm_labels),
+    }
+    if len(norm_labels) <= _MER_CONTEXT_TARGET_MAX:
+        return entities, stats
+    if not _MER_CONTEXT_CONSOLIDATE_ENABLED:
+        return entities, stats
+    if on_progress is not None:
+        await on_progress(
+            f"consolidando {len(norm_labels)} contextos acotados del MER…"
+        )
+
+    counts = _context_label_counts(entities)
+    lines = [
+        f"- {label} ({counts[label]} entidades)"
+        for label in sorted(norm_labels)
+    ]
+    msgs = [
+        ("system", _MER_CONTEXT_CONSOLIDATION_PROMPT),
+        ("human", "ETIQUETAS DE CONTEXTO:\n" + "\n".join(lines) + "\n"),
+    ]
+    try:
+        schema = await invoke_structured_resilient(
+            lambda **kw: structured_llm(MerContextConsolidationSchema, **kw),
+            msgs,
+            context_label=f"mer_contexts ({len(norm_labels)} etiquetas)",
+        )
+    except Exception:
+        logger.exception("consolidate_bounded_contexts: mapeo LLM fallo")
+        return entities, stats
+
+    resolved: dict[str, str] = {}
+    for m in schema.mappings:
+        raw = m.raw.strip()
+        canon = m.canonical.strip()
+        if raw and canon and raw != canon:
+            resolved[raw] = canon
+
+    def _final(label: str) -> str:
+        seen: set[str] = set()
+        cur = label
+        while cur in resolved and cur not in seen:
+            seen.add(cur)
+            cur = resolved[cur]
+        return cur
+
+    applied = 0
+    for e in entities:
+        bc = (e.bounded_context or "").strip()
+        if not bc:
+            continue
+        target = _final(bc)
+        if target in norm_labels and target != bc:
+            e.bounded_context = target
+            applied += 1
+
+    final = {
+        (e.bounded_context or "").strip()
+        for e in entities
+        if (e.bounded_context or "").strip()
+    }
+    stats.update(
+        {
+            "llm_mapped": applied > 0,
+            "mappings_applied": applied,
+            "final": len(final),
+        }
+    )
+    return entities, stats
+
+
 async def generate_mer(
     items,
     *,
@@ -881,6 +1865,7 @@ async def generate_mer(
     enable_critique: bool = True,
     goals: list[Any] | None = None,
     feedback: str = "",
+    on_progress=None,
 ) -> MerResult:
     """Generate a domain entity model (MER) from functional requirements.
 
@@ -905,31 +1890,62 @@ async def generate_mer(
     if not items:
         return MerResult(stats={"input": 0})
 
-    # Pass 1: entity discovery.
+    # Pass 1: entity discovery (batched).
     candidates = await _discover_entities(
         items, project_name, project_description,
-        goals=goals, feedback=feedback,
+        goals=goals, feedback=feedback, concurrency=concurrency,
+        on_progress=on_progress,
     )
 
-    # Pass 2: gap pass for uncovered requirements.
+    # Pass 2: gap pass for uncovered requirements (batched).
     gap_candidates = await _gap_pass(
         items, candidates, project_name, project_description,
-        goals=goals, feedback=feedback,
+        goals=goals, feedback=feedback, concurrency=concurrency,
+        on_progress=on_progress,
     )
-    all_candidates = candidates + gap_candidates
+    all_candidates = _dedupe_candidates(candidates + gap_candidates)
 
-    # Pass 3: attributes + relationships (entity-constrained).
+    # Pass 3: attributes + relationships (entity-constrained, batched).
     entities_full, relationships = await _detail_entities_relationships(
         items, all_candidates, project_name, project_description,
-        goals=goals, feedback=feedback,
+        goals=goals, feedback=feedback, concurrency=concurrency,
+        on_progress=on_progress,
     )
+
+    # Snapshot pre-consolidacion para el reporte (before/after).
+    stats_before = len(entities_full)
 
     # Normalize cardinalities to canonical forms before validation/rendering.
     for rel in relationships:
         rel.cardinality = _normalize_cardinality(rel.cardinality)
 
+    # Pass 3b: consolidation (anti over-fragmentation, env kill-switch).
+    consolidation_merges: list[dict] = []
+    if _MER_CONSOLIDATE_ENABLED and len(entities_full) > _MER_BATCH_SIZE:
+        entities_full, relationships, consolidation_merges = (
+            await _consolidate_entities(
+                entities_full,
+                relationships,
+                project_name=project_name,
+                concurrency=concurrency,
+                on_progress=on_progress,
+            )
+        )
+
+    # Pass 3c: higiene de contextos acotados (normaliza variantes ortograficas
+    # y, si quedan demasiadas etiquetas, las consolida con un mapeo LLM).
+    entities_full, context_stats = await consolidate_bounded_contexts(
+        entities_full, on_progress=on_progress,
+    )
+
+    # Pass 3d: re-apunta extremos de relaciones a nombres canonicos de
+    # entidad (evita nodos fantasma en el erDiagram).
+    relationships, reconcile_stats, reconcile_warnings = (
+        _reconcile_relationship_endpoints(entities_full, relationships)
+    )
+
     # Pass 4: deterministic validation.
-    warnings = _validate_mer(entities_full, relationships)
+    warnings = reconcile_warnings + _validate_mer(entities_full, relationships)
 
     # Pass 5: LLM critique (optional).
     critique_findings: list[MerCritiqueFinding] = []
@@ -961,13 +1977,23 @@ async def generate_mer(
         "bounded_contexts": len(
             {e.bounded_context for e in entities_full if e.bounded_context}
         ),
+        "contexts": context_stats,
         "req_coverage": f"{len(covered_codes)}/{len(input_codes)}",
         "uncovered_codes": sorted(uncovered),
         "gap_pass_found": len(gap_candidates),
+        "consolidation": {
+            "before": stats_before,
+            "after": len(entities_full),
+            "merges": consolidation_merges,
+        },
         "validation_warnings": warnings,
+        "reconciliation": reconcile_stats,
         "critique_findings": [f.model_dump() for f in critique_findings],
         "critique_blockers": sum(
             1 for f in critique_findings if f.severity == "blocker"
+        ),
+        "data_dictionary": render_data_dictionary(
+            entities_full, relationships
         ),
     }
     logger.info(

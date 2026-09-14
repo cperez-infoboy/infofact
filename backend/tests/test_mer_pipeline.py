@@ -20,10 +20,14 @@ from backend.agents.pipelines.mer_pipeline import (
     MerResult,
     MerDetailSchema,
     MerCritiqueSchema,
+    _DETAIL_PROMPT,
     _normalize_cardinality,
+    _reconcile_relationship_endpoints,
     _render_mermaid,
     _validate_mer,
     generate_mer,
+    render_data_dictionary,
+    resolve_entity_reference,
 )
 
 
@@ -105,17 +109,20 @@ def test_mermaid_cardinality_notation():
     entities = [_make_entity("A"), _make_entity("B")]
 
     one_to_one = _render_mermaid(
-        entities, [_make_relationship(cardinality="1:1", label="one-to-one")]
+        entities,
+        [_make_relationship("A", "B", cardinality="1:1", label="one-to-one")],
     )
     assert "||--||" in one_to_one
 
     one_to_many = _render_mermaid(
-        entities, [_make_relationship(cardinality="1:N", label="one-to-many")]
+        entities,
+        [_make_relationship("A", "B", cardinality="1:N", label="one-to-many")],
     )
     assert "||--o{" in one_to_many
 
     many_to_many = _render_mermaid(
-        entities, [_make_relationship(cardinality="N:M", label="many-to-many")]
+        entities,
+        [_make_relationship("A", "B", cardinality="N:M", label="many-to-many")],
     )
     assert "}o--o{" in many_to_many
 
@@ -432,3 +439,363 @@ async def test_generate_mer_disable_critique_skips_pass5():
     mock_critique.assert_not_called()
     assert result.stats["critique_findings"] == []
     assert result.stats["critique_blockers"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# MerAttribute.length + prompt del pass de detalle                            #
+# --------------------------------------------------------------------------- #
+
+
+def test_mer_attribute_length_defaults_empty():
+    """El campo nuevo length es opcional (compatibilidad con versiones viejas)."""
+    attr = MerAttribute(name="id", type="uuid", is_key=True)
+    assert attr.length == ""
+    # Un dict persistido sin length también valida (regresión).
+    legacy = MerAttribute.model_validate(
+        {"name": "status", "type": "string", "required": True}
+    )
+    assert legacy.length == ""
+
+
+def test_detail_prompt_mentions_length_and_business_description():
+    """El prompt del pass 3 pide largo con regla de tipos y descripción de negocio."""
+    assert "length" in _DETAIL_PROMPT
+    assert "'10,2'" in _DETAIL_PROMPT  # precisión,escala para float
+    assert "120" in _DETAIL_PROMPT  # techo de la frase de negocio
+    assert "enum" in _DETAIL_PROMPT  # valores permitidos dentro de la descripción
+
+
+# --------------------------------------------------------------------------- #
+# render_data_dictionary (determinista, 0 LLM)                                #
+# --------------------------------------------------------------------------- #
+
+
+def _dictionary_fixture():
+    entities = [
+        MerEntitySchema(
+            name="Order",
+            description="Pedido confirmado del cliente.",
+            aggregate_root=True,
+            bounded_context="Sales",
+            attributes=[
+                MerAttribute(
+                    name="id",
+                    type="uuid",
+                    is_key=True,
+                    description="Identificador del pedido.",
+                ),
+                MerAttribute(
+                    name="customer",
+                    type="Customer",
+                    description="Cliente que realiza el pedido.",
+                ),
+                MerAttribute(
+                    name="status",
+                    type="string",
+                    length="16",
+                    description="Estado: activa, cancelada, cumplida.",
+                ),
+                MerAttribute(
+                    name="total",
+                    type="float",
+                    length="10,2",
+                    required=False,
+                    description="Monto total en USD.",
+                ),
+            ],
+        ),
+        MerEntitySchema(
+            name="Customer",
+            description="Cliente registrado.",
+            attributes=[MerAttribute(name="id", type="uuid", is_key=True)],
+        ),
+    ]
+    relationships = [
+        MerRelationshipSchema(
+            from_entity="Customer",
+            to_entity="Order",
+            cardinality="1:N",
+            label="places",
+            description="Un cliente realiza muchos pedidos.",
+        )
+    ]
+    return entities, relationships
+
+
+def test_render_data_dictionary_structure():
+    """Índice de entidades, sección por entidad y tabla de campos de 6 columnas."""
+    entities, relationships = _dictionary_fixture()
+    out = render_data_dictionary(entities, relationships)
+
+    assert out.startswith("## Diccionario de datos")
+    # Catálogo-índice con las dos entidades.
+    assert "| Entidad | Descripción | Campos |" in out
+    assert "| Order |" in out and "| Customer |" in out
+    # Encabezado de sección de entidad con badges.
+    assert "### Order (aggregate root; contexto: Sales)" in out
+    assert "### Customer" in out
+    # Explicación de la entidad en prosa.
+    assert "Pedido confirmado del cliente." in out
+    # Tabla de campos con las columnas del diccionario.
+    assert "| Campo | Tipo | Largo | Obligatorio | Clave | Descripción |" in out
+    assert "| status | string | 16 | sí |  | Estado: activa, cancelada, cumplida. |" in out
+
+
+def test_render_data_dictionary_pk_first_and_fk_reference():
+    """Orden PK → FK → resto, y el FK referencia a la entidad destino."""
+    entities, _ = _dictionary_fixture()
+    out = render_data_dictionary(entities, [])
+
+    order_section = out.split("### Order", 1)[1].split("### Customer", 1)[0]
+    id_pos = order_section.index("| id |")
+    customer_pos = order_section.index("| customer |")
+    status_pos = order_section.index("| status |")
+    assert id_pos < customer_pos < status_pos
+    assert "| customer | Customer |  | sí | FK → Customer |" in order_section
+    # total es opcional: la columna Obligatorio lo refleja.
+    assert "| total | float | 10,2 | no |  |" in order_section
+
+
+def test_render_data_dictionary_tolerates_legacy_attributes():
+    """Atributos sin length y entidad sin atributos no rompen el render."""
+    entities = [
+        MerEntitySchema(
+            name="Empty",
+            attributes=[],
+        ),
+        MerEntitySchema(
+            name="Legacy",
+            attributes=[
+                MerAttribute.model_validate(
+                    {"name": "code", "type": "string", "is_key": True}
+                ),
+            ],
+        ),
+    ]
+    out = render_data_dictionary(entities, [])
+    assert "_Sin atributos modelados._" in out
+    assert "| code | string |  | sí | PK |  |" in out
+
+
+def test_render_data_dictionary_relationships_table():
+    """La tabla final de relaciones con cardinalidad y verbo."""
+    entities, relationships = _dictionary_fixture()
+    out = render_data_dictionary(entities, relationships)
+    assert "### Relaciones" in out
+    assert "| Origen | Cardinalidad | Destino | Verbo | Descripción |" in out
+    assert "| Customer | 1:N | Order | places | Un cliente realiza muchos pedidos. |" in out
+
+
+@pytest.mark.asyncio
+async def test_generate_mer_stats_include_data_dictionary():
+    """stats["data_dictionary"] viaja en el resultado del pipeline."""
+    from backend.models.requirement import ReqType
+
+    class _FakeItem:
+        def __init__(self, code, statement, type_=ReqType.FUNCTIONAL):
+            self.code = code
+            self.statement = statement
+            self.type = type_
+            self.source = None
+
+    items = [_FakeItem("REQ-001", "The system shall manage users")]
+    candidates = [EntityCandidate(name="User", traced_req_codes=["REQ-001"])]
+    entities_full = [
+        MerEntitySchema(
+            name="User",
+            attributes=[MerAttribute(name="id", type="uuid", is_key=True)],
+            traced_req_codes=["REQ-001"],
+        )
+    ]
+
+    with patch(
+        "backend.agents.pipelines.mer_pipeline._discover_entities",
+        return_value=candidates,
+    ), patch(
+        "backend.agents.pipelines.mer_pipeline._gap_pass",
+        return_value=[],
+    ), patch(
+        "backend.agents.pipelines.mer_pipeline._detail_entities_relationships",
+        return_value=(entities_full, []),
+    ), patch(
+        "backend.agents.pipelines.mer_pipeline._critique_mer",
+        return_value=[],
+    ):
+        result = await generate_mer(items, project_name="Proj")
+
+    dd = result.stats["data_dictionary"]
+    assert dd.startswith("## Diccionario de datos")
+    assert "### User" in dd
+
+
+# --------------------------------------------------------------------------- #
+# resolve_entity_reference + Pass 3d (reconciliación de extremos)             #
+# --------------------------------------------------------------------------- #
+
+
+def test_resolve_entity_reference_match_levels():
+    """Exacto case-insensitive > normalizado > compacto sin stopwords."""
+    names = ["Configuración de Conexión", "Usuario"]
+    # Nivel 1: exacto y case-insensitive.
+    assert (
+        resolve_entity_reference("Configuración de Conexión", names)
+        == "Configuración de Conexión"
+    )
+    assert resolve_entity_reference("usuario", names) == "Usuario"
+    # Nivel 3: compacto sin stopwords/acentos (el caso del nodo fantasma).
+    assert (
+        resolve_entity_reference("ConfiguracionConexion", names)
+        == "Configuración de Conexión"
+    )
+    # Sin match y referencia vacía.
+    assert resolve_entity_reference("ServidorDeCorreo", names) is None
+    assert resolve_entity_reference("", names) is None
+
+
+def test_resolve_entity_reference_ambiguous_is_none():
+    """Un nivel con 2+ candidatos se rechaza: nunca adivinar."""
+    names = ["Configuración de Conexión", "Configuración y Conexión"]
+    assert resolve_entity_reference("ConfiguracionConexion", names) is None
+
+
+def test_reconcile_relationship_endpoints_repunts_and_drops():
+    """Pass 3d: re-apunta variantes y descarta aristas sin resolución."""
+    entities = [
+        _make_entity("Configuración de Conexión"),
+        _make_entity("Usuario"),
+    ]
+    relationships = [
+        _make_relationship(
+            from_entity="ConfiguracionConexion",
+            to_entity="Usuario",
+            label="configura",
+        ),
+        _make_relationship(
+            from_entity="Usuario",
+            to_entity="Fantasma",
+            label="ve",
+        ),
+    ]
+
+    kept, stats, warnings = _reconcile_relationship_endpoints(
+        entities, relationships
+    )
+
+    assert len(kept) == 1
+    assert kept[0].from_entity == "Configuración de Conexión"
+    assert kept[0].to_entity == "Usuario"
+    assert stats["reconciled_count"] == 1
+    assert stats["reconciled"][0] == {
+        "side": "from",
+        "was": "ConfiguracionConexion",
+        "now": "Configuración de Conexión",
+    }
+    assert stats["dropped_count"] == 1
+    assert any("Fantasma" in w for w in warnings)
+
+
+def test_reconcile_relationship_endpoints_dedupes_converging_edges():
+    """Aristas idénticas (o que convergen tras el re-apuntado) no se duplican."""
+    entities = [_make_entity("Usuario"), _make_entity("Orden")]
+    relationships = [
+        _make_relationship("Usuario", "Orden", label="emite"),
+        _make_relationship("Usuario", "Orden", label="emite"),
+    ]
+
+    kept, stats, warnings = _reconcile_relationship_endpoints(
+        entities, relationships
+    )
+
+    assert len(kept) == 1
+    assert stats["deduped_count"] == 1
+    assert stats["reconciled_count"] == 0
+    assert warnings == []
+
+
+def test_render_mermaid_skips_edges_with_unknown_endpoints():
+    """El renderer nunca emite una arista con extremo no declarado."""
+    entities = [_make_entity("Usuario")]
+    relationships = [
+        _make_relationship("Usuario", "ConfiguracionConexion", label="usa"),
+    ]
+
+    out = _render_mermaid(entities, relationships)
+
+    assert "CONFIGURACIONCONEXION" not in out
+    assert "USUARIO {" in out
+
+
+@pytest.mark.asyncio
+async def test_generate_mer_reconciles_and_reports():
+    """Pass 3d integrado: variante re-apuntada, fantasma descartado, stats."""
+    from backend.models.requirement import ReqType
+
+    class _FakeItem:
+        def __init__(self, code, statement, type_=ReqType.FUNCTIONAL):
+            self.code = code
+            self.statement = statement
+            self.type = type_
+            self.source = None
+
+    items = [
+        _FakeItem("REQ-001", "The system shall manage connections"),
+        _FakeItem("REQ-002", "The system shall manage users"),
+    ]
+    candidates = [
+        EntityCandidate(name="Configuración de Conexión", traced_req_codes=["REQ-001"]),
+        EntityCandidate(name="Usuario", traced_req_codes=["REQ-002"]),
+    ]
+    entities_full = [
+        MerEntitySchema(
+            name="Configuración de Conexión",
+            attributes=[MerAttribute(name="id", type="uuid", is_key=True)],
+            traced_req_codes=["REQ-001"],
+        ),
+        MerEntitySchema(
+            name="Usuario",
+            attributes=[MerAttribute(name="id", type="uuid", is_key=True)],
+            traced_req_codes=["REQ-002"],
+        ),
+    ]
+    relationships = [
+        # Variante ortográfica del extremo origen (el caso del fantasma).
+        MerRelationshipSchema(
+            from_entity="ConfiguracionConexion",
+            to_entity="Usuario",
+            cardinality="1:N",
+            label="configura",
+        ),
+        # Extremo irrecuperable: se descarta con warning.
+        MerRelationshipSchema(
+            from_entity="Usuario",
+            to_entity="Fantasma",
+            cardinality="1:N",
+            label="ve",
+        ),
+    ]
+
+    with patch(
+        "backend.agents.pipelines.mer_pipeline._discover_entities",
+        return_value=candidates,
+    ), patch(
+        "backend.agents.pipelines.mer_pipeline._gap_pass",
+        return_value=[],
+    ), patch(
+        "backend.agents.pipelines.mer_pipeline._detail_entities_relationships",
+        return_value=(entities_full, relationships),
+    ), patch(
+        "backend.agents.pipelines.mer_pipeline._critique_mer",
+        return_value=[],
+    ):
+        result = await generate_mer(items, project_name="Proj")
+
+    # La variante quedó re-apuntada al nombre canónico.
+    assert result.relationships[0].from_entity == "Configuración de Conexión"
+    # La arista irrecuperable no viaja en el resultado.
+    assert len(result.relationships) == 1
+    # El diagrama no contiene el nodo fantasma.
+    assert "CONFIGURACIONCONEXION" not in result.mermaid
+    # Stats auditan la reconciliación y el descarte queda como warning.
+    assert result.stats["reconciliation"]["reconciled_count"] == 1
+    assert result.stats["reconciliation"]["dropped_count"] == 1
+    assert any("Fantasma" in w for w in result.stats["validation_warnings"])

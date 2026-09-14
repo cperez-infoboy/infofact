@@ -31,6 +31,7 @@ Design notes (mirrors mer_pipeline.py patterns):
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -38,6 +39,10 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel, Field
 
 from backend.agents.llm import structured_llm
+from backend.agents.pipelines._diagram_colors import (
+    BC_PALETTE,
+    class_def,
+)
 from backend.agents.pipelines._resilience import (
     DEFAULT_CONCURRENCY,
     _format_feedback,
@@ -45,7 +50,9 @@ from backend.agents.pipelines._resilience import (
     _invoke_with_retry,
     _repair_mermaid,
     _sanitize_mermaid,
+    _sanitize_mermaid_id,
     _validate_mermaid,
+    invoke_structured_resilient,
 )
 
 if TYPE_CHECKING:
@@ -178,6 +185,90 @@ class SubProjectResultSchema(BaseModel):
             "relacionan via contratos y que bounded contexts cubren."
         ),
     )
+    # Lotes fallidos del detailing batcheado (degradacion graciosa).
+    failed_batches: int = 0
+
+
+class ContractData(BaseModel):
+    """One contract between sub-projects WITHOUT the full spec text.
+
+    The OpenAPI/AsyncAPI YAML lives in :class:`ContractSchema.spec` when the
+    caller needs it; including that fat text in the batched structured output
+    is what overflowed the completion budget (Planitrack2.0: 304 entities ->
+    always finish_reason=length -> detailing_failed with 0 sub-projects).
+    """
+
+    from_subproject: str = Field(
+        description="Nombre del sub-proyecto origen (debe existir en sub_projects).",
+    )
+    to_subproject: str = Field(
+        description="Nombre del sub-proyecto destino (debe existir en sub_projects).",
+    )
+    contract_type: str = Field(
+        description="Tipo de contrato: openapi | asyncapi | event_schema.",
+    )
+    name: str = Field(
+        description="Endpoint o evento del contrato (ej. 'POST /orders', 'order.created').",
+    )
+    description: str = Field(
+        default="",
+        description="Descripcion breve del contrato (1 oracion).",
+    )
+
+
+class SubProjectBatchDetailSchema(BaseModel):
+    """Narrow schema for the batched Pass 3 (one batch per project area).
+
+    A single structured call for ALL sub-projects + contracts-with-full-specs
+    + component diagram overflows the completion budget at Planitrack2.0
+    scale. The batch detail keeps the fat ``spec`` OUT of the structured
+    output: contracts carry only endpoint/event + short description.
+    """
+
+    sub_projects: list[SubProjectSchema] = Field(
+        default_factory=list,
+    )
+    contracts: list[ContractData] = Field(
+        default_factory=list,
+    )
+    # Lotes del detailing que fallaron (reportado por propose_subprojects).
+    failed_batches: int = 0
+
+
+def _render_component_diagram(
+    sub_projects: list[SubProjectSchema],
+    contracts: list[ContractSchema],
+) -> str:
+    """Render the component diagram deterministically (Mermaid flowchart TD).
+
+    El LLM ya no genera el diagrama (viajaba en el output estructurado y era
+    parte del overflow de tokens); se construye desde los sub-proyectos y
+    contratos ya validados: un subgraph por sub-proyecto, aristas etiquetadas
+    por contrato y una paleta fija por area.
+    """
+    if not sub_projects:
+        return ""
+    lines: list[str] = ["graph TD"]
+    class_defs: list[str] = []
+    for i, sp in enumerate(sub_projects):
+        sid = _sanitize_mermaid_id(sp.name)
+        cls = f"sp_{i % len(BC_PALETTE)}"
+        fill, stroke = BC_PALETTE[i % len(BC_PALETTE)]
+        class_defs.append(class_def(cls, fill, stroke))
+        label = sp.name.replace("\"", "")
+        lines.append(f"    subgraph {sid} [\"{label}\"]")
+        comp = _sanitize_mermaid_id(f"{sp.name}_core")
+        lines.append(f"        {comp}[\"Nucleo {label}\"]:::{cls}")
+        lines.append("    end")
+    for j, c in enumerate(contracts):
+        if c.contract_type not in {"openapi", "asyncapi", "event_schema"}:
+            continue
+        src = _sanitize_mermaid_id(f"{c.from_subproject}_core")
+        dst = _sanitize_mermaid_id(f"{c.to_subproject}_core")
+        lines.append(f"    {src} -->|{c.name}| {dst}")
+    lines.append("")
+    lines.extend(f"    {cd}" for cd in class_defs)
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -263,44 +354,30 @@ _SUBPROJECT_GAP_PASS_PROMPT = (
 )
 
 _SUBPROJECT_DETAIL_PROMPT = (
-    "Eres un arquitecto de software. A partir de las entidades de dominio, "
-    "los contextos delimitados, las decisiones arquitectonicas (ADRs) y las "
-    "recomendaciones de stack, propone una descomposicion en sub-proyectos "
-    "con contratos explicitos entre ellos.\n\n"
-    "Recibiras la lista de entidades (con sus bounded contexts), las "
-    "decisiones ADR, el stack recomendado por capa y un listado de "
-    "sub-proyectos preliminares (nombre + responsabilidad + entidades + "
-    "contextos) que debes enriquecer con stack, contratos y diagrama.\n\n"
+    "Eres un arquitecto de software. Recibiras entidades de dominio, "
+    "decisiones arquitectonicas (ADRs), stack recomendado por capa y una "
+    "lista de SUB-PROYECTOS PRELIMINARES que debes enriquecer con stack y "
+    "contratos. Detalla SOLO los sub-proyectos de la lista; no inventes "
+    "otros.\n\n"
     "Reglas:\n"
     "- IDIOMA: manten el idioma original.\n"
     "- NO hagas descomposicion hexagonal interna.\n"
-    "- Para cada par de sub-proyectos que necesite comunicarse, define un "
-    "contrato (openapi para REST, asyncapi para mensajeria/eventos, "
+    "- Para cada par de sub-proyectos detallados que necesite comunicarse, "
+    "define un contrato (openapi para REST, asyncapi para mensajeria/eventos, "
     "event_schema para esquemas de eventos).\n"
     "- contract_type debe ser exactamente uno de: openapi, asyncapi, "
     "event_schema.\n"
-    "- from_subproject y to_subproject deben coincidir con nombres en "
-    "sub_projects.\n"
-    "- entity_codes: toda entidad del MER debe pertenecer a exactamente un "
-    "sub-proyecto.\n"
-    "- component_diagram_mermaid: genera un diagrama Mermaid flowchart TD donde "
-    "cada sub-proyecto es un subgraph con sus componentes internos, y cada "
-    "contrato es una arista etiquetada entre sub-proyectos. USA classDef para "
-    "dar un color distinto a cada sub-proyecto (fondo oscuro + borde brillante). "
-    "Aplica la clase a cada nodo con :::nombreClase. Ejemplo de colors:\\n"
-    "  classDef sp_alpha fill:#1e3a5f,stroke:#3b82f6,color:#fff\\n"
-    "  classDef sp_beta fill:#1a4d3a,stroke:#14b8a6,color:#fff\\n"
-    "  subgraph Alpha [\\\"Sub-proyecto Alpha\\\"]\\n"
-    "    A1[\\\"Componente A\\\"]:::sp_alpha\\n"
-    "  end\\n"
-    "  subgraph Beta [\\\"Sub-proyecto Beta\\\"]\\n"
-    "    B1[\\\"Componente B\\\"]:::sp_beta\\n"
-    "  end\\n"
-    "  A1 -->|REST| B1\\n"
-    "- component_diagram_description: descripcion breve en prosa (2-3 oraciones) "
-    "del diagrama de componentes: que sub-proyectos existen, como se relacionan "
-    "via contratos y que contextos cubren.\n"
-    "- Si el dominio es pequeno, devuelve un solo sub-proyecto monolitico.\n"
+    "- Los contratos van SIN especificacion completa: solo endpoint/evento "
+    "(name), tipo y una descripcion breve de una oracion. NO escribas YAML "
+    "ni JSON Schema en la salida.\n"
+    "- from_subproject y to_subproject deben coincidir con nombres de los "
+    "sub-proyectos detallados o del INVENTARIO COMPLETO de vecinos (ver "
+    "abajo). Un contrato cuyo destino es un vecino de otra area es valido "
+    "y necesario: define TODAS las colaboraciones que el dominio exija, "
+    "incluidas las cruzadas entre areas.\n"
+    "- entity_codes: las entidades listadas de cada sub-proyecto deben "
+    "permanecer asignadas a ese sub-proyecto.\n"
+    "- NO generes diagramas: el diagrama de componentes se construye despues.\n"
     "Devuelve SOLO el objeto estructurado."
 )
 
@@ -338,6 +415,8 @@ class SubProjectResult:
     contracts: list[ContractSchema] = field(default_factory=list)
     component_diagram_mermaid: str = ""
     component_diagram_description: str = ""
+    # Lotes del detailing que fallaron (degradacion graciosa por proyecto).
+    failed_batches: int = 0
     stats: dict = field(default_factory=dict)
 
 
@@ -572,47 +651,146 @@ async def _detail_subprojects(
     project_description: str = "",
     goals: list[Any] | None = None,
     feedback: str = "",
+    concurrency: int = DEFAULT_CONCURRENCY,
+    on_progress=None,
 ) -> SubProjectResultSchema | None:
-    """Pass 3: given the finalized skeletons, produce full sub-projects + contracts + diagram."""
+    """Pass 3: detailing batcheado por proyecto (stack + contratos).
+
+    Un lote por area descubierta (project_name del skeleton); los skeletons
+    sin proyecto van a un lote de reservas. Cada lote recibe SOLO sus
+    skeletons y devuelve sub-proyectos + contratos LIVIANOS (sin spec
+    completa: la spec fat era lo que truncaba el JSON del output). Un lote
+    que falla persistentemente se descarta con warning; la pasada devuelve
+    None solo si TODOS los lotes fallan.
+
+    ``on_progress`` (opcional) se invoca con un mensaje corto por lote, igual
+    que en los pipelines MER/process.
+    """
+    if not skeletons:
+        return SubProjectResultSchema()
+
     context = _build_subproject_context(
         mer_result, adr_result, nfr_result,
         project_name, project_description, goals, feedback=feedback,
     )
-    # Add project areas as constraint.
-    if project_result and project_result.projects:
-        proj_lines = []
-        for proj in project_result.projects:
-            proj_lines.append(
-                f"- {proj.name} [{proj.domain_type}]"
-            )
-        context += (
-            "\nPROYECTOS DEFINIDOS (cada sub-proyecto debe tener un "
-            "project_name valido de esta lista):\n"
-            + "\n".join(proj_lines) + "\n"
-        )
-    skeleton_lines = []
+
+    # Agrupar skeletons por area descubierta (o lote de reservas).
+    groups: dict[str, list[SubProjectSkeleton]] = {}
     for s in skeletons:
-        entities = ", ".join(s.entity_codes) if s.entity_codes else "(sin entidades)"
-        contexts = ", ".join(s.bounded_contexts) if s.bounded_contexts else ""
-        entry = f"- {s.name} — {s.responsibility} [entidades: {entities}]"
-        if contexts:
-            entry += f" [contextos: {contexts}]"
-        skeleton_lines.append(entry)
-    context += (
-        "\nSUB-PROYECTOS PRELIMINARES (enriquece cada uno con stack, contratos "
-        "y diagrama):\n"
-        + "\n".join(skeleton_lines)
-        + "\n"
-    )
-    msgs = [("system", _SUBPROJECT_DETAIL_PROMPT), ("human", context)]
-    llm = structured_llm(SubProjectResultSchema)
-    try:
-        return await _invoke_with_retry(
-            llm, msgs, context_label="subproject_detail"
+        key = (s.project_name or "").strip() or "(sin proyecto)"
+        groups.setdefault(key, []).append(s)
+    batches: list[tuple[str, list[SubProjectSkeleton]]] = list(groups.items())
+
+    total_batches = len(batches)
+    state: dict[str, int] = {"done": 0, "failed": 0}
+
+    # Inventario completo de la descomposicion: sin esto, un lote no conoce
+    # los sub-proyectos de las DEMAS areas y los contratos cruzados son
+    # imposibles (v4 Planitrack2.0: 8 contratos, todos intra-area, 5
+    # sub-proyectos grandes en cero contratos).
+    inventory_lines = [
+        f"- {s.name} — {s.responsibility} (area: "
+        f"{(s.project_name or '').strip() or '(sin area)'})"
+        for s in skeletons
+    ]
+
+    async def _detail(batch_key: str, batch: list[SubProjectSkeleton]):
+        batch_lines = []
+        for s in batch:
+            entities = ", ".join(s.entity_codes) if s.entity_codes else "(sin entidades)"
+            contexts = ", ".join(s.bounded_contexts) if s.bounded_contexts else ""
+            entry = f"- {s.name} — {s.responsibility} [entidades: {entities}]"
+            if contexts:
+                entry += f" [contextos: {contexts}]"
+            batch_lines.append(entry)
+        user_text = context + (
+            "\nINVENTARIO COMPLETO de sub-proyectos de la descomposicion "
+            "(usalo para decidir colaboraciones; los nombres de destino de "
+            "los contratos pueden ser de este inventario):\n"
+            + "\n".join(inventory_lines)
+            + "\n\nSUB-PROYECTOS A DETALLAR (enriquece SOLO estos con stack y "
+            "contratos; area: " + batch_key + "):\n"
+            + "\n".join(batch_lines)
+            + "\n"
         )
-    except Exception:
-        logger.exception("_detail_subprojects: all retries exhausted")
+        msgs = [
+            ("system", _SUBPROJECT_DETAIL_PROMPT),
+            ("human", user_text),
+        ]
+        try:
+            return await invoke_structured_resilient(
+                lambda **kw: structured_llm(SubProjectBatchDetailSchema, **kw),
+                msgs,
+                context_label=(
+                    f"subproject_detail ({len(batch)} sub-proyectos, area "
+                    f"{batch_key})"
+                ),
+            )
+        except Exception:
+            logger.exception(
+                "_detail_subprojects: lote del area %s fallo", batch_key
+            )
+            return None
+
+    sem = asyncio.Semaphore(concurrency)
+
+    async def _guarded(pair):
+        batch_key, batch = pair
+        async with sem:
+            result = await _detail(batch_key, batch)
+            state["done"] += 1
+            if result is None:
+                state["failed"] += 1
+            if on_progress is not None:
+                detail = (
+                    f"lote {state['done']}/{total_batches} completado"
+                    if result is not None
+                    else f"lote {state['done']}/{total_batches} fallo, se "
+                    "continua con el resto"
+                )
+                await on_progress(
+                    f"sub-proyectos ({state['done']}/{total_batches} lotes): {detail}"
+                )
+            return result
+
+    results = await asyncio.gather(
+        *[_guarded(p) for p in batches], return_exceptions=True
+    )
+    schemas = [r for r in results if isinstance(r, SubProjectBatchDetailSchema)]
+    failed = sum(
+        1
+        for r in results
+        if r is None or isinstance(r, Exception)
+    )
+    logger.info(
+        "subproject_detail: %d/%d lotes ok (%d fallidos) sobre %d skeletons",
+        total_batches - failed, total_batches, failed, len(skeletons),
+    )
+    if not schemas:
         return None
+
+    merged = SubProjectResultSchema()
+    seen: set[str] = set()
+    for schema in schemas:
+        for sp in schema.sub_projects:
+            key = sp.name.lower().strip()
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.sub_projects.append(sp)
+        for contract in schema.contracts:
+            merged.contracts.append(
+                ContractSchema(
+                    from_subproject=contract.from_subproject,
+                    to_subproject=contract.to_subproject,
+                    contract_type=contract.contract_type,
+                    name=contract.name,
+                    spec="",
+                    description=contract.description,
+                )
+            )
+    merged.failed_batches = failed
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -620,11 +798,56 @@ async def _detail_subprojects(
 # ---------------------------------------------------------------------------
 
 
+def _drop_self_contracts(
+    contracts: list[ContractSchema],
+) -> tuple[list[ContractSchema], int]:
+    """Descarta contratos cuyo origen y destino son el MISMO sub-proyecto.
+
+    Un contrato modela comunicación ENTRE sistemas; un "auto-contrato"
+    (SUB-007 -> SUB-007 en la corrida v2 de Planitrack2.0: 6 de 36) es un
+    endpoint interno mal clasificado. Determinista, sin LLM.
+    """
+    kept = [c for c in contracts if c.from_subproject != c.to_subproject]
+    dropped = len(contracts) - len(kept)
+    if dropped:
+        logger.info("_drop_self_contracts: %d auto-contratos descartados", dropped)
+    return kept, dropped
+
+
+def _reassign_orphan_subprojects(
+    sub_projects: list[SubProjectSchema],
+    project_result=None,
+) -> tuple[list[SubProjectSchema], int]:
+    """Re-asigna project_name de sub-proyectos huerfanos (determinista).
+
+    El gap-pass puede crear sub-proyectos sin area; si hay un unico proyecto
+    descubierto, heredan ese (no hay ambigüedad). Si hay varios, quedan con
+    project_name vacio y la validacion reporta la deuda (decision humana).
+    Devuelve (lista, cantidad re-asignados).
+    """
+    projects = getattr(project_result, "projects", None) or []
+    names = [p.name for p in projects if getattr(p, "name", "")]
+    if len(names) != 1:
+        return sub_projects, 0
+    assigned = 0
+    for sp in sub_projects:
+        if not (sp.project_name or "").strip():
+            sp.project_name = names[0]
+            assigned += 1
+    if assigned:
+        logger.info(
+            "_reassign_orphan_subprojects: %d huerfanos -> %s",
+            assigned, names[0],
+        )
+    return sub_projects, assigned
+
+
 async def _validate_subprojects(
     sub_projects: list[SubProjectSchema],
     contracts: list[ContractSchema],
     component_diagram: str,
     mer_entity_names: set[str],
+    project_result=None,
 ) -> tuple[list[str], bool]:
     """Pass 4: deterministic validation + _validate_mermaid for component diagram.
 
@@ -661,6 +884,30 @@ async def _validate_subprojects(
         if c.contract_type not in valid_contract_types:
             warnings.append(
                 f"Contract '{c.name}' con tipo invalido: {c.contract_type}"
+            )
+
+    # Check: sub-projects sin area (project_name vacio) cuando hay areas.
+    if project_result and getattr(project_result, "projects", None):
+        known = {
+            p.name for p in project_result.projects if getattr(p, "name", "")
+        }
+        unassigned = [
+            sp.name
+            for sp in sub_projects
+            if not (sp.project_name or "").strip()
+        ]
+        if unassigned:
+            warnings.append(
+                f"Sub-proyectos sin proyecto asignado: {sorted(unassigned)}"
+            )
+        wrong = [
+            sp.name
+            for sp in sub_projects
+            if (sp.project_name or "").strip() and sp.project_name not in known
+        ]
+        if wrong:
+            warnings.append(
+                f"Sub-proyectos con project_name inexistente: {sorted(wrong)}"
             )
 
     # Check: component diagram Mermaid syntax.
@@ -776,6 +1023,7 @@ async def propose_subprojects(
     goals: list[Any] | None = None,
     enable_critique: bool = True,
     feedback: str = "",
+    on_progress=None,
 ) -> SubProjectResult:
     """Propose sub-projects with contracts from MER, ADR, and NFR context.
 
@@ -783,14 +1031,15 @@ async def propose_subprojects(
 
       Pass 1 — decomposition skeleton (boundaries only).
       Pass 2 — gap pass for orphan MER entities.
-      Pass 3 — stack + contracts + diagram (skeleton-constrained).
-      Pass 4 — deterministic validation + Mermaid repair.
+      Pass 3 — stack + contracts (batched per project area).
+      Pass 4 — deterministic validation + component diagram rendered in code.
       Pass 5 — LLM critique (optional, enabled by default).
 
     Takes MerResult (entities + bounded contexts), AdrResult (architecture
     decisions), and NfrResult (stack recommendations) and produces a
-    SubProjectResult with sub-project definitions, inter-project contracts,
-    and a Mermaid component diagram.
+    SubProjectResult with sub-project definitions, inter-project contracts
+    and a Mermaid component diagram. ``on_progress`` recibe un mensaje por
+    lote del detailing (misma forma que generate_mer/generate_processes).
     """
     # MER is the minimum required input.
     if mer_result is None or not getattr(mer_result, "entities", None):
@@ -817,16 +1066,60 @@ async def propose_subprojects(
     )
     all_skeletons = skeletons + gap_skeletons
 
-    # Pass 3: stack + contracts + diagram (skeleton-constrained).
+    # Pass 3: stack + contracts (batched per project area).
     batch = await _detail_subprojects(
         mer_result, all_skeletons, adr_result, nfr_result,
         project_result=project_result,
         project_name=project_name,
         project_description=project_description,
         goals=goals, feedback=feedback,
+        concurrency=concurrency,
+        on_progress=on_progress,
     )
 
     if batch is None:
+        # Degradacion final: si TODOS los lotes fallaron, los skeletons del
+        # Pass 1 pasan como fallback determinista (la etapa mantiene
+        # contenido: nombres, responsabilidades y particion de entidades
+        # ya validada) en vez de volver vacia como en la corrida del
+        # 2026-09-10 (0 sub-proyectos por truncado).
+        if all_skeletons:
+            sub_projects = [
+                SubProjectSchema(
+                    project_name=s.project_name,
+                    name=s.name,
+                    responsibility=s.responsibility,
+                    entity_codes=s.entity_codes,
+                    bounded_contexts=s.bounded_contexts,
+                )
+                for s in all_skeletons
+            ]
+            logger.warning(
+                "propose_subprojects: detailing fallo completo; passthrough "
+                "de %d skeletons como fallback",
+                len(sub_projects),
+            )
+            # Las guardas tambien aplican al fallback (huerfanos y
+            # auto-contratos no existen en la lista, pero la re-asignacion
+            # de areas si).
+            sub_projects, orphans_reassigned = _reassign_orphan_subprojects(
+                sub_projects, project_result
+            )
+            return SubProjectResult(
+                sub_projects=sub_projects,
+                stats={
+                    "input_entities": len(mer_result.entities),
+                    "sub_projects": len(sub_projects),
+                    "contracts": 0,
+                    "detailing_fallback": True,
+                    "self_contracts_dropped": 0,
+                    "orphans_reassigned": orphans_reassigned,
+                    "failed_batches": len({
+                        (s.project_name or "").strip() or "(sin proyecto)"
+                        for s in all_skeletons
+                    }),
+                },
+            )
         return SubProjectResult(stats={
             "input_entities": len(mer_result.entities),
             "error": "detailing_failed",
@@ -836,13 +1129,23 @@ async def propose_subprojects(
 
     sub_projects = list(batch.sub_projects)
     contracts = list(batch.contracts)
-    component_diagram = _sanitize_mermaid(
-        batch.component_diagram_mermaid or "", "graph TD"
+
+    # Guardas deterministas (sin LLM), corrida v2 Planitrack2.0: 6 de 36
+    # contratos eran auto-contratos y 2 sub-proyectos quedaron huerfanos.
+    contracts, self_contracts_dropped = _drop_self_contracts(contracts)
+    sub_projects, orphans_reassigned = _reassign_orphan_subprojects(
+        sub_projects, project_result
     )
+    # El diagrama de componentes ya no viaja en el output LLM: se renderiza
+    # en codigo desde sub-proyectos y contratos ya validados.
+    component_diagram = _render_component_diagram(sub_projects, contracts)
+    if component_diagram:
+        component_diagram = _sanitize_mermaid(component_diagram, "graph TD")
 
     # Pass 4: validation + Mermaid repair.
     validation_warnings, diagram_repaired = await _validate_subprojects(
-        sub_projects, contracts, component_diagram, mer_entity_names
+        sub_projects, contracts, component_diagram, mer_entity_names,
+        project_result=project_result,
     )
 
     # If the diagram was repaired, re-generate it via repair.
@@ -870,6 +1173,10 @@ async def propose_subprojects(
         "contracts": len(contracts),
         "has_component_diagram": bool(component_diagram),
         "gap_pass_found": len(gap_skeletons),
+        "failed_batches": getattr(batch, "failed_batches", 0),
+        "detailing_fallback": False,
+        "self_contracts_dropped": self_contracts_dropped,
+        "orphans_reassigned": orphans_reassigned,
         "mermaid_repaired": diagram_repaired,
         "validation_warnings": validation_warnings,
         "critique_findings": [f.model_dump() for f in critique_findings],
@@ -892,7 +1199,11 @@ async def propose_subprojects(
         contracts=contracts,
         component_diagram_mermaid=component_diagram,
         component_diagram_description=(
-            batch.component_diagram_description if batch else ""
+            "Diagrama de componentes renderizado desde los sub-proyectos y "
+            "contratos validados."
+            if component_diagram
+            else ""
         ),
+        failed_batches=getattr(batch, "failed_batches", 0),
         stats=stats,
     )
