@@ -37,6 +37,7 @@
   import CaptureStatus from './CaptureStatus.svelte';
   import SrsStatus from './SrsStatus.svelte';
   import GroupingStatus from './GroupingStatus.svelte';
+  import AnalysisStatus from './AnalysisStatus.svelte';
 
   let { } = $props();
 
@@ -491,6 +492,9 @@
 
   <!-- Estado vivo del /agrupar (grouping.progress, ruta directa) -->
   <GroupingStatus />
+
+  <!-- Estado vivo del /analisis (analysis.progress por lote) -->
+  <AnalysisStatus />
 
   <!-- Mensajes -->
   <div class="flex-1 min-h-0 m-2">

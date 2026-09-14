@@ -18,7 +18,8 @@ import type {
   QualityFoundEvent,
   GoalInferredEvent,
   CoverageReportEvent,
-  SrsReadyEvent
+  SrsReadyEvent,
+  SrsDraftEvent
 } from '$lib/api/chat';
 import type { SrsVersion } from '$lib/api/srs';
 
@@ -38,6 +39,9 @@ export const liveCoverage = writable<CoverageReportEvent | null>(null);
 
 /** Notificacion de SRS listo (version CANDIDATE). Null hasta srs.ready. */
 export const srsReady = writable<SrsReadyEvent | null>(null);
+
+/** Notificacion de version DRAFT materializada temprano (srs.draft). */
+export const srsDraft = writable<SrsDraftEvent | null>(null);
 
 /** True mientras el subagente srs-agent corre una generacion. */
 export const srsRunning = writable<boolean>(false);
@@ -67,6 +71,7 @@ export function resetSrsLive(): void {
   liveGoals.set([]);
   liveCoverage.set(null);
   srsReady.set(null);
+  srsDraft.set(null);
   srsRunning.set(false);
 }
 
@@ -78,6 +83,7 @@ export function startSrs(): void {
     liveGoals.set([]);
     liveCoverage.set(null);
     srsReady.set(null);
+    srsDraft.set(null);
   }
   srsRunning.set(true);
 }
@@ -115,6 +121,11 @@ export function onCoverageReport(c: CoverageReportEvent): void {
 export function onSrsReady(r: SrsReadyEvent): void {
   srsReady.set(r);
   endSrs();
+}
+
+/** Handler de srs.draft: version DRAFT visible antes del commit final. */
+export function onSrsDraft(d: SrsDraftEvent): void {
+  srsDraft.set(d);
 }
 
 /** Devuelve los stores a su estado inicial (tests / logout). */

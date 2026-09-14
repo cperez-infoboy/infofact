@@ -18,6 +18,7 @@
   import GroupingPlanPanel from '$lib/components/GroupingPlanPanel.svelte';
   import SrsViewer from '$lib/components/SrsViewer.svelte';
   import AnalysisViewer from '$lib/components/AnalysisViewer.svelte';
+  import PackagesViewer from '$lib/components/PackagesViewer.svelte';
   import MarkdownEditor from '$lib/components/MarkdownEditor.svelte';
 
   let { } = $props();
@@ -132,6 +133,8 @@
       <SrsViewer projectId={$currentProjectId} />
     {:else if activeTab?.kind === 'analysis'}
       <AnalysisViewer projectId={$currentProjectId} />
+    {:else if activeTab?.kind === 'packages'}
+      <PackagesViewer projectId={$currentProjectId} />
     {:else}
       <div
         class="h-full flex items-center justify-center text-text-dim text-sm font-mono"

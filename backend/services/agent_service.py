@@ -28,7 +28,10 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from backend.agents.llm import build_llm
 from backend.agents.sandboxes.docker_sandbox import DockerSandbox
 from backend.agents.llm_retry_guard import EmptyResponseRetryMiddleware
-from backend.agents.size_guard import SizeGuardMiddleware
+from backend.agents.size_guard import (
+    SizeGuardMiddleware,
+    make_summarization_middleware,
+)
 from backend.agents.tools import fetch_url, web_search
 from backend.agents.subagents.requirements_capture_agent import (
     make_requirements_capture_agent_subagent,
@@ -315,6 +318,18 @@ def build_agent(
                 project_description=project_description or "",
             )
         )
+        from backend.agents.subagents.packages_agent import (
+            make_packages_agent_subagent,
+        )
+        subagents.append(
+            make_packages_agent_subagent(
+                project_id=project_id,
+                profile=profile,
+                project_slug=project_slug,
+                project_name=project_name or "",
+                project_description=project_description or "",
+            )
+        )
 
     orchestrator_tools = make_orchestrator_tools(project_id)
     if project_id is not None:
@@ -332,7 +347,14 @@ def build_agent(
         # Guarda de tamaño del input: trunca (sin eliminar) los mensajes
         # gigantes que puedan venir del checkpointer antes de cada llamada
         # al modelo. Transitorio: no reescribe el estado del thread.
-        middleware=[SizeGuardMiddleware(), EmptyResponseRetryMiddleware()],
+        # El summarizer con techo reemplaza por nombre al default de
+        # deepagents (sesión 17: el resumidor reenvió la historia sin trim
+        # y reventó la ventana).
+        middleware=[
+            SizeGuardMiddleware(),
+            EmptyResponseRetryMiddleware(),
+            make_summarization_middleware(sandbox),
+        ],
     )
 
 

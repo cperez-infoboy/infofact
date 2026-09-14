@@ -18,10 +18,31 @@ export interface ProcessDiagram {
   traced_req_codes: string[];
 }
 
+/** Decisión arquitectónica por NFR (espejo de NfrDecision del nfr_pipeline). */
+export interface NfrDecision {
+  /** REQ-XXXX de la fase 1 que motiva la decisión. */
+  req_code: string;
+  /** performance | security | usability | reliability | maintainability | compliance | constraint. */
+  category: string;
+  decision: string;
+  /** Componente de stack asociado (puede venir vacío). */
+  stack_component: string;
+  rationale: string;
+  impact: string;
+}
+
+/** Tecnología recomendada por capa (espejo de StackDecision del nfr_pipeline). */
+export interface StackDecision {
+  /** frontend | backend | database | messaging | cache | deployment | monitoring. */
+  layer: string;
+  technology: string;
+  rationale: string;
+}
+
 /** Análisis de NFR: decisiones, stack, consistencia y patrones. */
 export interface NfrAnalysis {
-  decisions: Record<string, unknown>[];
-  stack: Record<string, unknown>[];
+  decisions: NfrDecision[];
+  stack: StackDecision[];
   data_consistency: string;
   patterns: string;
 }
@@ -59,12 +80,14 @@ export interface AnalysisCommit {
   mer_stats: { entities: number; relationships: number };
 }
 
-/** Entidad de dominio (MER) con atributos y trazabilidad. */
+/** Atributo de una entidad de dominio (MER). */
 export interface DomainAttribute {
   name: string;
   type: string;
   required: boolean;
   is_key: boolean;
+  /** Largo o precisión cuando el tipo lo soporta; vacío en lo demás. */
+  length?: string;
   description: string;
 }
 
@@ -90,6 +113,13 @@ export interface DomainRelationship {
   traced_req_codes: string[];
 }
 
+/** Alternativa descartada de un ADR (espejo de AdrAlternative del adr_pipeline). */
+export interface AdrAlternative {
+  name: string;
+  pros: string;
+  cons: string;
+}
+
 /** ADR (Architecture Decision Record). */
 export interface Adr {
   id: number;
@@ -98,7 +128,7 @@ export interface Adr {
   status: string;
   context: string;
   decision: string;
-  alternatives: Record<string, unknown>[];
+  alternatives: AdrAlternative[];
   rationale: string;
   nfr_codes: string[];
 }

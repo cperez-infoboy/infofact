@@ -282,6 +282,74 @@ def _sanitize_error(exc: Exception) -> str:
     return f"{name}: {msg}" if msg else name
 
 
+# Recuperación de overflow de ventana (sesión 17 de Planitrack2.0): un turno
+# que consulta el SRS completo inunda el thread de tool_results y el upstream
+# rechaza CUALQUIER llamada siguiente (400 prompt is too long). Sin
+# intervención, cada reintento recarga el mismo estado inflado y la sesión
+# queda clavada para siempre: la compactación es lo que la recupera.
+_OVERFLOW_MARKERS = (
+    "ContextWindowExceededError",
+    "ContextOverflowError",
+    "prompt is too long",
+    "context_length_exceeded",
+    "context length exceeded",
+)
+
+
+def _is_context_overflow(exc: Exception) -> bool:
+    """El proveedor rechazó el prompt por exceder la ventana del modelo.
+
+    El texto llega envuelto en capas (litellm envuelve el 400 del proveedor;
+    langchain_openai lo re-empaqueta como OpenAIContextOverflowError), así que
+    se matchea el mensaje completo y no solo la clase de excepción.
+    """
+    text = f"{type(exc).__name__}: {exc}"
+    return any(marker in text for marker in _OVERFLOW_MARKERS)
+
+
+async def _compact_overflowed_thread(agent: Any, thread_id: str) -> int | None:
+    """Reescribe el thread con la historia recortada tras un overflow.
+
+    Conserva TODOS los mensajes (los pares tool_call/ToolMessage deben llegar
+    completos al proveedor) pero acota cada contenido con el mismo guard del
+    SizeGuard: los megabytes históricos pasan a marcadores de truncado y el
+    reintento del usuario encuentra una sesión usable. Devuelve la cantidad
+    de mensajes que quedaron (None si no había thread/estado).
+    """
+    from langchain_core.messages import RemoveMessage
+    from langgraph.graph.message import REMOVE_ALL_MESSAGES
+
+    from backend.agents.size_guard import truncate_messages
+
+    checkpointer = getattr(agent, "checkpointer", None)
+    if checkpointer is None:
+        return None
+    config = {"configurable": {"thread_id": thread_id}}
+    snapshot = await checkpointer.aget_tuple(config)
+    messages = None
+    if snapshot is not None and snapshot.checkpoint:
+        messages = (snapshot.checkpoint.get("channel_values") or {}).get(
+            "messages"
+        )
+    if not messages:
+        return None
+    compacted = truncate_messages(
+        list(messages),
+        # Contenidos históricos a un resumen de 4K: suficiente para que el
+        # agente sepa qué pasó, imposible que sature una ventana.
+        max_message_chars=4_000,
+        total_input_chars=settings.llm_total_input_chars,
+    )
+    # RemoveMessage(REMOVE_ALL_MESSAGES) borra la historia previa del estado
+    # y los mensajes recortados la reemplazan (patrón del summarizer de
+    # langchain): mismos ids de tool_call, sin huérfanos.
+    await agent.aupdate_state(
+        config,
+        {"messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES), *compacted]},
+    )
+    return len(compacted)
+
+
 # Comando /captura: el router reescribe el slash command como directiva al
 # subagente agentico requirements-capture-agent. Sin arg = proyecto completo;
 # con arg = steering del usuario (subpath, foco).
@@ -297,6 +365,7 @@ _SRS_PREFIX = "/srs"
 # /analisis (Fase 2: analisis y diseno arquitectonico) -> subagente
 # analysis-agent. Sin conflicto de prefijo con los demás comandos.
 _ANALYSIS_PREFIX = "/analisis"
+_PACKAGES_PREFIX = "/paquetes"
 
 # Marcadores de decision del usuario sobre los requerimientos existentes. La
 # guardia router-level solo deja pasar la captura cuando el texto los contiene
@@ -516,6 +585,38 @@ def _analysis_directive(user_instructions: str) -> str:
     return directive
 
 
+def _packages_directive(user_instructions: str) -> str:
+    """Directiva para el comando ``/paquetes`` (subagente packages-agent).
+
+    Delega al subagente ``packages-agent`` la generacion de paquetes de
+    trabajo entregables (uno por sub-proyecto + maestro de ensamblaje) a
+    partir del ultimo AnalysisDocument comprometido. La puerta de coherencia
+    del pipeline puede BLOQUEAR el commit: el subagente reporta los gates
+    fallidos en vez de persistir.
+    """
+    directive = (
+        "[DIRECTIVE] Delega INMEDIATAMENTE al subagente `packages-agent` "
+        "(usando la tool `task`) para generar los paquetes de trabajo del "
+        "proyecto a partir del ultimo analisis comprometido. NO explores el "
+        "sistema de archivos antes de delegar. El subagente ejecuta: "
+        "generate_work_packages (ensambla paquetes + corre la puerta de "
+        "coherencia) y, si el informe lo permite, commit_packages (persiste "
+        "la version CANDIDATE). Si un gate bloqueante falla, NO commitea: "
+        "reporta al usuario los gates fallidos y sugiere refinar el "
+        "analisis. Cuando termine, reporta: cantidad de paquetes y tareas, "
+        "orden de construccion sugerido, deudas visibles (gates en warn y "
+        "hallazgos de la critica cruzada) y donde verlos/descargarlos."
+    )
+    if user_instructions:
+        directive += " INSTRUCCIONES DEL USUARIO: "
+        directive += chr(34) + user_instructions + chr(34)
+        directive += (
+            " (incorporalas en el razonamiento; dirigen el reporte, no "
+            "parámetros internos del pipeline)."
+        )
+    return directive
+
+
 def _agrupar_directive(user_instructions: str) -> str:
     """Directiva para ``/agrupar`` con steering (espejo de ``_srs_directive``).
 
@@ -669,6 +770,14 @@ def _rewrite_command(content: str, project_id: int | None = None) -> str:
             stripped[len(_ANALYSIS_PREFIX):].strip().lstrip("/").strip()
         )
         return _analysis_directive(_user_instructions)
+
+    # /paquetes -> entrega a desarrolladores (subagente packages-agent).
+    # Texto tras el comando es steering del usuario.
+    if stripped.startswith(_PACKAGES_PREFIX):
+        _user_instructions = (
+            stripped[len(_PACKAGES_PREFIX):].strip().lstrip("/").strip()
+        )
+        return _packages_directive(_user_instructions)
 
     # /captura_agente (and /captura-agente) -> agent-driven subagent. Checked
     # BEFORE the /captura branch because "/captura_agente" startswith
@@ -1147,6 +1256,36 @@ async def send_message(
             # Turno abortado: persistir el segmento parcial como intermedio
             # para que la recarga muestre fielmente el corte.
             await _close_segment(intermediate=True)
+            if _is_context_overflow(exc):
+                # Recuperación: compactar el thread envenenado para que el
+                # reintento no recargue los megabytes que reventaron la
+                # ventana (sesión 17). Si la compactación falla, la sesión
+                # queda como estaba y el error viaja igual.
+                try:
+                    kept = await _compact_overflowed_thread(
+                        agent, str(session_id)
+                    )
+                    if kept is not None:
+                        logger.info(
+                            "thread compactado tras overflow session_id=%s "
+                            "(%d mensajes)",
+                            session_id,
+                            kept,
+                        )
+                        yield _sse("failed", {
+                            "error": (
+                                "La conversación excedió la ventana de "
+                                "contexto del modelo y fue compactada. "
+                                "Volvé a intentar el pedido."
+                            ),
+                            "recovered": "context_compacted",
+                        })
+                        return
+                except Exception:  # noqa: BLE001 - best-effort
+                    logger.exception(
+                        "compactación del thread falló session_id=%s",
+                        session_id,
+                    )
             yield _sse("failed", {"error": _sanitize_error(exc)})
         finally:
             _active_streams.discard(key)

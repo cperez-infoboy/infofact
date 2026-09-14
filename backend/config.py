@@ -109,6 +109,13 @@ class Settings(BaseSettings):
     relay_max_thinking_chars: int = 60_000
     llm_max_message_chars: int = 24_000
     llm_total_input_chars: int = 240_000
+    # Incidente de la sesión 17 de Planitrack2.0: el summarizer de deepagents
+    # manda la historia SIN recortar (su fábrica pasa trim_tokens_to_summarize
+    # =None, y None en langchain significa «sin trim») y con ~4.9 MB de
+    # tool_results el propio prompt del resumen reventó la ventana (400 prompt
+    # is too long). Este techo en CARACTERES acota lo que ve el resumidor;
+    # tunable via LLM_SUMMARIZE_TRIM_CHARS.
+    llm_summarize_trim_chars: int = 100_000
 
     # Agent container lifecycle
     agent_image: str = "infofact-agent"

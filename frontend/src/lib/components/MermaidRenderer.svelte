@@ -8,9 +8,21 @@
   import mermaid from 'mermaid';
   import elkLayouts from '@mermaid-js/layout-elk';
 
+  // crypto.randomUUID() SOLO existe en contextos seguros (HTTPS/localhost).
+  // Servida por HTTP en LAN lanza TypeError y el componente no se instancia
+  // (el "Cargando MER" se queda colgado). Fallback determinista sin crypto.
+  function genId(): string {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      return crypto.randomUUID();
+    }
+    return `id-${Date.now().toString(36)}-${Math.random()
+      .toString(36)
+      .slice(2, 10)}`;
+  }
+
   let {
     code,
-    id = crypto.randomUUID(),
+    id = genId(),
     editable = false,
     onsave = null,
   }: {
@@ -28,7 +40,7 @@
   // Sanitize the id for use as a DOM element ID (Mermaid uses querySelector
   // internally — spaces and non-ASCII chars break CSS selectors).
   const safeId = $derived(
-    (id || crypto.randomUUID()).replace(/[^A-Za-z0-9_-]/g, '_')
+    (id || genId()).replace(/[^A-Za-z0-9_-]/g, '_')
   );
 
   // -----------------------------------------------------------------------
@@ -41,7 +53,9 @@
   let dragStartX = 0;
   let dragStartY = 0;
 
-  const MIN_SCALE = 0.25;
+  // 0.02: un MER de cientos de entidades produce SVGs de decenas de miles de
+  // pixeles; ajustar el diagrama completo a la vista exige escalas de ese orden.
+  const MIN_SCALE = 0.02;
   const MAX_SCALE = 4.0;
 
   function onWheel(e: WheelEvent) {
@@ -87,14 +101,19 @@
     tx = 0;
     ty = 0;
   }
+  // Ajusta el diagrama COMPLETO a la vista (ancho y alto): con MERs de
+  // cientos de entidades el SVG mide decenas de miles de pixeles y ajustar
+  // solo el ancho deja el resto del diagrama fuera de encuadre.
   function fitWidth() {
     if (!canvas || !viewport) return;
     const svg = canvas.querySelector('svg');
     if (!svg) return;
     const svgWidth = origSvgW || parseFloat(svg.getAttribute('width') || '0') || svg.viewBox.baseVal.width || 0;
+    const svgHeight = origSvgH || parseFloat(svg.getAttribute('height') || '0') || svg.viewBox.baseVal.height || 0;
     if (svgWidth === 0) return;
-    const containerWidth = viewport.clientWidth - 32;
-    scale = Math.min(MAX_SCALE, Math.max(MIN_SCALE, containerWidth / svgWidth));
+    const sx = (viewport.clientWidth - 32) / svgWidth;
+    const sy = svgHeight > 0 ? (viewport.clientHeight - 32) / svgHeight : 1;
+    scale = Math.min(MAX_SCALE, Math.max(MIN_SCALE, Math.min(sx, sy)));
     tx = 16;
     ty = 16;
   }
@@ -133,7 +152,14 @@
 
   onMount(() => {
     mermaid.registerLayoutLoaders(elkLayouts);
-    mermaid.initialize({ startOnLoad: false, theme: 'dark' });
+    // maxTextSize/maxEdges default (50k chars / 500 aristas) truncan diagramas
+    // grandes (el MER de un corpus con ~1000 requerimientos los excede).
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: 'dark',
+      maxTextSize: 500_000,
+      maxEdges: 5_000
+    });
     initialized = true;
   });
 
@@ -310,7 +336,7 @@
         <button onclick={zoomOut} title="Alejar">−</button>
         <span class="zoom-level">{zoomPct}%</span>
         <button onclick={zoomIn} title="Acercar">+</button>
-        <button onclick={fitWidth} title="Ajustar al ancho">⤢</button>
+        <button onclick={fitWidth} title="Ajustar a la vista">⤢</button>
         <button onclick={resetView} title="Restablecer">⟲</button>
         <select
           value={layoutEngine}

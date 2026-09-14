@@ -131,7 +131,7 @@
         <div class="font-mono text-text-faint uppercase tracking-wider mb-1">
           Cobertura
         </div>
-        <div class="grid grid-cols-3 gap-2 text-center font-mono">
+        <div class="grid grid-cols-4 gap-2 text-center font-mono">
           <div>
             <div class="text-text-faint text-[10px]">FUNC</div>
             <div class="text-text">{$liveCoverage.functional}</div>
@@ -146,6 +146,14 @@
               {$liveCoverage.gaps_25010?.length ?? 0}
             </div>
           </div>
+          {#if $liveCoverage.unlinked_requirements !== undefined}
+            <div>
+              <div class="text-text-faint text-[10px]">SIN GOAL</div>
+              <div class="{$liveCoverage.unlinked_requirements > 0 ? 'text-warning' : 'text-text'}">
+                {$liveCoverage.unlinked_requirements}
+              </div>
+            </div>
+          {/if}
         </div>
       </div>
     {/if}

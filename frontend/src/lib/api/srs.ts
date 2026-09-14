@@ -5,7 +5,12 @@ import { apiFetch } from './client';
 
 // --- Tipos (espejo de los response models de srs.py) -----------------------
 
-export type SrsStatus = 'candidate' | 'in_review' | 'locked' | 'discarded';
+export type SrsStatus =
+  | 'draft'
+  | 'candidate'
+  | 'in_review'
+  | 'locked'
+  | 'discarded';
 export type GoalKind = 'functional_goal' | 'softgoal' | 'obstacle';
 export type GoalStatus = 'proposed' | 'confirmed' | 'rejected';
 export type FindingSeverity = 'blocker' | 'major' | 'minor' | 'info';

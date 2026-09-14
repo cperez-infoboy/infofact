@@ -113,6 +113,8 @@ export interface CoverageReportEvent {
   gaps_25010: string[];
   unrealized_goals: unknown[];
   unmitigated_obstacles: unknown[];
+  /** Reqs vivos sin ningún goal (dirección req->goal); ausente en backends viejos. */
+  unlinked_requirements?: number;
 }
 
 /** Fine event: SRS candidato listo (srs.ready). */
@@ -122,7 +124,13 @@ export interface SrsReadyEvent {
   requirement_count: number;
   findings: number;
   blockers: number;
+  blockers_detail?: { req: string | null; rule: string | null; message: string }[];
   goals: number;
+}
+
+/** Fine event: versión DRAFT materializada temprano (srs.draft). */
+export interface SrsDraftEvent {
+  version: number;
 }
 
 /** Fine event: MER listo (analysis.mer_ready). */
@@ -194,6 +202,7 @@ export interface StreamHandlers {
   onGoalInferred?: (g: GoalInferredEvent) => void;
   onCoverageReport?: (c: CoverageReportEvent) => void;
   onSrsReady?: (r: SrsReadyEvent) => void;
+  onSrsDraft?: (d: SrsDraftEvent) => void;
   // Fine events del subagente analysis-agent (Phase 2: Analysis & Design).
   onAnalysisProgress?: (p: ProgressEvent) => void;
   onAnalysisMerReady?: (e: AnalysisMerReadyEvent) => void;
@@ -413,6 +422,9 @@ export function dispatchEvent(ev: ParsedEvent, handlers: StreamHandlers): void {
       break;
     case 'srs.ready':
       handlers.onSrsReady?.(payload as unknown as SrsReadyEvent);
+      break;
+    case 'srs.draft':
+      handlers.onSrsDraft?.(payload as unknown as SrsDraftEvent);
       break;
     case 'analysis.progress':
       handlers.onAnalysisProgress?.({

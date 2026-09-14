@@ -132,6 +132,17 @@
         >
           ANÁLISIS
         </button>
+        <button
+          type="button"
+          class="absolute top-1 right-52 z-20 px-2 py-0.5 text-[10px] font-mono uppercase tracking-wider rounded-sm border border-border bg-surface-2 text-text-dim hover:bg-surface-3 hover:text-text transition-colors {$activeTabId ===
+          'packages'
+            ? 'bg-accent text-bg border-accent'
+            : ''}"
+          onclick={() => openView('packages')}
+          title="Ver paquetes de trabajo para desarrolladores"
+        >
+          PAQUETES
+        </button>
       </div>
 
       <ResizeHandle onResize={onChatResize} />

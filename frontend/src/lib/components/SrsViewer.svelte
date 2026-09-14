@@ -19,7 +19,7 @@
     type Finding
   } from '$lib/api/srs';
   import { renderMarkdown } from '$lib/utils/markdown';
-  import { srsRunning, srsStage, srsReady } from '$lib/stores/srs';
+  import { srsRunning, srsStage, srsReady, srsDraft } from '$lib/stores/srs';
   import RequirementForm from '$lib/components/RequirementForm.svelte';
   import { getRequirement, type RequirementDetail } from '$lib/api/requirements';
 
@@ -102,10 +102,13 @@
     try {
       versions = await listSrsVersions(projectId);
       if (versions.length > 0) {
-        // La más reciente NO descartada primero: las descartadas siguen
-        // listadas (etiquetadas) pero no son base de nada.
+        // La más reciente NO descartada/draft primero: las descartadas y las
+        // DRAFT (run en curso) siguen listadas (etiquetadas) pero no son la
+        // selección por defecto.
         const first =
-          versions.find((v) => v.status !== 'discarded') ?? versions[0];
+          versions.find(
+            (v) => v.status !== 'discarded' && v.status !== 'draft'
+          ) ?? versions[0];
         selVersion = first.version;
         await loadDetail();
       } else {
@@ -234,6 +237,17 @@
       void loadVersions();
     }
   });
+
+  // Materialización temprana: al llegar srs.draft, la versión DRAFT ya es
+  // visible en el selector sin esperar el commit final.
+  let lastDraftVersion: number | null = null;
+  $effect(() => {
+    const d = $srsDraft;
+    if (d && d.version !== lastDraftVersion) {
+      lastDraftVersion = d.version;
+      void loadVersions();
+    }
+  });
 </script>
 
 <section class="h-full flex flex-col bg-surface text-text min-w-0">
@@ -257,7 +271,9 @@
             <option value={v.version}>
               v{v.version} · {v.status === 'discarded'
                 ? 'descartada'
-                : v.status} · {v.requirement_count} reqs
+                : v.status === 'draft'
+                  ? 'borrador'
+                  : v.status} · {v.requirement_count} reqs
             </option>
           {/each}
         </select>
@@ -337,6 +353,13 @@
     >
       Versión descartada: el agente la ignora y no se usa como base de nuevas
       versiones.
+    </div>
+  {:else if active?.status === 'draft'}
+    <div
+      class="px-3 py-1 border-b border-accent/40 bg-accent/5 text-accent text-xs font-mono"
+    >
+      Versión borrador: materialización temprana del run en curso. El commit
+      final la promoverá a candidata; no se usa como base de nuevas versiones.
     </div>
   {/if}
 

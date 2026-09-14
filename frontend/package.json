@@ -31,6 +31,8 @@
     "@tiptap/markdown": "^3.30.5",
     "@tiptap/pm": "^3.30.5",
     "@tiptap/starter-kit": "^3.30.5",
+    "cytoscape": "^3.34.3",
+    "cytoscape-dagre": "^4.0.1",
     "dompurify": "^3.4.12",
     "marked": "^18.0.7",
     "mermaid": "^11.16.1"

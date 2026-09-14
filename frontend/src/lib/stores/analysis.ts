@@ -33,6 +33,7 @@ export const analysisReady = writable<
       relationships: number;
       adrs: number;
       sub_projects: number;
+      timings?: Record<string, number>;
     }
   | null
 >(null);
@@ -146,6 +147,7 @@ export function onAnalysisReady(r: {
   relationships: number;
   adrs: number;
   sub_projects: number;
+  timings?: Record<string, number>;
 }): void {
   analysisReady.set(r);
   endAnalysis();

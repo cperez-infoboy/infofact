@@ -22,7 +22,8 @@ import {
   onQualityFound,
   onGoalInferred,
   onCoverageReport,
-  onSrsReady
+  onSrsReady,
+  onSrsDraft
 } from '$lib/stores/srs';
 import {
   onAnalysisProgress,
@@ -411,6 +412,7 @@ export async function sendMessage(sessionId: number, content: string): Promise<b
       onGoalInferred: (g) => onGoalInferred(g),
       onCoverageReport: (c) => onCoverageReport(c),
       onSrsReady: (r) => onSrsReady(r),
+      onSrsDraft: (d) => onSrsDraft(d),
       // Fine events del subagente analysis-agent (Phase 2): el store de
       // análisis auto-inicia el run en el primer analysis.progress y lo
       // cierra en analysis.ready.
